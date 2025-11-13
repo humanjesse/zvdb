@@ -4,6 +4,29 @@ const ArrayList = std.array_list.Managed;
 const StringHashMap = std.StringHashMap;
 const AutoHashMap = std.AutoHashMap;
 
+// ============================================================================
+// Persistence Helpers
+// ============================================================================
+
+/// Helper to write integers in little-endian format to a file
+fn writeInt(file: std.fs.File, comptime T: type, value: T) !void {
+    var bytes: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &bytes, value, .little);
+    try file.writeAll(&bytes);
+}
+
+/// Helper to read integers in little-endian format from a file
+fn readInt(file: std.fs.File, comptime T: type) !T {
+    var bytes: [@sizeOf(T)]u8 = undefined;
+    const n = try file.readAll(&bytes);
+    if (n != @sizeOf(T)) return error.UnexpectedEOF;
+    return std.mem.readInt(T, &bytes, .little);
+}
+
+// ============================================================================
+// Data Types
+// ============================================================================
+
 /// Column value types
 pub const ColumnValue = union(enum) {
     null_value,
@@ -218,5 +241,192 @@ pub const Table = struct {
             i += 1;
         }
         return ids;
+    }
+
+    /// Save table to a binary file (.zvdb format)
+    pub fn save(self: *Table, path: []const u8) !void {
+        // Ensure parent directory exists
+        if (std.fs.path.dirname(path)) |dir_path| {
+            std.fs.cwd().makePath(dir_path) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => return err,
+            };
+        }
+
+        const file = try std.fs.cwd().createFile(path, .{});
+        defer file.close();
+
+        // Write header
+        const magic: u32 = 0x5456_4442; // "TVDB" in hex
+        const version: u32 = 1;
+        try writeInt(file, u32, magic);
+        try writeInt(file, u32, version);
+
+        // Write metadata
+        try writeInt(file, u64, self.name.len);
+        try file.writeAll(self.name);
+        try writeInt(file, u64, self.next_id);
+
+        // Write schema
+        try writeInt(file, u64, self.columns.items.len);
+        for (self.columns.items) |col| {
+            try writeInt(file, u64, col.name.len);
+            try file.writeAll(col.name);
+            try writeInt(file, u8, @intFromEnum(col.col_type));
+        }
+
+        // Write rows
+        try writeInt(file, u64, self.rows.count());
+        var it = self.rows.iterator();
+        while (it.next()) |entry| {
+            const row_id = entry.key_ptr.*;
+            const row = entry.value_ptr.*;
+
+            try writeInt(file, u64, row_id);
+            try writeInt(file, u64, row.values.count());
+
+            var val_it = row.values.iterator();
+            while (val_it.next()) |val_entry| {
+                const col_name = val_entry.key_ptr.*;
+                const value = val_entry.value_ptr.*;
+
+                // Write column name
+                try writeInt(file, u64, col_name.len);
+                try file.writeAll(col_name);
+
+                // Write value type tag
+                try writeInt(file, u8, @intFromEnum(value));
+
+                // Write value data
+                switch (value) {
+                    .null_value => {},
+                    .int => |i| try writeInt(file, i64, i),
+                    .float => |f| try file.writeAll(std.mem.asBytes(&f)),
+                    .bool => |b| try writeInt(file, u8, if (b) 1 else 0),
+                    .text => |s| {
+                        try writeInt(file, u64, s.len);
+                        try file.writeAll(s);
+                    },
+                    .embedding => |e| {
+                        try writeInt(file, u64, e.len);
+                        for (e) |val| {
+                            try file.writeAll(std.mem.asBytes(&val));
+                        }
+                    },
+                }
+            }
+        }
+    }
+
+    /// Load table from a binary file (.zvdb format)
+    pub fn load(allocator: Allocator, path: []const u8) !Table {
+        const file = try std.fs.cwd().openFile(path, .{});
+        defer file.close();
+
+        // Read and verify header
+        const magic = try readInt(file, u32);
+        if (magic != 0x5456_4442) return error.InvalidFileFormat;
+
+        const version = try readInt(file, u32);
+        if (version != 1) return error.UnsupportedVersion;
+
+        // Read metadata
+        const name_len = try readInt(file, u64);
+        const name = try allocator.alloc(u8, name_len);
+        // Handle cleanup explicitly before table owns the name
+        _ = file.readAll(name) catch |err| {
+            allocator.free(name);
+            return err;
+        };
+
+        const next_id = readInt(file, u64) catch |err| {
+            allocator.free(name);
+            return err;
+        };
+
+        // Initialize table - from this point, table owns name
+        var table = Table{
+            .name = name,
+            .columns = ArrayList(Column).init(allocator),
+            .rows = AutoHashMap(u64, Row).init(allocator),
+            .next_id = next_id,
+            .allocator = allocator,
+        };
+        errdefer table.deinit();
+
+        // Read schema
+        const column_count = try readInt(file, u64);
+        for (0..column_count) |_| {
+            const col_name_len = try readInt(file, u64);
+            const col_name = try allocator.alloc(u8, col_name_len);
+            errdefer allocator.free(col_name);
+            _ = try file.readAll(col_name);
+
+            const col_type_int = try readInt(file, u8);
+            const col_type: ColumnType = @enumFromInt(col_type_int);
+
+            try table.columns.append(Column{
+                .name = col_name,
+                .col_type = col_type,
+            });
+        }
+
+        // Read rows
+        const row_count = try readInt(file, u64);
+        for (0..row_count) |_| {
+            const row_id = try readInt(file, u64);
+            var row = Row.init(allocator, row_id);
+            errdefer row.deinit(allocator);
+
+            const value_count = try readInt(file, u64);
+            for (0..value_count) |_| {
+                // Read column name
+                const col_name_len = try readInt(file, u64);
+                const col_name = try allocator.alloc(u8, col_name_len);
+                errdefer allocator.free(col_name);
+                _ = try file.readAll(col_name);
+
+                // Read value type
+                const value_type_int = try readInt(file, u8);
+
+                // Read value data based on type
+                const value: ColumnValue = switch (value_type_int) {
+                    0 => .null_value,
+                    1 => .{ .int = try readInt(file, i64) },
+                    2 => blk: {
+                        var bytes: [8]u8 = undefined;
+                        _ = try file.readAll(&bytes);
+                        const f = std.mem.bytesToValue(f64, &bytes);
+                        break :blk .{ .float = f };
+                    },
+                    3 => blk: { // text
+                        const text_len = try readInt(file, u64);
+                        const text = try allocator.alloc(u8, text_len);
+                        errdefer allocator.free(text);
+                        _ = try file.readAll(text);
+                        break :blk .{ .text = text };
+                    },
+                    4 => .{ .bool = (try readInt(file, u8)) != 0 },
+                    5 => blk: { // embedding
+                        const emb_len = try readInt(file, u64);
+                        const embedding = try allocator.alloc(f32, emb_len);
+                        errdefer allocator.free(embedding);
+                        for (embedding) |*val| {
+                            var bytes: [4]u8 = undefined;
+                            _ = try file.readAll(&bytes);
+                            val.* = std.mem.bytesToValue(f32, &bytes);
+                        }
+                        break :blk .{ .embedding = embedding };
+                    },
+                    else => return error.InvalidValueType,
+                };
+
+                try row.values.put(col_name, value);
+            }
+
+            try table.rows.put(row_id, row);
+        }
+
+        return table;
     }
 };

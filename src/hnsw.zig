@@ -1069,10 +1069,18 @@ pub fn HNSW(comptime T: type) type {
             var source_node = self.nodes.getPtr(source) orelse return error.NodeNotFound;
             var target_node = self.nodes.getPtr(target) orelse return error.NodeNotFound;
 
-            source_node.mutex.lock();
-            defer source_node.mutex.unlock();
-            target_node.mutex.lock();
-            defer target_node.mutex.unlock();
+            // Prevent deadlock by always locking in consistent order (lower ID first)
+            if (source < target) {
+                source_node.mutex.lock();
+                defer source_node.mutex.unlock();
+                target_node.mutex.lock();
+                defer target_node.mutex.unlock();
+            } else {
+                target_node.mutex.lock();
+                defer target_node.mutex.unlock();
+                source_node.mutex.lock();
+                defer source_node.mutex.unlock();
+            }
 
             if (level < source_node.connections.len) {
                 try source_node.connections[level].append(target);
