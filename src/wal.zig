@@ -492,8 +492,11 @@ pub const WalWriter = struct {
             else => return err,
         };
 
+        // Find the next available sequence number (avoids conflicts with existing WAL files)
+        const sequence = try findNextWalSequence(wal_dir);
+
         // Create first WAL file
-        const file = try createWalFile(wal_dir, options.sequence, options.page_size);
+        const file = try createWalFile(wal_dir, sequence, options.page_size);
 
         var buffer = std.array_list.Managed(u8).init(allocator);
         try buffer.ensureTotalCapacity(options.page_size);
@@ -502,7 +505,7 @@ pub const WalWriter = struct {
             .file = file,
             .wal_dir = wal_dir,
             .buffer = buffer,
-            .sequence = options.sequence,
+            .sequence = sequence,
             .next_lsn = 1,
             .page_size = options.page_size,
             .max_file_size = options.max_file_size,
@@ -511,6 +514,41 @@ pub const WalWriter = struct {
             .max_total_wal_size = options.max_total_wal_size,
             .allocator = allocator,
         };
+    }
+
+    /// Find the next available WAL sequence number by scanning existing files
+    fn findNextWalSequence(wal_dir: []const u8) !u64 {
+        var max_sequence: u64 = 0;
+        var found_any = false;
+
+        var dir = std.fs.cwd().openDir(wal_dir, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => {
+                // Directory doesn't exist yet, start from 0
+                return 0;
+            },
+            else => return err,
+        };
+        defer dir.close();
+
+        var dir_it = dir.iterate();
+        while (try dir_it.next()) |entry| {
+            if (entry.kind != .file) continue;
+
+            // Check if filename matches "wal.NNNNNN" pattern
+            if (std.mem.startsWith(u8, entry.name, "wal.")) {
+                const seq_str = entry.name[4..]; // Skip "wal." prefix
+                if (seq_str.len == 6) {
+                    const sequence = std.fmt.parseInt(u64, seq_str, 10) catch continue;
+                    if (sequence >= max_sequence) {
+                        max_sequence = sequence;
+                        found_any = true;
+                    }
+                }
+            }
+        }
+
+        // Return next sequence number (max + 1 if files exist, 0 otherwise)
+        return if (found_any) max_sequence + 1 else 0;
     }
 
     /// Create a new WAL file with the given sequence number

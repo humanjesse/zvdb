@@ -151,6 +151,24 @@ pub const Row = struct {
         result.value_ptr.* = owned_value;
     }
 
+    /// Set a column value by transferring ownership (no clone)
+    /// Use this when the value is already owned and should be moved into the row
+    pub fn setMove(self: *Row, allocator: Allocator, column: []const u8, value: ColumnValue) !void {
+        const owned_key = try allocator.alloc(u8, column.len);
+        errdefer allocator.free(owned_key);
+        @memcpy(owned_key, column);
+
+        const result = try self.values.getOrPut(column);
+        if (result.found_existing) {
+            // Free old key and value
+            allocator.free(result.key_ptr.*);
+            var old_val = result.value_ptr.*;
+            old_val.deinit(allocator);
+        }
+        result.key_ptr.* = owned_key;
+        result.value_ptr.* = value;  // Move, don't clone
+    }
+
     pub fn get(self: *Row, column: []const u8) ?ColumnValue {
         return self.values.get(column);
     }
@@ -338,7 +356,7 @@ pub const Row = struct {
                 else => return error.InvalidValueType,
             };
 
-            try row.set(allocator, col_name, value);
+            try row.setMove(allocator, col_name, value);
         }
 
         return row;

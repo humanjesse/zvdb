@@ -11,6 +11,7 @@ const SqlCommand = sql.SqlCommand;
 const HNSW = @import("hnsw.zig").HNSW;
 const wal = @import("wal.zig");
 const WalWriter = wal.WalWriter;
+const WalReader = wal.WalReader;
 const WalRecord = wal.WalRecord;
 const WalRecordType = wal.WalRecordType;
 
@@ -173,6 +174,18 @@ pub const Database = struct {
         const tx_id = self.current_tx_id;
         self.current_tx_id += 1;
 
+        // Write BEGIN_TX record (auto-commit: each operation is its own transaction)
+        const begin_record = WalRecord{
+            .record_type = .begin_tx,
+            .tx_id = tx_id,
+            .lsn = 0,
+            .row_id = 0,
+            .table_name = "",
+            .data = "",
+            .checksum = 0,
+        };
+        _ = try w.writeRecord(begin_record);
+
         // Create WAL record (writeRecord makes its own copy of table_name and data)
         const table_name_owned = try self.allocator.dupe(u8, table_name);
         defer self.allocator.free(table_name_owned);
@@ -187,8 +200,22 @@ pub const Database = struct {
             .checksum = 0, // Will be calculated during serialization
         };
 
-        // Write WAL record and flush to disk (CRITICAL: must be durable before table mutation)
+        // Write data record
         _ = try w.writeRecord(record);
+
+        // Write COMMIT_TX record (auto-commit)
+        const commit_record = WalRecord{
+            .record_type = .commit_tx,
+            .tx_id = tx_id,
+            .lsn = 0,
+            .row_id = 0,
+            .table_name = "",
+            .data = "",
+            .checksum = 0,
+        };
+        _ = try w.writeRecord(commit_record);
+
+        // Flush to disk (CRITICAL: must be durable before table mutation)
         try w.flush();
 
         return tx_id;
@@ -222,7 +249,7 @@ pub const Database = struct {
         // Phase 2.4: WAL Recovery Implementation
 
         // Step 1: Find all WAL files in the directory
-        var wal_files = std.ArrayList([]const u8).init(self.allocator);
+        var wal_files = ArrayList([]const u8).init(self.allocator);
         defer {
             for (wal_files.items) |file| {
                 self.allocator.free(file);
@@ -342,6 +369,19 @@ pub const Database = struct {
             }
         }
 
+        // Update current_tx_id to prevent ID reuse after recovery
+        // Find the maximum transaction ID from committed transactions
+        var max_tx_id: u64 = 0;
+        var tx_it = transactions.iterator();
+        while (tx_it.next()) |entry| {
+            if (entry.value_ptr.* == .committed and entry.key_ptr.* > max_tx_id) {
+                max_tx_id = entry.key_ptr.*;
+            }
+        }
+        if (max_tx_id > 0) {
+            self.current_tx_id = max_tx_id + 1;
+        }
+
         std.debug.print("WAL Recovery complete: {} transactions, {} operations applied\n",
                        .{ recovered_count, applied_operations });
 
@@ -359,13 +399,13 @@ pub const Database = struct {
     fn replayInsert(self: *Database, record: *const WalRecord) !void {
         // Get or create the table
         const table = self.tables.get(record.table_name) orelse {
-            std.debug.print("Warning: Table '{}' not found during recovery, skipping INSERT\n",
-                           .{std.zig.fmtEscapes(record.table_name)});
+            std.debug.print("Warning: Table '{s}' not found during recovery, skipping INSERT\n",
+                           .{record.table_name});
             return;
         };
 
         // Deserialize the row data
-        const row = try Table.Row.deserialize(record.data, self.allocator);
+        const row = try Row.deserialize(record.data, self.allocator);
 
         // Check if row already exists (idempotency - may have been partially recovered)
         if (table.rows.contains(row.id)) {
@@ -377,14 +417,19 @@ pub const Database = struct {
 
         // Insert the row into the table
         try table.rows.put(row.id, row);
+
+        // Update next_id to ensure future inserts don't reuse this ID
+        if (row.id >= table.next_id) {
+            table.next_id = row.id + 1;
+        }
     }
 
     /// Replay a DELETE operation from WAL
     fn replayDelete(self: *Database, record: *const WalRecord) !void {
         // Get the table
         const table = self.tables.get(record.table_name) orelse {
-            std.debug.print("Warning: Table '{}' not found during recovery, skipping DELETE\n",
-                           .{std.zig.fmtEscapes(record.table_name)});
+            std.debug.print("Warning: Table '{s}' not found during recovery, skipping DELETE\n",
+                           .{record.table_name});
             return;
         };
 
@@ -399,13 +444,29 @@ pub const Database = struct {
     fn replayUpdate(self: *Database, record: *const WalRecord) !void {
         // Get the table
         const table = self.tables.get(record.table_name) orelse {
-            std.debug.print("Warning: Table '{}' not found during recovery, skipping UPDATE\n",
-                           .{std.zig.fmtEscapes(record.table_name)});
+            std.debug.print("Warning: Table '{s}' not found during recovery, skipping UPDATE\n",
+                           .{record.table_name});
             return;
         };
 
-        // Deserialize the updated row data
-        const updated_row = try Table.Row.deserialize(record.data, self.allocator);
+        // Extract new row data from combined format: [old_size:u64][old_data][new_data]
+        if (record.data.len < 8) {
+            std.debug.print("Warning: UPDATE record data too small during recovery\n", .{});
+            return error.InvalidWalRecord;
+        }
+
+        const old_row_size = std.mem.readInt(u64, record.data[0..8], .little);
+        const new_row_offset = 8 + old_row_size;
+
+        if (new_row_offset > record.data.len) {
+            std.debug.print("Warning: UPDATE record format invalid during recovery\n", .{});
+            return error.InvalidWalRecord;
+        }
+
+        const new_row_data = record.data[new_row_offset..];
+
+        // Deserialize the updated row data (new state only)
+        const updated_row = try Row.deserialize(new_row_data, self.allocator);
 
         // Remove old row if it exists
         if (table.rows.fetchRemove(record.row_id)) |entry| {
@@ -415,6 +476,11 @@ pub const Database = struct {
 
         // Insert the updated row
         try table.rows.put(updated_row.id, updated_row);
+
+        // Update next_id to ensure future inserts don't reuse this ID
+        if (updated_row.id >= table.next_id) {
+            table.next_id = updated_row.id + 1;
+        }
     }
 
     /// Rebuild HNSW vector index from table data (Phase 2.4)
@@ -472,7 +538,7 @@ pub const Database = struct {
                     const value = value_entry.value_ptr.*;
 
                     // Step 5: If this is an embedding column, insert into HNSW
-                    if (value.* == .embedding) {
+                    if (value == .embedding) {
                         const embedding = value.embedding;
 
                         // Insert into HNSW with row_id as external_id
@@ -480,8 +546,8 @@ pub const Database = struct {
                         vectors_indexed += 1;
 
                         if (vectors_indexed % 1000 == 0) {
-                            std.debug.print("HNSW rebuild progress: {} vectors indexed from table '{}'\n",
-                                           .{ vectors_indexed, std.zig.fmtEscapes(table_name) });
+                            std.debug.print("HNSW rebuild progress: {} vectors indexed from table '{s}'\n",
+                                           .{ vectors_indexed, table_name });
                         }
 
                         // Only process first embedding column per row
@@ -617,7 +683,6 @@ pub const Database = struct {
         // Determine which columns to select
         const select_all = cmd.columns.items.len == 0;
         if (select_all) {
-            try result.addColumn("id");
             for (table.columns.items) |col| {
                 try result.addColumn(col.name);
             }
@@ -702,7 +767,6 @@ pub const Database = struct {
             var result_row = ArrayList(ColumnValue).init(self.allocator);
 
             if (select_all) {
-                try result_row.append(ColumnValue{ .int = @intCast(row_id) });
                 for (table.columns.items) |col| {
                     if (row.get(col.name)) |val| {
                         try result_row.append(try val.clone(self.allocator));
