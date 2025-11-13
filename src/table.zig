@@ -134,9 +134,21 @@ pub const Row = struct {
 
     pub fn set(self: *Row, allocator: Allocator, column: []const u8, value: ColumnValue) !void {
         const owned_key = try allocator.alloc(u8, column.len);
+        errdefer allocator.free(owned_key);
         @memcpy(owned_key, column);
+
         const owned_value = try value.clone(allocator);
-        try self.values.put(owned_key, owned_value);
+        errdefer owned_value.deinit(allocator);
+
+        var result = try self.values.getOrPut(column);
+        if (result.found_existing) {
+            // Free old key and value
+            allocator.free(result.key_ptr.*);
+            var old_val = result.value_ptr.*;
+            old_val.deinit(allocator);
+        }
+        result.key_ptr.* = owned_key;
+        result.value_ptr.* = owned_value;
     }
 
     pub fn get(self: *Row, column: []const u8) ?ColumnValue {

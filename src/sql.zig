@@ -19,6 +19,7 @@ pub const SqlError = error{
     OutOfMemory,
     DimensionMismatch,
     InvalidExpression,
+    TypeMismatch,
 };
 
 /// SQL command types

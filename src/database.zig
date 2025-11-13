@@ -369,24 +369,40 @@ pub const Database = struct {
     fn executeUpdate(self: *Database, cmd: sql.UpdateCmd) !QueryResult {
         const table = self.tables.get(cmd.table_name) orelse return sql.SqlError.TableNotFound;
 
-        // Validate all SET columns exist in table
+        // Validate all SET columns exist in table and have correct types
         for (cmd.assignments.items) |assignment| {
             var found = false;
+            var col_type: ColumnType = undefined;
+
             for (table.columns.items) |col| {
                 if (std.mem.eql(u8, col.name, assignment.column)) {
                     found = true;
-                    // Validate embedding dimension if it's an embedding column
-                    if (col.col_type == .embedding and assignment.value == .embedding) {
-                        const expected_dim: usize = 768; // TODO: Make this configurable
-                        if (assignment.value.embedding.len != expected_dim) {
-                            return sql.SqlError.DimensionMismatch;
-                        }
-                    }
+                    col_type = col.col_type;
                     break;
                 }
             }
+
             if (!found) {
                 return sql.SqlError.ColumnNotFound;
+            }
+
+            // Type validation
+            const value_valid = switch (col_type) {
+                .int => assignment.value == .int or assignment.value == .null_value,
+                .float => assignment.value == .float or assignment.value == .int or assignment.value == .null_value,
+                .text => assignment.value == .text or assignment.value == .null_value,
+                .bool => assignment.value == .bool or assignment.value == .null_value,
+                .embedding => blk: {
+                    if (assignment.value == .null_value) break :blk true;
+                    if (assignment.value != .embedding) break :blk false;
+                    // Validate dimension
+                    const expected_dim: usize = 768; // TODO: Make this configurable
+                    break :blk assignment.value.embedding.len == expected_dim;
+                },
+            };
+
+            if (!value_valid) {
+                return sql.SqlError.TypeMismatch;
             }
         }
 
@@ -410,20 +426,26 @@ pub const Database = struct {
             var new_embedding: ?[]const f32 = null;
             var embedding_changed = false;
 
+            // Clone old embedding for potential rollback
+            var old_embedding_backup: ?[]f32 = null;
+            defer if (old_embedding_backup) |emb| self.allocator.free(emb);
+
             // Find old embedding if it exists
             if (self.hnsw != null) {
                 var it = row.values.iterator();
                 while (it.next()) |entry| {
                     if (entry.value_ptr.* == .embedding) {
                         old_embedding = entry.value_ptr.embedding;
+                        // Clone for potential rollback
+                        old_embedding_backup = try self.allocator.dupe(f32, old_embedding.?);
                         break;
                     }
                 }
             }
 
-            // Apply all SET assignments
+            // First pass: Detect if embedding is changing and determine new embedding
+            // This allows us to validate HNSW operations BEFORE mutating the row
             for (cmd.assignments.items) |assignment| {
-                // Check if this is updating an embedding column
                 if (assignment.value == .embedding) {
                     new_embedding = assignment.value.embedding;
                     // Check if embedding actually changed
@@ -443,22 +465,20 @@ pub const Database = struct {
                     } else {
                         embedding_changed = true;
                     }
+                    break; // Only one embedding column per table
                 }
-
-                // Update the row
-                try row.set(self.allocator, assignment.column, assignment.value);
             }
 
-            // Handle HNSW index updates if embedding changed
+            // Handle HNSW index updates BEFORE applying row updates
+            // This ensures atomicity: if HNSW fails, row hasn't been mutated
             if (embedding_changed and self.hnsw != null) {
                 const h = self.hnsw.?;
 
                 // Remove old vector from HNSW (if it existed)
-                if (old_embedding != null) {
+                if (old_embedding_backup != null) {
                     h.removeNode(row_id) catch |err| {
-                        // Rollback: This is a critical error, we should revert changes
-                        // For now, we'll just log the error
                         std.debug.print("Error removing node from HNSW: {}\n", .{err});
+                        // Row not yet updated, safe to return error
                         return err;
                     };
                 }
@@ -466,11 +486,22 @@ pub const Database = struct {
                 // Insert new vector with same row_id
                 if (new_embedding) |new_emb| {
                     _ = h.insert(new_emb, row_id) catch |err| {
-                        // Critical error: we've already removed the old vector
+                        // Rollback: Re-insert old embedding to restore HNSW state
+                        if (old_embedding_backup) |old_clone| {
+                            _ = h.insert(old_clone, row_id) catch {
+                                std.debug.print("CRITICAL: Failed to rollback HNSW state after insert failure\n", .{});
+                            };
+                        }
                         std.debug.print("Error inserting new vector to HNSW: {}\n", .{err});
                         return err;
                     };
                 }
+            }
+
+            // Now apply all SET assignments to the row
+            // This happens AFTER HNSW operations succeed, ensuring atomicity
+            for (cmd.assignments.items) |assignment| {
+                try row.set(self.allocator, assignment.column, assignment.value);
             }
 
             updated_count += 1;
