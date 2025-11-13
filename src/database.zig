@@ -9,6 +9,10 @@ const Row = @import("table.zig").Row;
 const sql = @import("sql.zig");
 const SqlCommand = sql.SqlCommand;
 const HNSW = @import("hnsw.zig").HNSW;
+const wal = @import("wal.zig");
+const WalWriter = wal.WalWriter;
+const WalRecord = wal.WalRecord;
+const WalRecordType = wal.WalRecordType;
 
 /// Query result set
 pub const QueryResult = struct {
@@ -85,6 +89,8 @@ pub const Database = struct {
     allocator: Allocator,
     data_dir: ?[]const u8, // Data directory for persistence (owned)
     auto_save: bool, // Auto-save on deinit
+    wal: ?*WalWriter, // Write-Ahead Log for durability (optional)
+    current_tx_id: u64, // Simple transaction ID counter (for Phase 2.3)
 
     pub fn init(allocator: Allocator) Database {
         return Database{
@@ -93,6 +99,8 @@ pub const Database = struct {
             .allocator = allocator,
             .data_dir = null,
             .auto_save = false,
+            .wal = null,
+            .current_tx_id = 0,
         };
     }
 
@@ -102,6 +110,14 @@ pub const Database = struct {
             self.saveAll(self.data_dir.?) catch |err| {
                 std.debug.print("Warning: Failed to auto-save database: {}\n", .{err});
             };
+        }
+
+        // Close WAL if enabled
+        if (self.wal) |w| {
+            w.close() catch |err| {
+                std.debug.print("Warning: Failed to close WAL: {}\n", .{err});
+            };
+            self.allocator.destroy(w);
         }
 
         var it = self.tables.iterator();
@@ -127,6 +143,20 @@ pub const Database = struct {
         const hnsw_ptr = try self.allocator.create(HNSW(f32));
         hnsw_ptr.* = HNSW(f32).init(self.allocator, m, ef_construction);
         self.hnsw = hnsw_ptr;
+    }
+
+    /// Enable Write-Ahead Logging for durability
+    /// Creates WAL directory and initializes WAL writer
+    pub fn enableWal(self: *Database, wal_dir: []const u8) !void {
+        if (self.wal != null) {
+            return error.WalAlreadyEnabled;
+        }
+
+        const wal_ptr = try self.allocator.create(WalWriter);
+        errdefer self.allocator.destroy(wal_ptr);
+
+        wal_ptr.* = try WalWriter.init(self.allocator, wal_dir);
+        self.wal = wal_ptr;
     }
 
     /// Execute a SQL command
@@ -184,6 +214,49 @@ pub const Database = struct {
                     try values_map.put(col.name, cmd.values.items[i]);
                 }
             }
+        }
+
+        // WAL-Ahead Protocol: Write to WAL BEFORE modifying data
+        if (self.wal) |w| {
+            // Get the row_id that will be assigned
+            const row_id = table.next_id;
+
+            // Create a temporary row for serialization
+            var temp_row = Row.init(self.allocator, row_id);
+            defer temp_row.deinit(self.allocator);
+
+            // Populate the temporary row with values
+            var it = values_map.iterator();
+            while (it.next()) |entry| {
+                try temp_row.set(self.allocator, entry.key_ptr.*, entry.value_ptr.*);
+            }
+
+            // Serialize the row
+            const serialized_row = try temp_row.serialize(self.allocator);
+            defer self.allocator.free(serialized_row);
+
+            // Get transaction ID and increment
+            const tx_id = self.current_tx_id;
+            self.current_tx_id += 1;
+
+            // Create WAL record
+            const table_name_owned = try self.allocator.dupe(u8, cmd.table_name);
+            var record = WalRecord{
+                .record_type = WalRecordType.insert_row,
+                .tx_id = tx_id,
+                .lsn = 0, // Will be assigned by WAL writer
+                .row_id = row_id,
+                .table_name = table_name_owned,
+                .data = serialized_row,
+                .checksum = 0, // Will be calculated during serialization
+            };
+
+            // Write WAL record and flush to disk (CRITICAL: must be durable before table mutation)
+            try w.writeRecord(&record);
+            try w.flush();
+
+            // Clean up the owned table_name (writeRecord makes its own copy)
+            self.allocator.free(table_name_owned);
         }
 
         const row_id = try table.insert(values_map);
@@ -352,6 +425,36 @@ pub const Database = struct {
             }
 
             if (should_delete) {
+                // WAL-Ahead Protocol: Write to WAL BEFORE deleting
+                if (self.wal) |w| {
+                    // Serialize the row being deleted (for potential recovery/undo)
+                    const serialized_row = try row.serialize(self.allocator);
+                    defer self.allocator.free(serialized_row);
+
+                    // Get transaction ID and increment
+                    const tx_id = self.current_tx_id;
+                    self.current_tx_id += 1;
+
+                    // Create WAL record
+                    const table_name_owned = try self.allocator.dupe(u8, cmd.table_name);
+                    var record = WalRecord{
+                        .record_type = WalRecordType.delete_row,
+                        .tx_id = tx_id,
+                        .lsn = 0, // Will be assigned by WAL writer
+                        .row_id = row_id,
+                        .table_name = table_name_owned,
+                        .data = serialized_row,
+                        .checksum = 0, // Will be calculated during serialization
+                    };
+
+                    // Write WAL record and flush (CRITICAL: must be durable before deletion)
+                    try w.writeRecord(&record);
+                    try w.flush();
+
+                    // Clean up the owned table_name
+                    self.allocator.free(table_name_owned);
+                }
+
                 _ = table.delete(row_id);
                 deleted_count += 1;
             }
@@ -467,6 +570,65 @@ pub const Database = struct {
                     }
                     break; // Only one embedding column per table
                 }
+            }
+
+            // WAL-Ahead Protocol: Write to WAL BEFORE any mutations
+            if (self.wal) |w| {
+                // Serialize the current row (old state) for recovery
+                const serialized_old = try row.serialize(self.allocator);
+                defer self.allocator.free(serialized_old);
+
+                // Create a temporary row with updates to serialize new state
+                var temp_row = Row.init(self.allocator, row_id);
+                defer temp_row.deinit(self.allocator);
+
+                // Copy current values to temp row
+                var copy_it = row.values.iterator();
+                while (copy_it.next()) |entry| {
+                    try temp_row.set(self.allocator, entry.key_ptr.*, entry.value_ptr.*);
+                }
+
+                // Apply assignments to temp row
+                for (cmd.assignments.items) |assignment| {
+                    try temp_row.set(self.allocator, assignment.column, assignment.value);
+                }
+
+                // Serialize the new state
+                const serialized_new = try temp_row.serialize(self.allocator);
+                defer self.allocator.free(serialized_new);
+
+                // For UPDATE, we store both old and new row data
+                // Format: [old_size:u64][old_data][new_data]
+                const combined_size = 8 + serialized_old.len + serialized_new.len;
+                const combined_data = try self.allocator.alloc(u8, combined_size);
+                defer self.allocator.free(combined_data);
+
+                std.mem.writeInt(u64, combined_data[0..8], serialized_old.len, .little);
+                @memcpy(combined_data[8..][0..serialized_old.len], serialized_old);
+                @memcpy(combined_data[8 + serialized_old.len ..][0..serialized_new.len], serialized_new);
+
+                // Get transaction ID and increment
+                const tx_id = self.current_tx_id;
+                self.current_tx_id += 1;
+
+                // Create WAL record
+                const table_name_owned = try self.allocator.dupe(u8, cmd.table_name);
+                var record = WalRecord{
+                    .record_type = WalRecordType.update_row,
+                    .tx_id = tx_id,
+                    .lsn = 0, // Will be assigned by WAL writer
+                    .row_id = row_id,
+                    .table_name = table_name_owned,
+                    .data = combined_data,
+                    .checksum = 0, // Will be calculated during serialization
+                };
+
+                // Write WAL record and flush (CRITICAL: must be durable before mutations)
+                try w.writeRecord(&record);
+                try w.flush();
+
+                // Clean up the owned table_name
+                self.allocator.free(table_name_owned);
             }
 
             // Handle HNSW index updates BEFORE applying row updates

@@ -154,6 +154,195 @@ pub const Row = struct {
     pub fn get(self: *Row, column: []const u8) ?ColumnValue {
         return self.values.get(column);
     }
+
+    /// Serialize row to bytes for WAL storage
+    /// Returns owned byte slice that caller must free
+    pub fn serialize(self: *const Row, allocator: Allocator) ![]u8 {
+        // Calculate size needed
+        var size: usize = 8; // row_id
+        size += 8; // num_values
+
+        var val_it = self.values.iterator();
+        while (val_it.next()) |entry| {
+            const col_name = entry.key_ptr.*;
+            const value = entry.value_ptr.*;
+
+            size += 8; // col_name length
+            size += col_name.len; // col_name
+            size += 1; // value type tag
+
+            // Value data size
+            switch (value) {
+                .null_value => {},
+                .int => size += 8,
+                .float => size += 8,
+                .bool => size += 1,
+                .text => |s| {
+                    size += 8; // text length
+                    size += s.len; // text data
+                },
+                .embedding => |e| {
+                    size += 8; // embedding length
+                    size += e.len * 4; // f32 data (4 bytes each)
+                },
+            }
+        }
+
+        // Allocate buffer
+        var buffer = try allocator.alloc(u8, size);
+        errdefer allocator.free(buffer);
+
+        var offset: usize = 0;
+
+        // Write row_id
+        std.mem.writeInt(u64, buffer[offset..][0..8], self.id, .little);
+        offset += 8;
+
+        // Write num_values
+        const num_values: u64 = self.values.count();
+        std.mem.writeInt(u64, buffer[offset..][0..8], num_values, .little);
+        offset += 8;
+
+        // Write each value
+        var it = self.values.iterator();
+        while (it.next()) |entry| {
+            const col_name = entry.key_ptr.*;
+            const value = entry.value_ptr.*;
+
+            // Write column name
+            std.mem.writeInt(u64, buffer[offset..][0..8], col_name.len, .little);
+            offset += 8;
+            @memcpy(buffer[offset..][0..col_name.len], col_name);
+            offset += col_name.len;
+
+            // Write value type tag
+            buffer[offset] = @intFromEnum(value);
+            offset += 1;
+
+            // Write value data
+            switch (value) {
+                .null_value => {},
+                .int => |i| {
+                    std.mem.writeInt(i64, buffer[offset..][0..8], i, .little);
+                    offset += 8;
+                },
+                .float => |f| {
+                    @memcpy(buffer[offset..][0..8], std.mem.asBytes(&f));
+                    offset += 8;
+                },
+                .bool => |b| {
+                    buffer[offset] = if (b) 1 else 0;
+                    offset += 1;
+                },
+                .text => |s| {
+                    std.mem.writeInt(u64, buffer[offset..][0..8], s.len, .little);
+                    offset += 8;
+                    @memcpy(buffer[offset..][0..s.len], s);
+                    offset += s.len;
+                },
+                .embedding => |e| {
+                    std.mem.writeInt(u64, buffer[offset..][0..8], e.len, .little);
+                    offset += 8;
+                    for (e) |val| {
+                        @memcpy(buffer[offset..][0..4], std.mem.asBytes(&val));
+                        offset += 4;
+                    }
+                },
+            }
+        }
+
+        std.debug.assert(offset == size);
+        return buffer;
+    }
+
+    /// Deserialize row from bytes (used during WAL recovery)
+    /// Returns new Row that caller owns
+    pub fn deserialize(buffer: []const u8, allocator: Allocator) !Row {
+        if (buffer.len < 16) return error.BufferTooSmall;
+
+        var offset: usize = 0;
+
+        // Read row_id
+        const row_id = std.mem.readInt(u64, buffer[offset..][0..8], .little);
+        offset += 8;
+
+        // Read num_values
+        const num_values = std.mem.readInt(u64, buffer[offset..][0..8], .little);
+        offset += 8;
+
+        var row = Row.init(allocator, row_id);
+        errdefer row.deinit(allocator);
+
+        // Read each value
+        var i: usize = 0;
+        while (i < num_values) : (i += 1) {
+            // Read column name
+            if (offset + 8 > buffer.len) return error.BufferTooSmall;
+            const col_name_len = std.mem.readInt(u64, buffer[offset..][0..8], .little);
+            offset += 8;
+
+            if (offset + col_name_len > buffer.len) return error.BufferTooSmall;
+            const col_name = buffer[offset..][0..col_name_len];
+            offset += col_name_len;
+
+            // Read value type tag
+            if (offset >= buffer.len) return error.BufferTooSmall;
+            const value_tag = buffer[offset];
+            offset += 1;
+
+            // Read value data based on type
+            const value = switch (value_tag) {
+                0 => ColumnValue.null_value, // null_value
+                1 => blk: { // int
+                    if (offset + 8 > buffer.len) return error.BufferTooSmall;
+                    const val = std.mem.readInt(i64, buffer[offset..][0..8], .little);
+                    offset += 8;
+                    break :blk ColumnValue{ .int = val };
+                },
+                2 => blk: { // float
+                    if (offset + 8 > buffer.len) return error.BufferTooSmall;
+                    const val = @as(*const f64, @ptrCast(@alignCast(buffer[offset..][0..8]))).*;
+                    offset += 8;
+                    break :blk ColumnValue{ .float = val };
+                },
+                3 => blk: { // text
+                    if (offset + 8 > buffer.len) return error.BufferTooSmall;
+                    const text_len = std.mem.readInt(u64, buffer[offset..][0..8], .little);
+                    offset += 8;
+
+                    if (offset + text_len > buffer.len) return error.BufferTooSmall;
+                    const text = try allocator.dupe(u8, buffer[offset..][0..text_len]);
+                    offset += text_len;
+                    break :blk ColumnValue{ .text = text };
+                },
+                4 => blk: { // bool
+                    if (offset >= buffer.len) return error.BufferTooSmall;
+                    const val = buffer[offset] != 0;
+                    offset += 1;
+                    break :blk ColumnValue{ .bool = val };
+                },
+                5 => blk: { // embedding
+                    if (offset + 8 > buffer.len) return error.BufferTooSmall;
+                    const emb_len = std.mem.readInt(u64, buffer[offset..][0..8], .little);
+                    offset += 8;
+
+                    if (offset + emb_len * 4 > buffer.len) return error.BufferTooSmall;
+                    const embedding = try allocator.alloc(f32, emb_len);
+                    var j: usize = 0;
+                    while (j < emb_len) : (j += 1) {
+                        embedding[j] = @as(*const f32, @ptrCast(@alignCast(buffer[offset..][0..4]))).*;
+                        offset += 4;
+                    }
+                    break :blk ColumnValue{ .embedding = embedding };
+                },
+                else => return error.InvalidValueType,
+            };
+
+            try row.set(allocator, col_name, value);
+        }
+
+        return row;
+    }
 };
 
 /// A table with schema and rows

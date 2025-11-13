@@ -1037,3 +1037,115 @@ test "SQL: UPDATE with inequality operators" {
 
     try testing.expect(select_result.rows.items.len == 2);
 }
+
+// ============================================================================
+// WAL Integration Tests (Phase 2.3)
+// ============================================================================
+
+test "WAL: Basic integration with INSERT/DELETE/UPDATE" {
+    const wal_dir = "test_data/wal_basic";
+
+    // Clean up any existing test data
+    std.fs.cwd().deleteTree(wal_dir) catch {};
+    defer std.fs.cwd().deleteTree(wal_dir) catch {};
+
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    // Enable WAL
+    try db.enableWal(wal_dir);
+
+    // Create table
+    var create_result = try db.execute("CREATE TABLE users (id int, name text, age int)");
+    defer create_result.deinit();
+
+    // Test INSERT with WAL enabled
+    var insert1 = try db.execute("INSERT INTO users VALUES (1, \"Alice\", 25)");
+    defer insert1.deinit();
+
+    var insert2 = try db.execute("INSERT INTO users VALUES (2, \"Bob\", 30)");
+    defer insert2.deinit();
+
+    // Test UPDATE with WAL enabled
+    var update_result = try db.execute("UPDATE users SET age = 26 WHERE id = 1");
+    defer update_result.deinit();
+    try testing.expect(update_result.rows.items[0].items[0].int == 1);
+
+    // Test DELETE with WAL enabled
+    var delete_result = try db.execute("DELETE FROM users WHERE id = 2");
+    defer delete_result.deinit();
+    try testing.expect(delete_result.rows.items[0].items[0].int == 1);
+
+    // Verify data is still correct
+    var select_result = try db.execute("SELECT * FROM users");
+    defer select_result.deinit();
+    try testing.expect(select_result.rows.items.len == 1);
+    try testing.expect(select_result.rows.items[0].items[3].int == 26); // Updated age
+
+    // Verify WAL directory was created
+    var wal_dir_handle = try std.fs.cwd().openDir(wal_dir, .{});
+    wal_dir_handle.close();
+}
+
+test "WAL: Transaction ID increments" {
+    const wal_dir = "test_data/wal_txid";
+
+    // Clean up any existing test data
+    std.fs.cwd().deleteTree(wal_dir) catch {};
+    defer std.fs.cwd().deleteTree(wal_dir) catch {};
+
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    try db.enableWal(wal_dir);
+
+    // Create table
+    var create_result = try db.execute("CREATE TABLE test (id int, value int)");
+    defer create_result.deinit();
+
+    // Transaction ID should start at 0
+    try testing.expect(db.current_tx_id == 0);
+
+    // Perform INSERT - should increment tx_id
+    var insert1 = try db.execute("INSERT INTO test VALUES (1, 100)");
+    defer insert1.deinit();
+    try testing.expect(db.current_tx_id == 1);
+
+    // Perform UPDATE - should increment tx_id again
+    var update1 = try db.execute("UPDATE test SET value = 200 WHERE id = 1");
+    defer update1.deinit();
+    try testing.expect(db.current_tx_id == 2);
+
+    // Perform DELETE - should increment tx_id again
+    var delete1 = try db.execute("DELETE FROM test WHERE id = 1");
+    defer delete1.deinit();
+    try testing.expect(db.current_tx_id == 3);
+}
+
+test "WAL: Database works without WAL (optional)" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    // WAL should be null by default
+    try testing.expect(db.wal == null);
+
+    // Operations should work without WAL
+    var create_result = try db.execute("CREATE TABLE users (id int, name text)");
+    defer create_result.deinit();
+
+    var insert_result = try db.execute("INSERT INTO users VALUES (1, \"Alice\")");
+    defer insert_result.deinit();
+
+    var update_result = try db.execute("UPDATE users SET name = \"Alicia\" WHERE id = 1");
+    defer update_result.deinit();
+    try testing.expect(update_result.rows.items[0].items[0].int == 1);
+
+    var delete_result = try db.execute("DELETE FROM users WHERE id = 1");
+    defer delete_result.deinit();
+    try testing.expect(delete_result.rows.items[0].items[0].int == 1);
+
+    // Verify database still works correctly
+    var select_result = try db.execute("SELECT * FROM users");
+    defer select_result.deinit();
+    try testing.expect(select_result.rows.items.len == 0);
+}
