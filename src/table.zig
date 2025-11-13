@@ -333,12 +333,18 @@ pub const Table = struct {
         // Read metadata
         const name_len = try readInt(file, u64);
         const name = try allocator.alloc(u8, name_len);
-        errdefer allocator.free(name);
-        _ = try file.readAll(name);
+        // Handle cleanup explicitly before table owns the name
+        _ = file.readAll(name) catch |err| {
+            allocator.free(name);
+            return err;
+        };
 
-        const next_id = try readInt(file, u64);
+        const next_id = readInt(file, u64) catch |err| {
+            allocator.free(name);
+            return err;
+        };
 
-        // Initialize table
+        // Initialize table - from this point, table owns name
         var table = Table{
             .name = name,
             .columns = ArrayList(Column).init(allocator),
@@ -393,14 +399,14 @@ pub const Table = struct {
                         const f = std.mem.bytesToValue(f64, &bytes);
                         break :blk .{ .float = f };
                     },
-                    3 => .{ .bool = (try readInt(file, u8)) != 0 },
-                    4 => blk: { // text
+                    3 => blk: { // text
                         const text_len = try readInt(file, u64);
                         const text = try allocator.alloc(u8, text_len);
                         errdefer allocator.free(text);
                         _ = try file.readAll(text);
                         break :blk .{ .text = text };
                     },
+                    4 => .{ .bool = (try readInt(file, u8)) != 0 },
                     5 => blk: { // embedding
                         const emb_len = try readInt(file, u64);
                         const embedding = try allocator.alloc(f32, emb_len);

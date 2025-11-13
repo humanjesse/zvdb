@@ -250,7 +250,6 @@ test "SQL: NULL values" {
 
 test "Persistence: Save and load empty table" {
     const test_dir = "test_data/empty_table";
-    const test_file = "test_data/empty_table/users.zvdb";
 
     // Clean up any existing test data
     std.fs.cwd().deleteTree(test_dir) catch {};

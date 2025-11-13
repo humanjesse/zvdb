@@ -147,6 +147,7 @@ fn tokenize(allocator: Allocator, sql: []const u8) !ArrayList(Token) {
         }
         // Number
         else if (std.ascii.isDigit(sql[i]) or (sql[i] == '-' and i + 1 < sql.len and std.ascii.isDigit(sql[i + 1]))) {
+            if (sql[i] == '-') i += 1; // Skip the negative sign
             while (i < sql.len and (std.ascii.isDigit(sql[i]) or sql[i] == '.')) : (i += 1) {}
             try tokens.append(.{ .text = sql[start..i], .start = start });
         }
@@ -386,6 +387,12 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
                 } else if (std.mem.indexOf(u8, token_text, ".")) |_| {
                     const f = try std.fmt.parseFloat(f64, token_text);
                     where_value = ColumnValue{ .float = f };
+                } else if (eqlIgnoreCase(token_text, "true")) {
+                    where_value = ColumnValue{ .bool = true };
+                } else if (eqlIgnoreCase(token_text, "false")) {
+                    where_value = ColumnValue{ .bool = false };
+                } else if (eqlIgnoreCase(token_text, "NULL")) {
+                    where_value = ColumnValue.null_value;
                 } else {
                     const num = try std.fmt.parseInt(i64, token_text, 10);
                     where_value = ColumnValue{ .int = num };
@@ -464,6 +471,12 @@ fn parseDelete(allocator: Allocator, tokens: []const Token) !DeleteCmd {
             } else if (std.mem.indexOf(u8, token_text, ".")) |_| {
                 const f = try std.fmt.parseFloat(f64, token_text);
                 where_value = ColumnValue{ .float = f };
+            } else if (eqlIgnoreCase(token_text, "true")) {
+                where_value = ColumnValue{ .bool = true };
+            } else if (eqlIgnoreCase(token_text, "false")) {
+                where_value = ColumnValue{ .bool = false };
+            } else if (eqlIgnoreCase(token_text, "NULL")) {
+                where_value = ColumnValue.null_value;
             } else {
                 const num = try std.fmt.parseInt(i64, token_text, 10);
                 where_value = ColumnValue{ .int = num };

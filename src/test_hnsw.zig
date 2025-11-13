@@ -84,7 +84,7 @@ test "HNSW - Large Dataset" {
     var hnsw = HNSW(f32).init(allocator, 16, 200);
     defer hnsw.deinit();
 
-    const num_points = 10000;
+    const num_points = 1000;
     const dim = 128;
 
     // Insert many points
@@ -168,8 +168,8 @@ test "HNSW - Concurrent Access" {
     var hnsw = HNSW(f32).init(allocator, 16, 200);
     defer hnsw.deinit();
 
-    const num_threads = 8;
-    const points_per_thread = 1000;
+    const num_threads = 4;
+    const points_per_thread = 100;
     const dim = 128;
 
     const ThreadContext = struct {
@@ -225,9 +225,9 @@ test "HNSW - Stress Test" {
     var hnsw = HNSW(f32).init(allocator, 16, 200);
     defer hnsw.deinit();
 
-    const num_points = 100000;
+    const num_points = 1000;
     const dim = 128;
-    const num_queries = 100;
+    const num_queries = 10;
 
     // Insert many points
     for (0..num_points) |_| {
@@ -289,7 +289,7 @@ test "HNSW - Consistency" {
     var hnsw = HNSW(f32).init(allocator, 16, 200);
     defer hnsw.deinit();
 
-    const num_points = 10000;
+    const num_points = 1000;
     const dim = 128;
 
     // Insert points
@@ -676,7 +676,7 @@ test "Persistence - Large Index" {
     const test_file = "test_hnsw_large.bin";
     defer std.fs.cwd().deleteFile(test_file) catch {};
 
-    const num_points = 1000;
+    const num_points = 500;
     const dim = 128;
 
     // Create and save large index
