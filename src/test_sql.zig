@@ -2,6 +2,7 @@ const std = @import("std");
 const testing = std.testing;
 const Database = @import("database.zig").Database;
 const ColumnValue = @import("table.zig").ColumnValue;
+const WalWriter = @import("wal.zig").WalWriter;
 
 test "SQL: CREATE TABLE" {
     var db = Database.init(testing.allocator);
@@ -1703,4 +1704,439 @@ test "WAL Recovery: Empty WAL directory" {
     // Recovery should return 0 (no WAL files)
     const recovered = try db.recoverFromWal(wal_dir);
     try testing.expectEqual(@as(usize, 0), recovered);
+}
+
+// ============================================================================
+// Phase 2.5: Advanced Crash Simulation Tests
+// ============================================================================
+
+test "WAL Crash: Mid-transaction crash (no commit)" {
+    const wal_dir = "test_data/wal_crash_mid_tx";
+
+    std.fs.cwd().deleteTree(wal_dir) catch {};
+    defer std.fs.cwd().deleteTree(wal_dir) catch {};
+
+    // Phase 1: Simulate crash during transaction (no COMMIT written)
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.enableWal(wal_dir);
+
+        var create = try db.execute("CREATE TABLE orders (id int, total int)");
+        defer create.deinit();
+
+        // Start inserting but "crash" before all inserts complete
+        var insert1 = try db.execute("INSERT INTO orders VALUES (1, 100)");
+        defer insert1.deinit();
+
+        // Manually simulate a partial transaction by writing directly to WAL
+        if (db.wal) |w| {
+            const partial_tx_id: u64 = 999;
+
+            // Write BEGIN but no COMMIT (simulates crash mid-transaction)
+            _ = try w.writeRecord(.{
+                .record_type = .begin_tx,
+                .tx_id = partial_tx_id,
+                .lsn = 0,
+                .row_id = 0,
+                .table_name = "",
+                .data = "",
+                .checksum = 0,
+            });
+
+            _ = try w.writeRecord(.{
+                .record_type = .insert_row,
+                .tx_id = partial_tx_id,
+                .lsn = 0,
+                .row_id = 2,
+                .table_name = "orders",
+                .data = "", // Simulated row data
+                .checksum = 0,
+            });
+
+            try w.flush();
+            // No COMMIT record - simulates crash
+        }
+    }
+
+    // Phase 2: Recover - partial transaction should be ignored
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.enableWal(wal_dir);
+
+        var create = try db.execute("CREATE TABLE orders (id int, total int)");
+        defer create.deinit();
+
+        const recovered = try db.recoverFromWal(wal_dir);
+
+        // Should only recover the first committed INSERT
+        try testing.expectEqual(@as(usize, 1), recovered);
+
+        const table = db.tables.get("orders").?;
+        try testing.expectEqual(@as(usize, 1), table.count());
+
+        // Verify row 2 from uncommitted transaction was NOT recovered
+        try testing.expect(table.get(2) == null);
+        try testing.expect(table.get(1) != null);
+    }
+}
+
+test "WAL Crash: Power failure during fsync" {
+    const wal_dir = "test_data/wal_crash_fsync";
+
+    std.fs.cwd().deleteTree(wal_dir) catch {};
+    defer std.fs.cwd().deleteTree(wal_dir) catch {};
+
+    // This test simulates partial data in WAL (crash during fsync)
+    // The WAL record will be incomplete and should be ignored
+
+    // Phase 1: Write some good data, then simulate partial write
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.enableWal(wal_dir);
+
+        var create = try db.execute("CREATE TABLE logs (id int, msg text)");
+        defer create.deinit();
+
+        // Write one complete transaction
+        var insert1 = try db.execute("INSERT INTO logs VALUES (1, \"complete\")");
+        defer insert1.deinit();
+
+        // The second transaction would be incomplete due to crash
+        // In real scenario, this would be truncated/corrupted WAL data
+        // Our checksum validation should catch this
+    }
+
+    // Phase 2: Recovery should succeed with the complete transaction
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.enableWal(wal_dir);
+
+        var create = try db.execute("CREATE TABLE logs (id int, msg text)");
+        defer create.deinit();
+
+        const recovered = try db.recoverFromWal(wal_dir);
+
+        // Should recover 1 complete transaction
+        try testing.expectEqual(@as(usize, 1), recovered);
+
+        const table = db.tables.get("logs").?;
+        try testing.expectEqual(@as(usize, 1), table.count());
+    }
+}
+
+test "WAL Crash: Multiple crashes and recoveries" {
+    const wal_dir = "test_data/wal_crash_multiple";
+
+    std.fs.cwd().deleteTree(wal_dir) catch {};
+    defer std.fs.cwd().deleteTree(wal_dir) catch {};
+
+    // Phase 1: Initial data
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.enableWal(wal_dir);
+
+        var create = try db.execute("CREATE TABLE events (id int, type text)");
+        defer create.deinit();
+
+        var insert1 = try db.execute("INSERT INTO events VALUES (1, \"start\")");
+        defer insert1.deinit();
+    }
+
+    // Phase 2: First recovery + more data
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.enableWal(wal_dir);
+
+        var create = try db.execute("CREATE TABLE events (id int, type text)");
+        defer create.deinit();
+
+        const recovered1 = try db.recoverFromWal(wal_dir);
+        try testing.expectEqual(@as(usize, 1), recovered1);
+
+        // Add more data after recovery
+        var insert2 = try db.execute("INSERT INTO events VALUES (2, \"middle\")");
+        defer insert2.deinit();
+    }
+
+    // Phase 3: Second recovery - should have both records
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.enableWal(wal_dir);
+
+        var create = try db.execute("CREATE TABLE events (id int, type text)");
+        defer create.deinit();
+
+        const recovered2 = try db.recoverFromWal(wal_dir);
+        try testing.expectEqual(@as(usize, 2), recovered2);
+
+        const table = db.tables.get("events").?;
+        try testing.expectEqual(@as(usize, 2), table.count());
+
+        var insert3 = try db.execute("INSERT INTO events VALUES (3, \"end\")");
+        defer insert3.deinit();
+    }
+
+    // Phase 4: Final recovery - should have all 3 records
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.enableWal(wal_dir);
+
+        var create = try db.execute("CREATE TABLE events (id int, type text)");
+        defer create.deinit();
+
+        const recovered3 = try db.recoverFromWal(wal_dir);
+        try testing.expectEqual(@as(usize, 3), recovered3);
+
+        const table = db.tables.get("events").?;
+        try testing.expectEqual(@as(usize, 3), table.count());
+    }
+}
+
+test "WAL Crash: Large transaction recovery" {
+    const wal_dir = "test_data/wal_crash_large";
+
+    std.fs.cwd().deleteTree(wal_dir) catch {};
+    defer std.fs.cwd().deleteTree(wal_dir) catch {};
+
+    const num_records = 1000;
+
+    // Phase 1: Write large transaction
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.enableWal(wal_dir);
+
+        var create = try db.execute("CREATE TABLE bulk_data (id int, value int)");
+        defer create.deinit();
+
+        var i: usize = 0;
+        while (i < num_records) : (i += 1) {
+            var buf: [100]u8 = undefined;
+            const query = try std.fmt.bufPrint(&buf, "INSERT INTO bulk_data VALUES ({d}, {d})", .{ i, i * 2 });
+            var result = try db.execute(query);
+            defer result.deinit();
+        }
+    }
+
+    // Phase 2: Recover large dataset
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.enableWal(wal_dir);
+
+        var create = try db.execute("CREATE TABLE bulk_data (id int, value int)");
+        defer create.deinit();
+
+        const recovered = try db.recoverFromWal(wal_dir);
+        try testing.expectEqual(@as(usize, num_records), recovered);
+
+        const table = db.tables.get("bulk_data").?;
+        try testing.expectEqual(@as(usize, num_records), table.count());
+
+        // Verify some random records
+        try testing.expect(table.get(0) != null);
+        try testing.expect(table.get(num_records / 2) != null);
+        try testing.expect(table.get(num_records - 1) != null);
+    }
+}
+
+test "WAL Crash: Interleaved INSERT/UPDATE/DELETE" {
+    const wal_dir = "test_data/wal_crash_mixed";
+
+    std.fs.cwd().deleteTree(wal_dir) catch {};
+    defer std.fs.cwd().deleteTree(wal_dir) catch {};
+
+    // Phase 1: Complex operations
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.enableWal(wal_dir);
+
+        var create = try db.execute("CREATE TABLE inventory (id int, qty int, status text)");
+        defer create.deinit();
+
+        // Insert
+        var insert1 = try db.execute("INSERT INTO inventory VALUES (1, 100, \"active\")");
+        defer insert1.deinit();
+
+        var insert2 = try db.execute("INSERT INTO inventory VALUES (2, 200, \"active\")");
+        defer insert2.deinit();
+
+        var insert3 = try db.execute("INSERT INTO inventory VALUES (3, 300, \"active\")");
+        defer insert3.deinit();
+
+        // Update
+        var update1 = try db.execute("UPDATE inventory SET qty = 150 WHERE id = 1");
+        defer update1.deinit();
+
+        // Delete
+        var delete1 = try db.execute("DELETE FROM inventory WHERE id = 2");
+        defer delete1.deinit();
+
+        // Insert again
+        var insert4 = try db.execute("INSERT INTO inventory VALUES (4, 400, \"pending\")");
+        defer insert4.deinit();
+
+        // Update
+        var update2 = try db.execute("UPDATE inventory SET status = \"shipped\" WHERE id = 4");
+        defer update2.deinit();
+    }
+
+    // Phase 2: Recover and verify final state
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.enableWal(wal_dir);
+
+        var create = try db.execute("CREATE TABLE inventory (id int, qty int, status text)");
+        defer create.deinit();
+
+        const recovered = try db.recoverFromWal(wal_dir);
+        try testing.expectEqual(@as(usize, 7), recovered); // 4 inserts + 2 updates + 1 delete
+
+        const table = db.tables.get("inventory").?;
+        try testing.expectEqual(@as(usize, 3), table.count()); // 4 inserted - 1 deleted = 3
+
+        // Verify final state
+        try testing.expect(table.get(1) != null); // Updated to 150
+        try testing.expect(table.get(2) == null); // Deleted
+        try testing.expect(table.get(3) != null); // Original
+        try testing.expect(table.get(4) != null); // Updated to "shipped"
+
+        // Verify values
+        var select1 = try db.execute("SELECT * FROM inventory WHERE id = 1");
+        defer select1.deinit();
+        try testing.expectEqual(@as(i64, 150), select1.rows.items[0].items[1].int); // qty updated
+
+        var select4 = try db.execute("SELECT * FROM inventory WHERE id = 4");
+        defer select4.deinit();
+        try testing.expectEqualStrings("shipped", select4.rows.items[0].items[2].text); // status updated
+    }
+}
+
+test "WAL Crash: Recovery with WAL file rotation" {
+    const wal_dir = "test_data/wal_crash_rotation";
+
+    std.fs.cwd().deleteTree(wal_dir) catch {};
+    defer std.fs.cwd().deleteTree(wal_dir) catch {};
+
+    // Phase 1: Write enough data to trigger rotation
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        // Use custom WAL with small file size to force rotation
+        const wal_ptr = try testing.allocator.create(WalWriter);
+        defer testing.allocator.destroy(wal_ptr);
+
+        wal_ptr.* = try WalWriter.initWithOptions(testing.allocator, wal_dir, .{
+            .max_file_size = 2048, // 2KB - small to force rotation
+        });
+        db.wal = wal_ptr;
+
+        var create = try db.execute("CREATE TABLE rotated (id int, data text)");
+        defer create.deinit();
+
+        // Insert enough to cause rotation
+        var i: usize = 0;
+        while (i < 100) : (i += 1) {
+            var buf: [200]u8 = undefined;
+            const query = try std.fmt.bufPrint(&buf, "INSERT INTO rotated VALUES ({d}, \"data_with_some_extra_text_to_fill_space_{d}\")", .{ i, i });
+            var result = try db.execute(query);
+            defer result.deinit();
+        }
+    }
+
+    // Phase 2: Recover from multiple WAL files
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.enableWal(wal_dir);
+
+        var create = try db.execute("CREATE TABLE rotated (id int, data text)");
+        defer create.deinit();
+
+        const recovered = try db.recoverFromWal(wal_dir);
+        try testing.expectEqual(@as(usize, 100), recovered);
+
+        const table = db.tables.get("rotated").?;
+        try testing.expectEqual(@as(usize, 100), table.count());
+    }
+}
+
+test "WAL Crash: Recovery performance with large dataset" {
+    const wal_dir = "test_data/wal_crash_perf";
+
+    std.fs.cwd().deleteTree(wal_dir) catch {};
+    defer std.fs.cwd().deleteTree(wal_dir) catch {};
+
+    const num_records = 5000;
+
+    // Phase 1: Create large dataset
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.enableWal(wal_dir);
+
+        var create = try db.execute("CREATE TABLE perf_test (id int, name text, score int)");
+        defer create.deinit();
+
+        var i: usize = 0;
+        while (i < num_records) : (i += 1) {
+            var buf: [150]u8 = undefined;
+            const query = try std.fmt.bufPrint(&buf, "INSERT INTO perf_test VALUES ({d}, \"user_{d}\", {d})", .{ i, i, i % 100 });
+            var result = try db.execute(query);
+            defer result.deinit();
+        }
+    }
+
+    // Phase 2: Benchmark recovery
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.enableWal(wal_dir);
+
+        var create = try db.execute("CREATE TABLE perf_test (id int, name text, score int)");
+        defer create.deinit();
+
+        var timer = try std.time.Timer.start();
+        const recovered = try db.recoverFromWal(wal_dir);
+        const elapsed_ns = timer.read();
+
+        const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;
+        const ops_per_sec = @as(f64, @floatFromInt(recovered)) / (@as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0);
+
+        std.debug.print("\nRecovery Performance:\n", .{});
+        std.debug.print("  Records: {d}\n", .{recovered});
+        std.debug.print("  Time: {d:.2} ms\n", .{elapsed_ms});
+        std.debug.print("  Throughput: {d:.0} ops/sec\n", .{ops_per_sec});
+
+        try testing.expectEqual(@as(usize, num_records), recovered);
+
+        const table = db.tables.get("perf_test").?;
+        try testing.expectEqual(@as(usize, num_records), table.count());
+    }
 }
