@@ -393,8 +393,8 @@ test "Cosine Distance - Known Values" {
     defer hnsw.deinit();
 
     // Test with known vectors
-    const v1 = &[_]f32{ 3.0, 4.0 };  // magnitude = 5
-    const v2 = &[_]f32{ 4.0, 3.0 };  // magnitude = 5
+    const v1 = &[_]f32{ 3.0, 4.0 }; // magnitude = 5
+    const v2 = &[_]f32{ 4.0, 3.0 }; // magnitude = 5
 
     _ = try hnsw.insert(v1, null);
     _ = try hnsw.insert(v2, null);
@@ -973,10 +973,10 @@ test "GraphRAG - Get Neighbors" {
     var hnsw = HNSW(f32).init(allocator, 16, 200);
     defer hnsw.deinit();
 
-    const id1 = try hnsw.insert(&[_]f32{ 1.0 }, null);
-    const id2 = try hnsw.insert(&[_]f32{ 2.0 }, null);
-    const id3 = try hnsw.insert(&[_]f32{ 3.0 }, null);
-    const id4 = try hnsw.insert(&[_]f32{ 4.0 }, null);
+    const id1 = try hnsw.insert(&[_]f32{1.0}, null);
+    const id2 = try hnsw.insert(&[_]f32{2.0}, null);
+    const id3 = try hnsw.insert(&[_]f32{3.0}, null);
+    const id4 = try hnsw.insert(&[_]f32{4.0}, null);
 
     try hnsw.addEdge(id1, id2, "calls", 1.0);
     try hnsw.addEdge(id1, id3, "calls", 1.0);
@@ -999,10 +999,10 @@ test "GraphRAG - Graph Traversal" {
     defer hnsw.deinit();
 
     // Create a simple graph: 1 -> 2 -> 3 -> 4
-    const id1 = try hnsw.insert(&[_]f32{ 1.0 }, null);
-    const id2 = try hnsw.insert(&[_]f32{ 2.0 }, null);
-    const id3 = try hnsw.insert(&[_]f32{ 3.0 }, null);
-    const id4 = try hnsw.insert(&[_]f32{ 4.0 }, null);
+    const id1 = try hnsw.insert(&[_]f32{1.0}, null);
+    const id2 = try hnsw.insert(&[_]f32{2.0}, null);
+    const id3 = try hnsw.insert(&[_]f32{3.0}, null);
+    const id4 = try hnsw.insert(&[_]f32{4.0}, null);
 
     try hnsw.addEdge(id1, id2, "next", 1.0);
     try hnsw.addEdge(id2, id3, "next", 1.0);
@@ -1030,9 +1030,9 @@ test "GraphRAG - Incoming and Outgoing Edges" {
     var hnsw = HNSW(f32).init(allocator, 16, 200);
     defer hnsw.deinit();
 
-    const id1 = try hnsw.insert(&[_]f32{ 1.0 }, null);
-    const id2 = try hnsw.insert(&[_]f32{ 2.0 }, null);
-    const id3 = try hnsw.insert(&[_]f32{ 3.0 }, null);
+    const id1 = try hnsw.insert(&[_]f32{1.0}, null);
+    const id2 = try hnsw.insert(&[_]f32{2.0}, null);
+    const id3 = try hnsw.insert(&[_]f32{3.0}, null);
 
     // id1 -> id2, id1 -> id3, id3 -> id2
     try hnsw.addEdge(id1, id2, "calls", 1.0);
