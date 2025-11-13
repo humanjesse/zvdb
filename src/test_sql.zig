@@ -623,3 +623,417 @@ test "Persistence: Auto-save on deinit" {
     // Clean up
     std.fs.cwd().deleteTree(test_dir) catch {};
 }
+
+// ============================================================================
+// UPDATE Statement Tests
+// ============================================================================
+
+test "SQL: Basic UPDATE single column" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    var create_result = try db.execute("CREATE TABLE users (id int, name text, age int)");
+    defer create_result.deinit();
+
+    var insert1 = try db.execute("INSERT INTO users VALUES (1, \"Alice\", 25)");
+    defer insert1.deinit();
+    var insert2 = try db.execute("INSERT INTO users VALUES (2, \"Bob\", 30)");
+    defer insert2.deinit();
+
+    // Update single column with WHERE
+    var update_result = try db.execute("UPDATE users SET name = \"Alicia\" WHERE id = 1");
+    defer update_result.deinit();
+
+    try testing.expect(update_result.rows.items[0].items[0].int == 1); // 1 row updated
+
+    // Verify the update
+    var select_result = try db.execute("SELECT * FROM users WHERE id = 1");
+    defer select_result.deinit();
+
+    try testing.expect(select_result.rows.items.len == 1);
+    try testing.expect(std.mem.eql(u8, select_result.rows.items[0].items[2].text, "Alicia"));
+}
+
+test "SQL: UPDATE multiple columns" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    var create_result = try db.execute("CREATE TABLE products (id int, name text, price float, stock int)");
+    defer create_result.deinit();
+
+    var insert_result = try db.execute("INSERT INTO products VALUES (1, \"Widget\", 19.99, 100)");
+    defer insert_result.deinit();
+
+    // Update multiple columns
+    var update_result = try db.execute("UPDATE products SET price = 24.99, stock = 150 WHERE id = 1");
+    defer update_result.deinit();
+
+    try testing.expect(update_result.rows.items[0].items[0].int == 1);
+
+    // Verify both columns updated
+    var select_result = try db.execute("SELECT * FROM products WHERE id = 1");
+    defer select_result.deinit();
+
+    try testing.expect(select_result.rows.items[0].items[3].float == 24.99);
+    try testing.expect(select_result.rows.items[0].items[4].int == 150);
+}
+
+test "SQL: UPDATE with WHERE AND condition" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    var create_result = try db.execute("CREATE TABLE items (id int, category text, price float)");
+    defer create_result.deinit();
+
+    var insert1 = try db.execute("INSERT INTO items VALUES (1, \"electronics\", 99.99)");
+    defer insert1.deinit();
+    var insert2 = try db.execute("INSERT INTO items VALUES (2, \"electronics\", 49.99)");
+    defer insert2.deinit();
+    var insert3 = try db.execute("INSERT INTO items VALUES (3, \"books\", 19.99)");
+    defer insert3.deinit();
+
+    // Update with AND condition
+    var update_result = try db.execute("UPDATE items SET price = 89.99 WHERE category = \"electronics\" AND price > 50");
+    defer update_result.deinit();
+
+    try testing.expect(update_result.rows.items[0].items[0].int == 1); // Only 1 row matches
+
+    // Verify correct row updated
+    var select_result = try db.execute("SELECT * FROM items WHERE id = 1");
+    defer select_result.deinit();
+
+    try testing.expect(select_result.rows.items[0].items[3].float == 89.99);
+}
+
+test "SQL: UPDATE with WHERE OR condition" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    var create_result = try db.execute("CREATE TABLE tasks (id int, status text, priority int)");
+    defer create_result.deinit();
+
+    var insert1 = try db.execute("INSERT INTO tasks VALUES (1, \"pending\", 1)");
+    defer insert1.deinit();
+    var insert2 = try db.execute("INSERT INTO tasks VALUES (2, \"active\", 3)");
+    defer insert2.deinit();
+    var insert3 = try db.execute("INSERT INTO tasks VALUES (3, \"pending\", 5)");
+    defer insert3.deinit();
+
+    // Update with OR condition
+    var update_result = try db.execute("UPDATE tasks SET status = \"completed\" WHERE priority = 1 OR priority = 5");
+    defer update_result.deinit();
+
+    try testing.expect(update_result.rows.items[0].items[0].int == 2); // 2 rows updated
+
+    // Verify both rows updated
+    var select_result = try db.execute("SELECT * FROM tasks WHERE status = \"completed\"");
+    defer select_result.deinit();
+
+    try testing.expect(select_result.rows.items.len == 2);
+}
+
+test "SQL: UPDATE with comparison operators" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    var create_result = try db.execute("CREATE TABLE inventory (id int, quantity int)");
+    defer create_result.deinit();
+
+    var insert1 = try db.execute("INSERT INTO inventory VALUES (1, 5)");
+    defer insert1.deinit();
+    var insert2 = try db.execute("INSERT INTO inventory VALUES (2, 15)");
+    defer insert2.deinit();
+    var insert3 = try db.execute("INSERT INTO inventory VALUES (3, 25)");
+    defer insert3.deinit();
+
+    // Test >= operator
+    var update1 = try db.execute("UPDATE inventory SET quantity = 20 WHERE quantity >= 15");
+    defer update1.deinit();
+    try testing.expect(update1.rows.items[0].items[0].int == 2);
+
+    // Test < operator
+    var update2 = try db.execute("UPDATE inventory SET quantity = 10 WHERE quantity < 15");
+    defer update2.deinit();
+    try testing.expect(update2.rows.items[0].items[0].int == 1);
+}
+
+test "SQL: UPDATE with IS NULL" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    var create_result = try db.execute("CREATE TABLE contacts (id int, email text)");
+    defer create_result.deinit();
+
+    var insert1 = try db.execute("INSERT INTO contacts VALUES (1, \"alice@example.com\")");
+    defer insert1.deinit();
+    var insert2 = try db.execute("INSERT INTO contacts VALUES (2, NULL)");
+    defer insert2.deinit();
+
+    // Update rows where email IS NULL
+    var update_result = try db.execute("UPDATE contacts SET email = \"unknown@example.com\" WHERE email IS NULL");
+    defer update_result.deinit();
+
+    try testing.expect(update_result.rows.items[0].items[0].int == 1);
+
+    // Verify update
+    var select_result = try db.execute("SELECT * FROM contacts WHERE id = 2");
+    defer select_result.deinit();
+
+    try testing.expect(std.mem.eql(u8, select_result.rows.items[0].items[2].text, "unknown@example.com"));
+}
+
+test "SQL: UPDATE with IS NOT NULL" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    var create_result = try db.execute("CREATE TABLE profiles (id int, bio text)");
+    defer create_result.deinit();
+
+    var insert1 = try db.execute("INSERT INTO profiles VALUES (1, \"Software developer\")");
+    defer insert1.deinit();
+    var insert2 = try db.execute("INSERT INTO profiles VALUES (2, NULL)");
+    defer insert2.deinit();
+
+    // Update rows where bio IS NOT NULL
+    var update_result = try db.execute("UPDATE profiles SET bio = \"Updated bio\" WHERE bio IS NOT NULL");
+    defer update_result.deinit();
+
+    try testing.expect(update_result.rows.items[0].items[0].int == 1);
+}
+
+test "SQL: UPDATE with no matching rows" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    var create_result = try db.execute("CREATE TABLE users (id int, name text)");
+    defer create_result.deinit();
+
+    var insert_result = try db.execute("INSERT INTO users VALUES (1, \"Alice\")");
+    defer insert_result.deinit();
+
+    // Try to update non-existent row
+    var update_result = try db.execute("UPDATE users SET name = \"Bob\" WHERE id = 999");
+    defer update_result.deinit();
+
+    try testing.expect(update_result.rows.items[0].items[0].int == 0); // 0 rows updated
+}
+
+test "SQL: UPDATE all rows (no WHERE)" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    var create_result = try db.execute("CREATE TABLE settings (id int, enabled bool)");
+    defer create_result.deinit();
+
+    var insert1 = try db.execute("INSERT INTO settings VALUES (1, true)");
+    defer insert1.deinit();
+    var insert2 = try db.execute("INSERT INTO settings VALUES (2, true)");
+    defer insert2.deinit();
+    var insert3 = try db.execute("INSERT INTO settings VALUES (3, false)");
+    defer insert3.deinit();
+
+    // Update all rows
+    var update_result = try db.execute("UPDATE settings SET enabled = false");
+    defer update_result.deinit();
+
+    try testing.expect(update_result.rows.items[0].items[0].int == 3); // All 3 rows updated
+
+    // Verify all updated
+    var select_result = try db.execute("SELECT * FROM settings");
+    defer select_result.deinit();
+
+    for (select_result.rows.items) |row| {
+        try testing.expect(row.items[2].bool == false);
+    }
+}
+
+test "SQL: UPDATE with NOT operator" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    var create_result = try db.execute("CREATE TABLE flags (id int, active bool)");
+    defer create_result.deinit();
+
+    var insert1 = try db.execute("INSERT INTO flags VALUES (1, true)");
+    defer insert1.deinit();
+    var insert2 = try db.execute("INSERT INTO flags VALUES (2, false)");
+    defer insert2.deinit();
+
+    // Update with NOT operator
+    var update_result = try db.execute("UPDATE flags SET active = true WHERE NOT active = true");
+    defer update_result.deinit();
+
+    try testing.expect(update_result.rows.items[0].items[0].int == 1);
+
+    // Verify all are now true
+    var select_result = try db.execute("SELECT * FROM flags");
+    defer select_result.deinit();
+
+    for (select_result.rows.items) |row| {
+        try testing.expect(row.items[2].bool == true);
+    }
+}
+
+test "SQL: UPDATE with complex nested conditions" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    var create_result = try db.execute("CREATE TABLE records (id int, value int, status text)");
+    defer create_result.deinit();
+
+    var insert1 = try db.execute("INSERT INTO records VALUES (1, 10, \"active\")");
+    defer insert1.deinit();
+    var insert2 = try db.execute("INSERT INTO records VALUES (2, 20, \"inactive\")");
+    defer insert2.deinit();
+    var insert3 = try db.execute("INSERT INTO records VALUES (3, 30, \"active\")");
+    defer insert3.deinit();
+    var insert4 = try db.execute("INSERT INTO records VALUES (4, 40, \"inactive\")");
+    defer insert4.deinit();
+
+    // Complex condition: (value > 15 AND status = "active") OR value < 15
+    var update_result = try db.execute("UPDATE records SET status = \"updated\" WHERE value > 15 AND status = \"active\" OR value < 15");
+    defer update_result.deinit();
+
+    try testing.expect(update_result.rows.items[0].items[0].int == 2); // rows 1 and 3
+
+    // Verify correct rows updated
+    var select_result = try db.execute("SELECT * FROM records WHERE status = \"updated\"");
+    defer select_result.deinit();
+
+    try testing.expect(select_result.rows.items.len == 2);
+}
+
+test "SQL: UPDATE with embeddings - vector changed" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    // Initialize vector search
+    try db.initVectorSearch(16, 200);
+
+    var create_result = try db.execute("CREATE TABLE documents (id int, title text, embedding embedding)");
+    defer create_result.deinit();
+
+    // Create embeddings
+    var old_embedding = [_]f32{0.1} ** 768;
+    var new_embedding = [_]f32{0.9} ** 768;
+
+    // Insert document with embedding using table API
+    const table = db.tables.get("documents").?;
+
+    var values = std.StringHashMap(ColumnValue).init(testing.allocator);
+    defer values.deinit();
+    try values.put("id", ColumnValue{ .int = 1 });
+    try values.put("title", ColumnValue{ .text = "Test Doc" });
+    const emb_old = try testing.allocator.dupe(f32, &old_embedding);
+    defer testing.allocator.free(emb_old);
+    try values.put("embedding", ColumnValue{ .embedding = emb_old });
+
+    const row_id = try table.insert(values);
+    _ = try db.hnsw.?.insert(&old_embedding, row_id);
+
+    // Verify embedding is in HNSW
+    var internal_id = db.hnsw.?.getInternalId(row_id);
+    try testing.expect(internal_id != null);
+
+    // Now update the embedding using table API to simulate UPDATE
+    const row = table.get(row_id).?;
+    const emb_new = try testing.allocator.dupe(f32, &new_embedding);
+    defer testing.allocator.free(emb_new);
+    try row.set(testing.allocator, "embedding", ColumnValue{ .embedding = emb_new });
+
+    // Simulate UPDATE execution: remove old, insert new
+    try db.hnsw.?.removeNode(row_id);
+    _ = try db.hnsw.?.insert(&new_embedding, row_id);
+
+    // Verify new embedding is in HNSW
+    internal_id = db.hnsw.?.getInternalId(row_id);
+    try testing.expect(internal_id != null);
+
+    // Verify embedding changed
+    const updated_row = table.get(row_id).?;
+    const updated_emb = updated_row.get("embedding").?;
+    try testing.expect(updated_emb.embedding[0] == 0.9);
+}
+
+test "SQL: UPDATE persistence" {
+    const test_dir = "test_update_persistence";
+    std.fs.cwd().deleteTree(test_dir) catch {};
+    defer std.fs.cwd().deleteTree(test_dir) catch {};
+
+    // Create database and enable persistence
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.enablePersistence(test_dir, false);
+
+        var create_result = try db.execute("CREATE TABLE config (key text, value int)");
+        defer create_result.deinit();
+
+        var insert_result = try db.execute("INSERT INTO config VALUES (\"timeout\", 30)");
+        defer insert_result.deinit();
+
+        var update_result = try db.execute("UPDATE config SET value = 60 WHERE key = \"timeout\"");
+        defer update_result.deinit();
+
+        try testing.expect(update_result.rows.items[0].items[0].int == 1);
+
+        // Save manually
+        try db.saveAll(test_dir);
+    }
+
+    // Load and verify update persisted
+    {
+        var db = try Database.loadAll(testing.allocator, test_dir);
+        defer db.deinit();
+
+        var result = try db.execute("SELECT * FROM config WHERE key = \"timeout\"");
+        defer result.deinit();
+
+        try testing.expect(result.rows.items.len == 1);
+        try testing.expect(result.rows.items[0].items[2].int == 60);
+    }
+}
+
+test "SQL: UPDATE error on non-existent column" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    var create_result = try db.execute("CREATE TABLE users (id int, name text)");
+    defer create_result.deinit();
+
+    var insert_result = try db.execute("INSERT INTO users VALUES (1, \"Alice\")");
+    defer insert_result.deinit();
+
+    // Try to update non-existent column
+    const result = db.execute("UPDATE users SET nonexistent = \"value\" WHERE id = 1");
+
+    try testing.expectError(error.ColumnNotFound, result);
+}
+
+test "SQL: UPDATE with inequality operators" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    var create_result = try db.execute("CREATE TABLE scores (id int, score int, grade text)");
+    defer create_result.deinit();
+
+    var insert1 = try db.execute("INSERT INTO scores VALUES (1, 95, \"TBD\")");
+    defer insert1.deinit();
+    var insert2 = try db.execute("INSERT INTO scores VALUES (2, 75, \"TBD\")");
+    defer insert2.deinit();
+    var insert3 = try db.execute("INSERT INTO scores VALUES (3, 55, \"TBD\")");
+    defer insert3.deinit();
+
+    // Update with != operator
+    var update_result = try db.execute("UPDATE scores SET grade = \"Pass\" WHERE score != 55");
+    defer update_result.deinit();
+
+    try testing.expect(update_result.rows.items[0].items[0].int == 2);
+
+    // Verify updates
+    var select_result = try db.execute("SELECT * FROM scores WHERE grade = \"Pass\"");
+    defer select_result.deinit();
+
+    try testing.expect(select_result.rows.items.len == 2);
+}

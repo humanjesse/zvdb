@@ -139,6 +139,7 @@ pub const Database = struct {
             .insert => |insert| try self.executeInsert(insert),
             .select => |select| try self.executeSelect(select),
             .delete => |delete| try self.executeDelete(delete),
+            .update => |update| try self.executeUpdate(update),
         };
     }
 
@@ -360,6 +361,156 @@ pub const Database = struct {
         try result.addColumn("deleted");
         var row = ArrayList(ColumnValue).init(self.allocator);
         try row.append(ColumnValue{ .int = @intCast(deleted_count) });
+        try result.addRow(row);
+
+        return result;
+    }
+
+    fn executeUpdate(self: *Database, cmd: sql.UpdateCmd) !QueryResult {
+        const table = self.tables.get(cmd.table_name) orelse return sql.SqlError.TableNotFound;
+
+        // Validate all SET columns exist in table and have correct types
+        for (cmd.assignments.items) |assignment| {
+            var found = false;
+            var col_type: ColumnType = undefined;
+
+            for (table.columns.items) |col| {
+                if (std.mem.eql(u8, col.name, assignment.column)) {
+                    found = true;
+                    col_type = col.col_type;
+                    break;
+                }
+            }
+
+            if (!found) {
+                return sql.SqlError.ColumnNotFound;
+            }
+
+            // Type validation
+            const value_valid = switch (col_type) {
+                .int => assignment.value == .int or assignment.value == .null_value,
+                .float => assignment.value == .float or assignment.value == .int or assignment.value == .null_value,
+                .text => assignment.value == .text or assignment.value == .null_value,
+                .bool => assignment.value == .bool or assignment.value == .null_value,
+                .embedding => blk: {
+                    if (assignment.value == .null_value) break :blk true;
+                    if (assignment.value != .embedding) break :blk false;
+                    // Validate dimension
+                    const expected_dim: usize = 768; // TODO: Make this configurable
+                    break :blk assignment.value.embedding.len == expected_dim;
+                },
+            };
+
+            if (!value_valid) {
+                return sql.SqlError.TypeMismatch;
+            }
+        }
+
+        var updated_count: usize = 0;
+        const row_ids = try table.getAllRows(self.allocator);
+        defer self.allocator.free(row_ids);
+
+        for (row_ids) |row_id| {
+            var row = table.get(row_id) orelse continue;
+
+            // Apply WHERE filter using expression evaluator
+            var should_update = true;
+            if (cmd.where_expr) |expr| {
+                should_update = sql.evaluateExpr(expr, row.values);
+            }
+
+            if (!should_update) continue;
+
+            // Track if embedding column is being updated
+            var old_embedding: ?[]const f32 = null;
+            var new_embedding: ?[]const f32 = null;
+            var embedding_changed = false;
+
+            // Clone old embedding for potential rollback
+            var old_embedding_backup: ?[]f32 = null;
+            defer if (old_embedding_backup) |emb| self.allocator.free(emb);
+
+            // Find old embedding if it exists
+            if (self.hnsw != null) {
+                var it = row.values.iterator();
+                while (it.next()) |entry| {
+                    if (entry.value_ptr.* == .embedding) {
+                        old_embedding = entry.value_ptr.embedding;
+                        // Clone for potential rollback
+                        old_embedding_backup = try self.allocator.dupe(f32, old_embedding.?);
+                        break;
+                    }
+                }
+            }
+
+            // First pass: Detect if embedding is changing and determine new embedding
+            // This allows us to validate HNSW operations BEFORE mutating the row
+            for (cmd.assignments.items) |assignment| {
+                if (assignment.value == .embedding) {
+                    new_embedding = assignment.value.embedding;
+                    // Check if embedding actually changed
+                    if (old_embedding) |old_emb| {
+                        if (old_emb.len == new_embedding.?.len) {
+                            var changed = false;
+                            for (old_emb, 0..) |val, i| {
+                                if (val != new_embedding.?[i]) {
+                                    changed = true;
+                                    break;
+                                }
+                            }
+                            embedding_changed = changed;
+                        } else {
+                            embedding_changed = true;
+                        }
+                    } else {
+                        embedding_changed = true;
+                    }
+                    break; // Only one embedding column per table
+                }
+            }
+
+            // Handle HNSW index updates BEFORE applying row updates
+            // This ensures atomicity: if HNSW fails, row hasn't been mutated
+            if (embedding_changed and self.hnsw != null) {
+                const h = self.hnsw.?;
+
+                // Remove old vector from HNSW (if it existed)
+                if (old_embedding_backup != null) {
+                    h.removeNode(row_id) catch |err| {
+                        std.debug.print("Error removing node from HNSW: {}\n", .{err});
+                        // Row not yet updated, safe to return error
+                        return err;
+                    };
+                }
+
+                // Insert new vector with same row_id
+                if (new_embedding) |new_emb| {
+                    _ = h.insert(new_emb, row_id) catch |err| {
+                        // Rollback: Re-insert old embedding to restore HNSW state
+                        if (old_embedding_backup) |old_clone| {
+                            _ = h.insert(old_clone, row_id) catch {
+                                std.debug.print("CRITICAL: Failed to rollback HNSW state after insert failure\n", .{});
+                            };
+                        }
+                        std.debug.print("Error inserting new vector to HNSW: {}\n", .{err});
+                        return err;
+                    };
+                }
+            }
+
+            // Now apply all SET assignments to the row
+            // This happens AFTER HNSW operations succeed, ensuring atomicity
+            for (cmd.assignments.items) |assignment| {
+                try row.set(self.allocator, assignment.column, assignment.value);
+            }
+
+            updated_count += 1;
+        }
+
+        var result = QueryResult.init(self.allocator);
+        try result.addColumn("updated");
+        var row = ArrayList(ColumnValue).init(self.allocator);
+        try row.append(ColumnValue{ .int = @intCast(updated_count) });
         try result.addRow(row);
 
         return result;
