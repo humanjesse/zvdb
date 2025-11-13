@@ -114,9 +114,7 @@ pub const Database = struct {
 
         // Close WAL if enabled
         if (self.wal) |w| {
-            w.close() catch |err| {
-                std.debug.print("Warning: Failed to close WAL: {}\n", .{err});
-            };
+            w.deinit();
             self.allocator.destroy(w);
         }
 
@@ -241,7 +239,7 @@ pub const Database = struct {
 
             // Create WAL record
             const table_name_owned = try self.allocator.dupe(u8, cmd.table_name);
-            var record = WalRecord{
+            const record = WalRecord{
                 .record_type = WalRecordType.insert_row,
                 .tx_id = tx_id,
                 .lsn = 0, // Will be assigned by WAL writer
@@ -252,7 +250,7 @@ pub const Database = struct {
             };
 
             // Write WAL record and flush to disk (CRITICAL: must be durable before table mutation)
-            try w.writeRecord(&record);
+            _ = try w.writeRecord(record);
             try w.flush();
 
             // Clean up the owned table_name (writeRecord makes its own copy)
@@ -437,7 +435,7 @@ pub const Database = struct {
 
                     // Create WAL record
                     const table_name_owned = try self.allocator.dupe(u8, cmd.table_name);
-                    var record = WalRecord{
+                    const record = WalRecord{
                         .record_type = WalRecordType.delete_row,
                         .tx_id = tx_id,
                         .lsn = 0, // Will be assigned by WAL writer
@@ -448,7 +446,7 @@ pub const Database = struct {
                     };
 
                     // Write WAL record and flush (CRITICAL: must be durable before deletion)
-                    try w.writeRecord(&record);
+                    _ = try w.writeRecord(record);
                     try w.flush();
 
                     // Clean up the owned table_name
@@ -613,7 +611,7 @@ pub const Database = struct {
 
                 // Create WAL record
                 const table_name_owned = try self.allocator.dupe(u8, cmd.table_name);
-                var record = WalRecord{
+                const record = WalRecord{
                     .record_type = WalRecordType.update_row,
                     .tx_id = tx_id,
                     .lsn = 0, // Will be assigned by WAL writer
@@ -624,7 +622,7 @@ pub const Database = struct {
                 };
 
                 // Write WAL record and flush (CRITICAL: must be durable before mutations)
-                try w.writeRecord(&record);
+                _ = try w.writeRecord(record);
                 try w.flush();
 
                 // Clean up the owned table_name
