@@ -156,6 +156,17 @@ zig build        # Build library
 zig build test   # Run tests
 ```
 
+## CI/CD
+
+This project uses GitHub Actions for continuous integration:
+
+- ✅ Automated testing on push/PR
+- ✅ Multi-OS support (Ubuntu, macOS, Windows)
+- ✅ Code formatting checks
+- ✅ Benchmark builds
+
+See [CI_CD_SETUP.md](CI_CD_SETUP.md) for setup instructions.
+
 ## Recent Updates
 
 - **2025-10-20**: GraphRAG MVP Release
