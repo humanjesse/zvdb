@@ -289,6 +289,17 @@ zig build test   # Run tests
 zig build demo   # Run SQL demo
 ```
 
+## CI/CD
+
+This project uses GitHub Actions for continuous integration:
+
+- ✅ Automated testing on push/PR
+- ✅ Multi-OS support (Ubuntu, macOS, Windows)
+- ✅ Code formatting checks
+- ✅ Benchmark builds
+
+See [CI_CD_SETUP.md](CI_CD_SETUP.md) for setup instructions.
+
 ## Recent Updates
 
 - **2025-11-13**: SQL Interface Release 🎉
