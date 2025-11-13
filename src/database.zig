@@ -83,16 +83,27 @@ pub const Database = struct {
     tables: StringHashMap(*Table),
     hnsw: ?*HNSW(f32), // Optional vector index
     allocator: Allocator,
+    data_dir: ?[]const u8, // Data directory for persistence (owned)
+    auto_save: bool, // Auto-save on deinit
 
     pub fn init(allocator: Allocator) Database {
         return Database{
             .tables = StringHashMap(*Table).init(allocator),
             .hnsw = null,
             .allocator = allocator,
+            .data_dir = null,
+            .auto_save = false,
         };
     }
 
     pub fn deinit(self: *Database) void {
+        // Auto-save if enabled and data_dir is set
+        if (self.auto_save and self.data_dir != null) {
+            self.saveAll(self.data_dir.?) catch |err| {
+                std.debug.print("Warning: Failed to auto-save database: {}\n", .{err});
+            };
+        }
+
         var it = self.tables.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -104,6 +115,10 @@ pub const Database = struct {
         if (self.hnsw) |h| {
             h.deinit();
             self.allocator.destroy(h);
+        }
+
+        if (self.data_dir) |dir| {
+            self.allocator.free(dir);
         }
     }
 
@@ -348,6 +363,114 @@ pub const Database = struct {
         try result.addRow(row);
 
         return result;
+    }
+
+    /// Enable persistence with specified data directory
+    pub fn enablePersistence(self: *Database, data_dir: []const u8, auto_save: bool) !void {
+        if (self.data_dir) |old_dir| {
+            self.allocator.free(old_dir);
+        }
+        self.data_dir = try self.allocator.dupe(u8, data_dir);
+        self.auto_save = auto_save;
+    }
+
+    /// Save all tables and HNSW index to the data directory
+    pub fn saveAll(self: *Database, dir_path: []const u8) !void {
+        // Create directory if it doesn't exist
+        std.fs.cwd().makePath(dir_path) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+
+        // Save each table
+        var it = self.tables.iterator();
+        while (it.next()) |entry| {
+            const table_name = entry.key_ptr.*;
+            const table = entry.value_ptr.*;
+
+            const file_path = try std.fmt.allocPrint(
+                self.allocator,
+                "{s}/{s}.zvdb",
+                .{ dir_path, table_name },
+            );
+            defer self.allocator.free(file_path);
+
+            try table.save(file_path);
+        }
+
+        // Save HNSW index if it exists
+        if (self.hnsw) |h| {
+            const hnsw_path = try std.fmt.allocPrint(
+                self.allocator,
+                "{s}/vectors.hnsw",
+                .{dir_path},
+            );
+            defer self.allocator.free(hnsw_path);
+
+            try h.save(hnsw_path);
+        }
+    }
+
+    /// Load all tables and HNSW index from the data directory
+    pub fn loadAll(allocator: Allocator, dir_path: []const u8) !Database {
+        var db = Database.init(allocator);
+        errdefer db.deinit();
+
+        // Open directory
+        var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => {
+                // Directory doesn't exist yet, return empty database
+                return db;
+            },
+            else => return err,
+        };
+        defer dir.close();
+
+        // Iterate through files
+        var it = dir.iterate();
+        while (try it.next()) |entry| {
+            if (entry.kind != .file) continue;
+
+            // Check file extension
+            const ext = std.fs.path.extension(entry.name);
+
+            if (std.mem.eql(u8, ext, ".zvdb")) {
+                // Load table file
+                const file_path = try std.fmt.allocPrint(
+                    allocator,
+                    "{s}/{s}",
+                    .{ dir_path, entry.name },
+                );
+                defer allocator.free(file_path);
+
+                var table = try Table.load(allocator, file_path);
+                errdefer table.deinit();
+
+                // Allocate owned table pointer
+                const table_ptr = try allocator.create(Table);
+                table_ptr.* = table;
+
+                // Duplicate table name for the key
+                const table_name_key = try allocator.dupe(u8, table.name);
+
+                // Add to database
+                try db.tables.put(table_name_key, table_ptr);
+            } else if (std.mem.eql(u8, entry.name, "vectors.hnsw")) {
+                // Load HNSW index
+                const file_path = try std.fmt.allocPrint(
+                    allocator,
+                    "{s}/{s}",
+                    .{ dir_path, entry.name },
+                );
+                defer allocator.free(file_path);
+
+                const hnsw = try allocator.create(HNSW(f32));
+                hnsw.* = try HNSW(f32).load(allocator, file_path);
+                db.hnsw = hnsw;
+            }
+        }
+
+        return db;
     }
 
     fn valuesEqual(a: ColumnValue, b: ColumnValue) bool {

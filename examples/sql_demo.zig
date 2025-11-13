@@ -75,12 +75,98 @@ pub fn main() !void {
     defer result9.deinit();
     try result9.print();
 
+    // ==========================================================================
+    // NEW! Persistence Demo
+    // ==========================================================================
+
+    std.debug.print("\n=== NEW FEATURE: Table Persistence! ===\n", .{});
+
+    const data_dir = "zvdb_data";
+
+    std.debug.print("--- Saving database to disk: {s}/ ---\n", .{data_dir});
+    try db.saveAll(data_dir);
+
+    // Check what was saved
+    var dir = try std.fs.cwd().openDir(data_dir, .{ .iterate = true });
+    defer dir.close();
+
+    std.debug.print("\nFiles saved:\n", .{});
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind == .file) {
+            const stat = try dir.statFile(entry.name);
+            std.debug.print("  - {s} ({d} bytes)\n", .{ entry.name, stat.size });
+        }
+    }
+
+    std.debug.print("\n--- Loading database from disk ---\n", .{});
+    var loaded_db = try Database.loadAll(allocator, data_dir);
+    defer loaded_db.deinit();
+
+    std.debug.print("Loaded {d} table(s) from disk!\n", .{loaded_db.tables.count()});
+
+    std.debug.print("\n--- Querying loaded database ---\n", .{});
+    var result10 = try loaded_db.execute("SELECT * FROM users");
+    defer result10.deinit();
+    try result10.print();
+
+    var result11 = try loaded_db.execute("SELECT * FROM products");
+    defer result11.deinit();
+    try result11.print();
+
+    std.debug.print("--- Data persisted successfully! ---\n", .{});
+
+    // ==========================================================================
+    // Auto-save Demo
+    // ==========================================================================
+
+    std.debug.print("\n=== Auto-Save Feature ===\n", .{});
+    std.debug.print("Creating a new database with auto-save enabled...\n", .{});
+
+    {
+        var auto_db = Database.init(allocator);
+        defer auto_db.deinit(); // Will trigger auto-save!
+
+        try auto_db.enablePersistence("zvdb_data_autosave", true);
+
+        _ = try auto_db.execute("CREATE TABLE autosave_test (id int, message text)");
+        _ = try auto_db.execute("INSERT INTO autosave_test VALUES (1, \"This will be auto-saved!\")");
+
+        std.debug.print("Data created... database will auto-save on deinit.\n", .{});
+    }
+
+    std.debug.print("Database closed, checking if auto-save worked...\n", .{});
+
+    // Verify auto-save worked
+    {
+        var verify_db = try Database.loadAll(allocator, "zvdb_data_autosave");
+        defer verify_db.deinit();
+
+        var result12 = try verify_db.execute("SELECT * FROM autosave_test");
+        defer result12.deinit();
+
+        std.debug.print("Auto-save verified! Data recovered:\n", .{});
+        try result12.print();
+    }
+
+    // Clean up demo directories
+    std.debug.print("\n--- Cleaning up demo data directories ---\n", .{});
+    std.fs.cwd().deleteTree(data_dir) catch {};
+    std.fs.cwd().deleteTree("zvdb_data_autosave") catch {};
+
     std.debug.print("\n=== Demo complete! ===\n", .{});
-    std.debug.print("Try these features in your own code:\n", .{});
-    std.debug.print("- CREATE TABLE with int, float, text, bool, and embedding types\n", .{});
-    std.debug.print("- INSERT with values or column names\n", .{});
-    std.debug.print("- SELECT with WHERE, LIMIT, and column selection\n", .{});
-    std.debug.print("- DELETE with WHERE conditions\n", .{});
-    std.debug.print("- ORDER BY SIMILARITY TO \"query\" for semantic search\n", .{});
-    std.debug.print("- ORDER BY VIBES for random ordering (for fun!)\n\n", .{});
+    std.debug.print("\nAvailable features:\n", .{});
+    std.debug.print("SQL Operations:\n", .{});
+    std.debug.print("  - CREATE TABLE with int, float, text, bool, and embedding types\n", .{});
+    std.debug.print("  - INSERT with values or column names\n", .{});
+    std.debug.print("  - SELECT with WHERE, LIMIT, and column selection\n", .{});
+    std.debug.print("  - DELETE with WHERE conditions\n", .{});
+    std.debug.print("  - ORDER BY SIMILARITY TO \"query\" for semantic search\n", .{});
+    std.debug.print("  - ORDER BY VIBES for random ordering (for fun!)\n", .{});
+    std.debug.print("\nPersistence Features (NEW!):\n", .{});
+    std.debug.print("  - db.saveAll(path) to save all tables and indexes\n", .{});
+    std.debug.print("  - Database.loadAll(allocator, path) to load from disk\n", .{});
+    std.debug.print("  - db.enablePersistence(path, auto_save) for auto-save on exit\n", .{});
+    std.debug.print("  - All data types persist correctly (int, float, text, bool, embedding)\n", .{});
+    std.debug.print("  - Row IDs and auto-increment counters preserved\n\n", .{});
 }

@@ -243,3 +243,384 @@ test "SQL: NULL values" {
     try testing.expect(result.rows.items.len == 1);
     try testing.expect(result.rows.items[0].items[2] == .null_value);
 }
+
+// =============================================================================
+// Persistence Tests
+// =============================================================================
+
+test "Persistence: Save and load empty table" {
+    const test_dir = "test_data/empty_table";
+    const test_file = "test_data/empty_table/users.zvdb";
+
+    // Clean up any existing test data
+    std.fs.cwd().deleteTree(test_dir) catch {};
+
+    // Create and save empty table
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        var create_result = try db.execute("CREATE TABLE users (id int, name text, age int)");
+        defer create_result.deinit();
+
+        try db.saveAll(test_dir);
+    }
+
+    // Load and verify
+    {
+        var db = try Database.loadAll(testing.allocator, test_dir);
+        defer db.deinit();
+
+        try testing.expect(db.tables.count() == 1);
+        const table = db.tables.get("users").?;
+        try testing.expect(table.count() == 0);
+        try testing.expect(table.columns.items.len == 3);
+        try testing.expectEqualStrings("users", table.name);
+    }
+
+    // Clean up
+    std.fs.cwd().deleteTree(test_dir) catch {};
+}
+
+test "Persistence: Save and load table with data" {
+    const test_dir = "test_data/with_data";
+
+    // Clean up any existing test data
+    std.fs.cwd().deleteTree(test_dir) catch {};
+
+    // Create, populate, and save
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        var create_result = try db.execute("CREATE TABLE products (id int, name text, price float, available bool)");
+        defer create_result.deinit();
+
+        var insert1 = try db.execute("INSERT INTO products VALUES (1, \"Widget\", 19.99, true)");
+        defer insert1.deinit();
+
+        var insert2 = try db.execute("INSERT INTO products VALUES (2, \"Gadget\", 29.99, false)");
+        defer insert2.deinit();
+
+        var insert3 = try db.execute("INSERT INTO products VALUES (3, \"Gizmo\", 39.99, true)");
+        defer insert3.deinit();
+
+        try db.saveAll(test_dir);
+    }
+
+    // Load and verify
+    {
+        var db = try Database.loadAll(testing.allocator, test_dir);
+        defer db.deinit();
+
+        try testing.expect(db.tables.count() == 1);
+
+        var result = try db.execute("SELECT * FROM products");
+        defer result.deinit();
+
+        try testing.expect(result.rows.items.len == 3);
+
+        // Verify we can query the loaded data
+        var where_result = try db.execute("SELECT * FROM products WHERE available = true");
+        defer where_result.deinit();
+
+        try testing.expect(where_result.rows.items.len == 2);
+    }
+
+    // Clean up
+    std.fs.cwd().deleteTree(test_dir) catch {};
+}
+
+test "Persistence: Multiple tables" {
+    const test_dir = "test_data/multi_tables";
+
+    // Clean up any existing test data
+    std.fs.cwd().deleteTree(test_dir) catch {};
+
+    // Create multiple tables and save
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        var create1 = try db.execute("CREATE TABLE users (id int, name text)");
+        defer create1.deinit();
+        var create2 = try db.execute("CREATE TABLE products (id int, price float)");
+        defer create2.deinit();
+        var create3 = try db.execute("CREATE TABLE orders (id int, quantity int)");
+        defer create3.deinit();
+
+        var insert1 = try db.execute("INSERT INTO users VALUES (1, \"Alice\")");
+        defer insert1.deinit();
+        var insert2 = try db.execute("INSERT INTO products VALUES (1, 99.99)");
+        defer insert2.deinit();
+        var insert3 = try db.execute("INSERT INTO orders VALUES (1, 5)");
+        defer insert3.deinit();
+
+        try db.saveAll(test_dir);
+    }
+
+    // Load and verify
+    {
+        var db = try Database.loadAll(testing.allocator, test_dir);
+        defer db.deinit();
+
+        try testing.expect(db.tables.count() == 3);
+        try testing.expect(db.tables.contains("users"));
+        try testing.expect(db.tables.contains("products"));
+        try testing.expect(db.tables.contains("orders"));
+
+        var result1 = try db.execute("SELECT * FROM users");
+        defer result1.deinit();
+        try testing.expect(result1.rows.items.len == 1);
+
+        var result2 = try db.execute("SELECT * FROM products");
+        defer result2.deinit();
+        try testing.expect(result2.rows.items.len == 1);
+
+        var result3 = try db.execute("SELECT * FROM orders");
+        defer result3.deinit();
+        try testing.expect(result3.rows.items.len == 1);
+    }
+
+    // Clean up
+    std.fs.cwd().deleteTree(test_dir) catch {};
+}
+
+test "Persistence: All data types" {
+    const test_dir = "test_data/all_types";
+
+    // Clean up any existing test data
+    std.fs.cwd().deleteTree(test_dir) catch {};
+
+    // Create table with all types
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        var create_result = try db.execute("CREATE TABLE mixed (id int, name text, price float, active bool)");
+        defer create_result.deinit();
+
+        var insert1 = try db.execute("INSERT INTO mixed VALUES (42, \"Test Item\", 123.45, true)");
+        defer insert1.deinit();
+        var insert2 = try db.execute("INSERT INTO mixed VALUES (-99, \"Another\", -0.5, false)");
+        defer insert2.deinit();
+        var insert3 = try db.execute("INSERT INTO mixed VALUES (0, \"Empty\", 0.0, false)");
+        defer insert3.deinit();
+
+        try db.saveAll(test_dir);
+    }
+
+    // Load and verify
+    {
+        var db = try Database.loadAll(testing.allocator, test_dir);
+        defer db.deinit();
+
+        var result = try db.execute("SELECT * FROM mixed");
+        defer result.deinit();
+
+        try testing.expect(result.rows.items.len == 3);
+
+        // Verify specific values preserved
+        var where_result = try db.execute("SELECT * FROM mixed WHERE id = 42");
+        defer where_result.deinit();
+        try testing.expect(where_result.rows.items.len == 1);
+    }
+
+    // Clean up
+    std.fs.cwd().deleteTree(test_dir) catch {};
+}
+
+test "Persistence: NULL values" {
+    const test_dir = "test_data/nulls";
+
+    // Clean up any existing test data
+    std.fs.cwd().deleteTree(test_dir) catch {};
+
+    // Create table with NULLs
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        var create_result = try db.execute("CREATE TABLE nullable (id int, value text)");
+        defer create_result.deinit();
+
+        var insert1 = try db.execute("INSERT INTO nullable VALUES (1, NULL)");
+        defer insert1.deinit();
+        var insert2 = try db.execute("INSERT INTO nullable VALUES (2, \"Not Null\")");
+        defer insert2.deinit();
+
+        try db.saveAll(test_dir);
+    }
+
+    // Load and verify NULLs preserved
+    {
+        var db = try Database.loadAll(testing.allocator, test_dir);
+        defer db.deinit();
+
+        var result = try db.execute("SELECT * FROM nullable");
+        defer result.deinit();
+
+        try testing.expect(result.rows.items.len == 2);
+        // First row should have NULL value
+        try testing.expect(result.rows.items[0].items[2] == .null_value);
+    }
+
+    // Clean up
+    std.fs.cwd().deleteTree(test_dir) catch {};
+}
+
+test "Persistence: Row IDs preserved" {
+    const test_dir = "test_data/row_ids";
+
+    // Clean up any existing test data
+    std.fs.cwd().deleteTree(test_dir) catch {};
+
+    var original_ids: [3]u64 = undefined;
+
+    // Create and save with specific row IDs
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        var create_result = try db.execute("CREATE TABLE tracking (id int, name text)");
+        defer create_result.deinit();
+
+        var insert1 = try db.execute("INSERT INTO tracking VALUES (1, \"First\")");
+        defer insert1.deinit();
+        var insert2 = try db.execute("INSERT INTO tracking VALUES (2, \"Second\")");
+        defer insert2.deinit();
+        var insert3 = try db.execute("INSERT INTO tracking VALUES (3, \"Third\")");
+        defer insert3.deinit();
+
+        // Capture row IDs
+        const table = db.tables.get("tracking").?;
+        const ids = try table.getAllRows(testing.allocator);
+        defer testing.allocator.free(ids);
+        @memcpy(&original_ids, ids);
+
+        try db.saveAll(test_dir);
+    }
+
+    // Load and verify row IDs match
+    {
+        var db = try Database.loadAll(testing.allocator, test_dir);
+        defer db.deinit();
+
+        const table = db.tables.get("tracking").?;
+        const loaded_ids = try table.getAllRows(testing.allocator);
+        defer testing.allocator.free(loaded_ids);
+
+        try testing.expect(loaded_ids.len == original_ids.len);
+
+        // Verify all original row IDs exist
+        for (original_ids) |orig_id| {
+            var found = false;
+            for (loaded_ids) |loaded_id| {
+                if (orig_id == loaded_id) {
+                    found = true;
+                    break;
+                }
+            }
+            try testing.expect(found);
+        }
+    }
+
+    // Clean up
+    std.fs.cwd().deleteTree(test_dir) catch {};
+}
+
+test "Persistence: Next ID counter preserved" {
+    const test_dir = "test_data/next_id";
+
+    // Clean up any existing test data
+    std.fs.cwd().deleteTree(test_dir) catch {};
+
+    // Create, insert, and save
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        var create_result = try db.execute("CREATE TABLE sequences (id int, value int)");
+        defer create_result.deinit();
+
+        var insert1 = try db.execute("INSERT INTO sequences VALUES (1, 100)");
+        defer insert1.deinit();
+        var insert2 = try db.execute("INSERT INTO sequences VALUES (2, 200)");
+        defer insert2.deinit();
+
+        try db.saveAll(test_dir);
+    }
+
+    // Load and insert new row - ID should continue from where it left off
+    {
+        var db = try Database.loadAll(testing.allocator, test_dir);
+        defer db.deinit();
+
+        const table_before = db.tables.get("sequences").?;
+        const next_id_before = table_before.next_id;
+
+        var insert3 = try db.execute("INSERT INTO sequences VALUES (3, 300)");
+        defer insert3.deinit();
+
+        // Verify new row got expected ID
+        const table_after = db.tables.get("sequences").?;
+        try testing.expect(table_after.rows.count() == 3);
+        try testing.expect(table_after.next_id == next_id_before + 1);
+    }
+
+    // Clean up
+    std.fs.cwd().deleteTree(test_dir) catch {};
+}
+
+test "Persistence: Load from non-existent directory" {
+    const test_dir = "test_data/does_not_exist";
+
+    // Ensure directory doesn't exist
+    std.fs.cwd().deleteTree(test_dir) catch {};
+
+    // Loading from non-existent directory should return empty database
+    var db = try Database.loadAll(testing.allocator, test_dir);
+    defer db.deinit();
+
+    try testing.expect(db.tables.count() == 0);
+    try testing.expect(db.hnsw == null);
+}
+
+test "Persistence: Auto-save on deinit" {
+    const test_dir = "test_data/auto_save";
+
+    // Clean up any existing test data
+    std.fs.cwd().deleteTree(test_dir) catch {};
+
+    // Create database with auto-save enabled
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.enablePersistence(test_dir, true);
+
+        var create_result = try db.execute("CREATE TABLE autosave (id int, data text)");
+        defer create_result.deinit();
+
+        var insert_result = try db.execute("INSERT INTO autosave VALUES (1, \"Auto saved data\")");
+        defer insert_result.deinit();
+
+        // deinit will trigger auto-save
+    }
+
+    // Verify data was auto-saved
+    {
+        var db = try Database.loadAll(testing.allocator, test_dir);
+        defer db.deinit();
+
+        try testing.expect(db.tables.count() == 1);
+
+        var result = try db.execute("SELECT * FROM autosave");
+        defer result.deinit();
+
+        try testing.expect(result.rows.items.len == 1);
+    }
+
+    // Clean up
+    std.fs.cwd().deleteTree(test_dir) catch {};
+}
