@@ -300,6 +300,124 @@ pub const WalRecord = struct {
 };
 
 // ============================================================================
+// Path Validation (Security)
+// ============================================================================
+
+/// Validate that a WAL directory path is safe to use.
+///
+/// Security checks:
+/// - Rejects absolute paths (e.g., "/tmp", "C:\Windows")
+/// - Rejects paths with ".." components (path traversal)
+/// - Rejects paths with null bytes
+/// - Enforces maximum path length
+///
+/// Allowed examples: "wal", "data/wal", "./wal"
+/// Rejected examples: "/tmp/wal", "../wal", "wal/../etc"
+pub fn validateWalPath(path: []const u8) !void {
+    // Check for empty path
+    if (path.len == 0) {
+        return error.InvalidWalPath;
+    }
+
+    // Check for excessive length (common security limit)
+    if (path.len > 255) {
+        return error.WalPathTooLong;
+    }
+
+    // Check for null bytes (common security issue)
+    if (std.mem.indexOfScalar(u8, path, 0) != null) {
+        return error.InvalidWalPath;
+    }
+
+    // Check for absolute paths (Unix)
+    if (path[0] == '/') {
+        return error.AbsolutePathNotAllowed;
+    }
+
+    // Check for absolute paths (Windows drive letters: C:, D:, etc.)
+    if (path.len >= 2 and path[1] == ':') {
+        const first = path[0];
+        if ((first >= 'A' and first <= 'Z') or (first >= 'a' and first <= 'z')) {
+            return error.AbsolutePathNotAllowed;
+        }
+    }
+
+    // Check for path traversal attempts
+    // Split path by '/' and check each component
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |component| {
+        // Reject ".." components
+        if (std.mem.eql(u8, component, "..")) {
+            return error.PathTraversalNotAllowed;
+        }
+
+        // Also check Windows-style backslashes
+        if (std.mem.indexOfScalar(u8, component, '\\') != null) {
+            var it2 = std.mem.splitScalar(u8, component, '\\');
+            while (it2.next()) |subcomp| {
+                if (std.mem.eql(u8, subcomp, "..")) {
+                    return error.PathTraversalNotAllowed;
+                }
+            }
+        }
+    }
+
+    // Path is safe
+}
+
+/// Check if a path is a symlink (without following it)
+///
+/// This provides defense-in-depth against symlink attacks where an attacker
+/// creates a symlink at the WAL location pointing to a sensitive file.
+///
+/// Note: This has a TOCTOU (Time-Of-Check-Time-Of-Use) race condition.
+/// An attacker could create a symlink after this check but before file creation.
+/// The mitigation is to combine this with:
+/// - Using exclusive file creation flags
+/// - Running the database with minimal filesystem permissions
+/// - Using process isolation (containers, chroot)
+fn isSymlink(dir_path: []const u8, file_path: []const u8) !bool {
+    // Try to stat the file without following symlinks
+    // We use fstatat with AT.SYMLINK_NOFOLLOW flag
+
+    // First, open the directory
+    var dir = std.fs.cwd().openDir(dir_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false, // Directory doesn't exist, so file can't be a symlink
+        else => return err,
+    };
+    defer dir.close();
+
+    // Get the file descriptor
+    const dir_fd = dir.fd;
+
+    // Prepare the filename as null-terminated
+    var path_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+    if (file_path.len >= path_buf.len) {
+        return error.NameTooLong;
+    }
+    @memcpy(path_buf[0..file_path.len], file_path);
+    path_buf[file_path.len] = 0;
+
+    // Use fstatat with SYMLINK_NOFOLLOW to check without following
+    const stat_result = std.posix.fstatatZ(
+        dir_fd,
+        @ptrCast(&path_buf),
+        std.c.AT.SYMLINK_NOFOLLOW,
+    ) catch |err| switch (err) {
+        error.FileNotFound => return false, // File doesn't exist, not a symlink
+        else => return err,
+    };
+
+    // Check if it's a symlink using mode field
+    // S_IFLNK = 0xA000 on most Unix systems (symlink file type)
+    // S_IFMT = 0xF000 (mask for file type bits)
+    const S_IFMT: u32 = 0xF000;
+    const S_IFLNK: u32 = 0xA000;
+    const file_type = stat_result.mode & S_IFMT;
+    return file_type == S_IFLNK;
+}
+
+// ============================================================================
 // WAL Writer
 // ============================================================================
 
@@ -319,7 +437,7 @@ pub const WalWriter = struct {
     wal_dir: []const u8,
 
     /// Write buffer for batching records
-    buffer: std.ArrayList(u8),
+    buffer: std.array_list.Managed(u8),
 
     /// Current sequence number (for file rotation)
     sequence: u64,
@@ -336,11 +454,18 @@ pub const WalWriter = struct {
     /// Current file size in bytes
     current_file_size: u64,
 
+    /// Total size of all WAL files in bytes (for disk exhaustion protection)
+    total_wal_size: u64,
+
+    /// Maximum total WAL size before refusing new writes (default: 1GB)
+    max_total_wal_size: u64,
+
     /// Allocator for buffer management
     allocator: Allocator,
 
     pub const DEFAULT_PAGE_SIZE: u32 = 4096; // 4KB
     pub const DEFAULT_MAX_FILE_SIZE: u64 = 16 * 1024 * 1024; // 16MB
+    pub const DEFAULT_MAX_TOTAL_WAL_SIZE: u64 = 1 * 1024 * 1024 * 1024; // 1GB
 
     /// Initialize a new WAL writer
     ///
@@ -353,10 +478,14 @@ pub const WalWriter = struct {
     pub const InitOptions = struct {
         page_size: u32 = DEFAULT_PAGE_SIZE,
         max_file_size: u64 = DEFAULT_MAX_FILE_SIZE,
+        max_total_wal_size: u64 = DEFAULT_MAX_TOTAL_WAL_SIZE,
         sequence: u64 = 0,
     };
 
     pub fn initWithOptions(allocator: Allocator, wal_dir: []const u8, options: InitOptions) !WalWriter {
+        // Validate path for security (prevent path traversal attacks)
+        try validateWalPath(wal_dir);
+
         // Create WAL directory if it doesn't exist
         std.fs.cwd().makePath(wal_dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
@@ -366,7 +495,7 @@ pub const WalWriter = struct {
         // Create first WAL file
         const file = try createWalFile(wal_dir, options.sequence, options.page_size);
 
-        var buffer = std.ArrayList(u8).init(allocator);
+        var buffer = std.array_list.Managed(u8).init(allocator);
         try buffer.ensureTotalCapacity(options.page_size);
 
         return WalWriter{
@@ -378,6 +507,8 @@ pub const WalWriter = struct {
             .page_size = options.page_size,
             .max_file_size = options.max_file_size,
             .current_file_size = WalHeader.SIZE, // Header already written
+            .total_wal_size = WalHeader.SIZE, // Start with just the header
+            .max_total_wal_size = options.max_total_wal_size,
             .allocator = allocator,
         };
     }
@@ -386,14 +517,24 @@ pub const WalWriter = struct {
     fn createWalFile(wal_dir: []const u8, sequence: u64, page_size: u32) !std.fs.File {
         const allocator = std.heap.page_allocator;
 
-        // Generate filename: wal.000000, wal.000001, etc.
-        const filename = try std.fmt.allocPrint(allocator, "{s}/wal.{d:0>6}", .{ wal_dir, sequence });
+        // Generate base filename (without directory)
+        const base_filename = try std.fmt.allocPrint(allocator, "wal.{d:0>6}", .{sequence});
+        defer allocator.free(base_filename);
+
+        // Check if path is a symlink (defense-in-depth against symlink attacks)
+        if (try isSymlink(wal_dir, base_filename)) {
+            return error.SymlinkNotAllowed;
+        }
+
+        // Generate full path
+        const filename = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ wal_dir, base_filename });
         defer allocator.free(filename);
 
-        // Create the file
+        // Create the file with exclusive flag to prevent race conditions
         const file = try std.fs.cwd().createFile(filename, .{
             .read = true,
             .truncate = false,
+            .exclusive = true, // Fail if file already exists (prevents TOCTOU)
         });
 
         // Write header
@@ -433,6 +574,11 @@ pub const WalWriter = struct {
         // Calculate serialized size
         const size = record_with_lsn.serializedSize();
 
+        // Check for disk exhaustion (prevent unlimited WAL growth)
+        if (self.total_wal_size + size > self.max_total_wal_size) {
+            return error.WalDiskQuotaExceeded;
+        }
+
         // Check if we need to rotate the file
         if (self.current_file_size + size > self.max_file_size) {
             try self.rotate();
@@ -446,8 +592,9 @@ pub const WalWriter = struct {
         try self.buffer.resize(start + size);
         try record_with_lsn.serialize(self.buffer.items[start..], self.allocator);
 
-        // Update file size estimate
+        // Update file size estimates
         self.current_file_size += size;
+        self.total_wal_size += size;
 
         // Flush if buffer is full
         if (self.buffer.items.len >= self.page_size) {
@@ -525,6 +672,63 @@ pub const WalWriter = struct {
     pub fn getNextLsn(self: *const WalWriter) u64 {
         return self.next_lsn;
     }
+
+    /// Get the current total WAL size across all files
+    pub fn getTotalWalSize(self: *const WalWriter) u64 {
+        return self.total_wal_size;
+    }
+
+    /// Get the maximum allowed total WAL size
+    pub fn getMaxTotalWalSize(self: *const WalWriter) u64 {
+        return self.max_total_wal_size;
+    }
+
+    /// Delete old WAL files before a given sequence number
+    ///
+    /// This should be called after a checkpoint to reclaim disk space.
+    /// Reduces total_wal_size by the size of deleted files.
+    ///
+    /// WARNING: Only call this after ensuring the database state is
+    /// persisted to disk (checkpoint complete).
+    pub fn deleteOldWalFiles(self: *WalWriter, before_sequence: u64) !void {
+        const allocator = std.heap.page_allocator;
+
+        // Don't delete the current file
+        if (before_sequence > self.sequence) {
+            return error.CannotDeleteCurrentWalFile;
+        }
+
+        var seq: u64 = 0;
+        while (seq < before_sequence) : (seq += 1) {
+            // Generate filename
+            const filename = try std.fmt.allocPrint(
+                allocator,
+                "{s}/wal.{d:0>6}",
+                .{ self.wal_dir, seq },
+            );
+            defer allocator.free(filename);
+
+            // Get file size before deleting (for accounting)
+            const stat = std.fs.cwd().statFile(filename) catch |err| switch (err) {
+                error.FileNotFound => continue, // Already deleted or never existed
+                else => return err,
+            };
+
+            // Delete the file
+            std.fs.cwd().deleteFile(filename) catch |err| switch (err) {
+                error.FileNotFound => continue, // Race condition, already deleted
+                else => return err,
+            };
+
+            // Update total WAL size
+            if (self.total_wal_size >= stat.size) {
+                self.total_wal_size -= stat.size;
+            } else {
+                // Shouldn't happen, but prevent underflow
+                self.total_wal_size = 0;
+            }
+        }
+    }
 };
 
 // ============================================================================
@@ -544,6 +748,22 @@ pub const WalReader = struct {
 
     /// Open a WAL file for reading
     pub fn init(allocator: Allocator, wal_path: []const u8) !WalReader {
+        // Validate path for security (prevent path traversal attacks)
+        try validateWalPath(wal_path);
+
+        // Check if path is a symlink (additional security)
+        if (std.fs.path.dirname(wal_path)) |dir_path| {
+            const base = std.fs.path.basename(wal_path);
+            if (try isSymlink(dir_path, base)) {
+                return error.SymlinkNotAllowed;
+            }
+        } else {
+            // No directory component, check in current directory
+            if (try isSymlink(".", wal_path)) {
+                return error.SymlinkNotAllowed;
+            }
+        }
+
         const file = try std.fs.cwd().openFile(wal_path, .{});
         errdefer file.close();
 
@@ -580,7 +800,7 @@ pub const WalReader = struct {
     /// Returns null at end of file.
     /// Returned record must be deinit'd by the caller.
     pub fn readRecord(self: *WalReader) !?WalRecord {
-        if (self.eof) {
+        if (self.eof and self.buffer_len - self.buffer_pos == 0) {
             return null;
         }
 
@@ -603,7 +823,9 @@ pub const WalReader = struct {
                 }
                 // Try again with more data
                 const remaining2 = self.buffer[self.buffer_pos..self.buffer_len];
-                return try WalRecord.deserialize(remaining2, self.allocator);
+                const result2 = try WalRecord.deserialize(remaining2, self.allocator);
+                self.buffer_pos += result2.bytes_read;
+                return result2.record;
             },
             else => return err,
         };
@@ -1109,4 +1331,248 @@ test "WalWriter and WalReader: round-trip with large data" {
     try testing.expectEqual(@as(u64, 456), r.row_id);
     try testing.expectEqualStrings("large_table", r.table_name);
     try testing.expectEqual(large_data.len, r.data.len);
+}
+
+// ============================================================================
+// Security Tests
+// ============================================================================
+
+test "validateWalPath: accepts safe paths" {
+    // These paths should be accepted
+    const safe_paths = [_][]const u8{
+        "wal",
+        "data/wal",
+        "./wal",
+        "my_database/wal_files",
+        "a/b/c/d/wal",
+    };
+
+    for (safe_paths) |path| {
+        try validateWalPath(path);
+    }
+}
+
+test "validateWalPath: rejects absolute Unix paths" {
+    try testing.expectError(error.AbsolutePathNotAllowed, validateWalPath("/tmp/wal"));
+    try testing.expectError(error.AbsolutePathNotAllowed, validateWalPath("/etc/shadow"));
+    try testing.expectError(error.AbsolutePathNotAllowed, validateWalPath("/var/lib/db"));
+}
+
+test "validateWalPath: rejects absolute Windows paths" {
+    try testing.expectError(error.AbsolutePathNotAllowed, validateWalPath("C:\\Windows\\System32"));
+    try testing.expectError(error.AbsolutePathNotAllowed, validateWalPath("D:\\data"));
+    try testing.expectError(error.AbsolutePathNotAllowed, validateWalPath("c:\\temp")); // lowercase too
+}
+
+test "validateWalPath: rejects path traversal attempts" {
+    try testing.expectError(error.PathTraversalNotAllowed, validateWalPath("../etc"));
+    try testing.expectError(error.PathTraversalNotAllowed, validateWalPath("../../tmp"));
+    try testing.expectError(error.PathTraversalNotAllowed, validateWalPath("../../../root"));
+    try testing.expectError(error.PathTraversalNotAllowed, validateWalPath("wal/../../../etc"));
+    try testing.expectError(error.PathTraversalNotAllowed, validateWalPath("good/../../bad"));
+    try testing.expectError(error.PathTraversalNotAllowed, validateWalPath("a/b/../../../c"));
+}
+
+test "validateWalPath: rejects Windows-style path traversal" {
+    try testing.expectError(error.PathTraversalNotAllowed, validateWalPath("wal\\..\\..\\etc"));
+    try testing.expectError(error.PathTraversalNotAllowed, validateWalPath("..\\Windows"));
+}
+
+test "validateWalPath: rejects empty path" {
+    try testing.expectError(error.InvalidWalPath, validateWalPath(""));
+}
+
+test "validateWalPath: rejects path with null byte" {
+    const path_with_null = "wal\x00/bad";
+    try testing.expectError(error.InvalidWalPath, validateWalPath(path_with_null));
+}
+
+test "validateWalPath: rejects excessively long path" {
+    var long_path: [300]u8 = undefined;
+    @memset(&long_path, 'a');
+    try testing.expectError(error.WalPathTooLong, validateWalPath(&long_path));
+}
+
+test "WalWriter: rejects dangerous path on init" {
+    const allocator = testing.allocator;
+
+    // Should fail to initialize with dangerous path
+    try testing.expectError(
+        error.PathTraversalNotAllowed,
+        WalWriter.init(allocator, "../../../tmp/evil"),
+    );
+
+    try testing.expectError(
+        error.AbsolutePathNotAllowed,
+        WalWriter.init(allocator, "/tmp/wal"),
+    );
+}
+
+test "WalReader: rejects dangerous path on init" {
+    const allocator = testing.allocator;
+
+    // Should fail to open with dangerous path
+    try testing.expectError(
+        error.PathTraversalNotAllowed,
+        WalReader.init(allocator, "../../../etc/shadow"),
+    );
+
+    try testing.expectError(
+        error.AbsolutePathNotAllowed,
+        WalReader.init(allocator, "/etc/passwd"),
+    );
+}
+
+test "WalWriter: disk quota enforcement" {
+    const allocator = testing.allocator;
+
+    const test_dir = "test_wal_quota";
+    defer std.fs.cwd().deleteTree(test_dir) catch {};
+
+    // Create writer with very small quota (1KB)
+    var writer = try WalWriter.initWithOptions(allocator, test_dir, .{
+        .max_total_wal_size = 1024, // 1KB limit
+    });
+    defer writer.deinit();
+
+    // Should be able to write some records
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        _ = try writer.writeRecord(.{
+            .record_type = .insert_row,
+            .tx_id = @intCast(i),
+            .lsn = 0,
+            .row_id = @intCast(i),
+            .table_name = "test",
+            .data = "small_data",
+            .checksum = 0,
+        });
+    }
+
+    // Eventually should hit quota
+    var hit_quota = false;
+    i = 10;
+    while (i < 1000) : (i += 1) {
+        _ = writer.writeRecord(.{
+            .record_type = .insert_row,
+            .tx_id = @intCast(i),
+            .lsn = 0,
+            .row_id = @intCast(i),
+            .table_name = "test_table_with_longer_name",
+            .data = "much_larger_data_to_fill_quota_faster",
+            .checksum = 0,
+        }) catch |err| {
+            if (err == error.WalDiskQuotaExceeded) {
+                hit_quota = true;
+                break;
+            }
+            return err;
+        };
+    }
+
+    try testing.expect(hit_quota);
+    try testing.expect(writer.getTotalWalSize() <= writer.getMaxTotalWalSize());
+}
+
+test "WalWriter: cleanup old files reduces quota" {
+    const allocator = testing.allocator;
+
+    const test_dir = "test_wal_cleanup";
+    defer std.fs.cwd().deleteTree(test_dir) catch {};
+
+    var writer = try WalWriter.initWithOptions(allocator, test_dir, .{
+        .max_file_size = 512, // Small files to trigger rotation
+    });
+    defer writer.deinit();
+
+    // Write enough to create multiple files
+    var i: usize = 0;
+    while (i < 50) : (i += 1) {
+        _ = try writer.writeRecord(.{
+            .record_type = .insert_row,
+            .tx_id = @intCast(i),
+            .lsn = 0,
+            .row_id = @intCast(i),
+            .table_name = "test_table_name",
+            .data = "some_data_to_write_here",
+            .checksum = 0,
+        });
+    }
+
+    try writer.flush();
+
+    // Should have rotated at least once
+    const final_seq = writer.getCurrentSequence();
+    try testing.expect(final_seq > 0);
+
+    // Record size before cleanup
+    const size_before = writer.getTotalWalSize();
+
+    // Clean up old files
+    try writer.deleteOldWalFiles(final_seq);
+
+    // Size should be reduced (only current file remains)
+    const size_after = writer.getTotalWalSize();
+    try testing.expect(size_after < size_before);
+}
+
+test "WalWriter: rejects symlink" {
+    const allocator = testing.allocator;
+
+    const test_dir = "test_wal_symlink";
+    defer std.fs.cwd().deleteTree(test_dir) catch {};
+
+    // Create directory
+    try std.fs.cwd().makePath(test_dir);
+
+    // Create a regular file
+    {
+        const target_file = try std.fs.cwd().createFile(test_dir ++ "/target.txt", .{});
+        defer target_file.close();
+        try target_file.writeAll("target");
+    }
+
+    // Create symlink to the file (if supported by OS)
+    const symlink_path = test_dir ++ "/wal.000000";
+    std.posix.symlink("target.txt", symlink_path) catch |err| {
+        // Skip test on systems without symlink support or if not permitted
+        std.debug.print("Skipping symlink test: {}\n", .{err});
+        return;
+    };
+
+    // WalWriter should detect and reject the symlink
+    try testing.expectError(
+        error.SymlinkNotAllowed,
+        WalWriter.init(allocator, test_dir),
+    );
+}
+
+test "WalWriter: total size tracking accurate" {
+    const allocator = testing.allocator;
+
+    const test_dir = "test_wal_size_tracking";
+    defer std.fs.cwd().deleteTree(test_dir) catch {};
+
+    var writer = try WalWriter.init(allocator, test_dir);
+    defer writer.deinit();
+
+    const initial_size = writer.getTotalWalSize();
+    try testing.expectEqual(WalHeader.SIZE, initial_size);
+
+    // Write a record and verify size increases
+    const record = WalRecord{
+        .record_type = .insert_row,
+        .tx_id = 1,
+        .lsn = 0,
+        .row_id = 100,
+        .table_name = "users",
+        .data = "test_data",
+        .checksum = 0,
+    };
+
+    const expected_increase = record.serializedSize();
+    _ = try writer.writeRecord(record);
+
+    const size_after = writer.getTotalWalSize();
+    try testing.expectEqual(initial_size + expected_increase, size_after);
 }
