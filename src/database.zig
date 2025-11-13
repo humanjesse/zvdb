@@ -1,7 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const StringHashMap = std.StringHashMap;
-const ArrayList = std.ArrayList;
+const ArrayList = std.array_list.Managed;
 const Table = @import("table.zig").Table;
 const ColumnValue = @import("table.zig").ColumnValue;
 const ColumnType = @import("table.zig").ColumnType;
@@ -50,33 +50,31 @@ pub const QueryResult = struct {
     }
 
     pub fn print(self: *QueryResult) !void {
-        const stdout = std.io.getStdOut().writer();
-
         // Print header
-        try stdout.writeAll("\n");
+        std.debug.print("\n", .{});
         for (self.columns.items, 0..) |col, i| {
-            if (i > 0) try stdout.writeAll(" | ");
-            try stdout.print("{s}", .{col});
+            if (i > 0) std.debug.print(" | ", .{});
+            std.debug.print("{s}", .{col});
         }
-        try stdout.writeAll("\n");
+        std.debug.print("\n", .{});
 
         // Print separator
         for (self.columns.items, 0..) |_, i| {
-            if (i > 0) try stdout.writeAll("-+-");
-            try stdout.writeAll("----------");
+            if (i > 0) std.debug.print("-+-", .{});
+            std.debug.print("----------", .{});
         }
-        try stdout.writeAll("\n");
+        std.debug.print("\n", .{});
 
         // Print rows
         for (self.rows.items) |row| {
             for (row.items, 0..) |val, i| {
-                if (i > 0) try stdout.writeAll(" | ");
-                try stdout.print("{}", .{val});
+                if (i > 0) std.debug.print(" | ", .{});
+                std.debug.print("{any}", .{val});
             }
-            try stdout.writeAll("\n");
+            std.debug.print("\n", .{});
         }
 
-        try stdout.print("\n({d} rows)\n", .{self.rows.items.len});
+        std.debug.print("\n({d} rows)\n", .{self.rows.items.len});
     }
 };
 
@@ -215,7 +213,7 @@ pub const Database = struct {
 
         // Get rows to process
         var row_ids: []u64 = undefined;
-        var should_free_ids = true;
+        const should_free_ids = true;
 
         // Handle ORDER BY SIMILARITY TO "text"
         if (cmd.order_by_similarity) |similarity_text| {
@@ -223,7 +221,7 @@ pub const Database = struct {
 
             // For semantic search, we need to generate an embedding from the text
             // For now, we'll use a simple hash-based mock embedding
-            var query_embedding = try self.allocator.alloc(f32, 128);
+            const query_embedding = try self.allocator.alloc(f32, 128);
             defer self.allocator.free(query_embedding);
 
             // Simple hash-based embedding (in real use, you'd use an actual embedding model)

@@ -1,6 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const ArrayList = std.ArrayList;
+const ArrayList = std.array_list.Managed;
 const AutoHashMap = std.AutoHashMap;
 const StringHashMap = std.StringHashMap;
 const Order = std.math.Order;
@@ -66,6 +66,7 @@ pub const NodeMetadata = struct {
         }
         var it = self.attributes.iterator();
         while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
             var val = entry.value_ptr.*;
             val.deinit(allocator);
         }
@@ -73,8 +74,11 @@ pub const NodeMetadata = struct {
     }
 
     pub fn setAttribute(self: *NodeMetadata, allocator: Allocator, key: []const u8, value: MetadataValue) !void {
-        const owned_value = try value.clone(allocator);
-        try self.attributes.put(key, owned_value);
+        const owned_key = try allocator.dupe(u8, key);
+        errdefer allocator.free(owned_key);
+        var owned_value = try value.clone(allocator);
+        errdefer owned_value.deinit(allocator);
+        try self.attributes.put(owned_key, owned_value);
     }
 
     pub fn getAttribute(self: *NodeMetadata, key: []const u8) ?MetadataValue {
@@ -135,7 +139,7 @@ pub fn HNSW(comptime T: type) type {
                 const connections = try allocator.alloc(ArrayList(usize), level + 1);
                 errdefer allocator.free(connections);
                 for (connections) |*conn| {
-                    conn.* = ArrayList(usize){};
+                    conn.* = ArrayList(usize).init(allocator);
                 }
                 const owned_point = try allocator.alloc(T, point.len);
                 errdefer allocator.free(owned_point);
@@ -151,7 +155,7 @@ pub fn HNSW(comptime T: type) type {
 
             fn deinit(self: *Node, allocator: Allocator) void {
                 for (self.connections) |*conn| {
-                    conn.deinit(allocator);
+                    conn.deinit();
                 }
                 allocator.free(self.connections);
                 allocator.free(self.point);
@@ -224,7 +228,7 @@ pub fn HNSW(comptime T: type) type {
             var type_it = self.type_index.iterator();
             while (type_it.next()) |entry| {
                 var list = entry.value_ptr;
-                list.deinit(self.allocator);
+                list.deinit();
             }
             self.type_index.deinit();
 
@@ -232,7 +236,7 @@ pub fn HNSW(comptime T: type) type {
             var file_path_it = self.file_path_index.iterator();
             while (file_path_it.next()) |entry| {
                 var list = entry.value_ptr;
-                list.deinit(self.allocator);
+                list.deinit();
             }
             self.file_path_index.deinit();
         }
@@ -466,9 +470,9 @@ pub fn HNSW(comptime T: type) type {
         fn addToTypeIndex(self: *Self, node_type: []const u8, external_id: u64) !void {
             var result = try self.type_index.getOrPut(node_type);
             if (!result.found_existing) {
-                result.value_ptr.* = ArrayList(u64){};
+                result.value_ptr.* = ArrayList(u64).init(self.allocator);
             }
-            try result.value_ptr.append(self.allocator, external_id);
+            try result.value_ptr.append(external_id);
         }
 
         /// Helper: Remove external ID from type index
@@ -486,9 +490,9 @@ pub fn HNSW(comptime T: type) type {
         fn addToFilePathIndex(self: *Self, file_path: []const u8, external_id: u64) !void {
             var result = try self.file_path_index.getOrPut(file_path);
             if (!result.found_existing) {
-                result.value_ptr.* = ArrayList(u64){};
+                result.value_ptr.* = ArrayList(u64).init(self.allocator);
             }
-            try result.value_ptr.append(self.allocator, external_id);
+            try result.value_ptr.append(external_id);
         }
 
         /// Helper: Remove external ID from file_path index
@@ -538,8 +542,8 @@ pub fn HNSW(comptime T: type) type {
             self.mutex.lock();
             defer self.mutex.unlock();
 
-            var result = ArrayList(Edge){};
-            errdefer result.deinit(self.allocator);
+            var result = ArrayList(Edge).init(self.allocator);
+            errdefer result.deinit();
 
             var it = self.edges.iterator();
             while (it.next()) |entry| {
@@ -556,10 +560,10 @@ pub fn HNSW(comptime T: type) type {
 
                 // Clone edge for return
                 const cloned = try Edge.init(self.allocator, edge.src, edge.dst, edge.edge_type, edge.weight);
-                try result.append(self.allocator, cloned);
+                try result.append(cloned);
             }
 
-            return result.toOwnedSlice(self.allocator);
+            return result.toOwnedSlice();
         }
 
         /// Get neighboring node IDs (optionally filtered by edge type)
@@ -567,8 +571,8 @@ pub fn HNSW(comptime T: type) type {
             self.mutex.lock();
             defer self.mutex.unlock();
 
-            var result = ArrayList(u64){};
-            errdefer result.deinit(self.allocator);
+            var result = ArrayList(u64).init(self.allocator);
+            errdefer result.deinit();
 
             var it = self.edges.iterator();
             while (it.next()) |entry| {
@@ -581,13 +585,13 @@ pub fn HNSW(comptime T: type) type {
 
                 // Add neighbor ID
                 if (edge.src == node_id) {
-                    try result.append(self.allocator, edge.dst);
+                    try result.append(edge.dst);
                 } else if (edge.dst == node_id) {
-                    try result.append(self.allocator, edge.src);
+                    try result.append(edge.src);
                 }
             }
 
-            return result.toOwnedSlice(self.allocator);
+            return result.toOwnedSlice();
         }
 
         /// Get incoming edges for a node
@@ -595,8 +599,8 @@ pub fn HNSW(comptime T: type) type {
             self.mutex.lock();
             defer self.mutex.unlock();
 
-            var result = ArrayList(Edge){};
-            errdefer result.deinit(self.allocator);
+            var result = ArrayList(Edge).init(self.allocator);
+            errdefer result.deinit();
 
             var it = self.edges.iterator();
             while (it.next()) |entry| {
@@ -612,10 +616,10 @@ pub fn HNSW(comptime T: type) type {
 
                 // Clone edge for return
                 const cloned = try Edge.init(self.allocator, edge.src, edge.dst, edge.edge_type, edge.weight);
-                try result.append(self.allocator, cloned);
+                try result.append(cloned);
             }
 
-            return result.toOwnedSlice(self.allocator);
+            return result.toOwnedSlice();
         }
 
         /// Get outgoing edges for a node
@@ -623,8 +627,8 @@ pub fn HNSW(comptime T: type) type {
             self.mutex.lock();
             defer self.mutex.unlock();
 
-            var result = ArrayList(Edge){};
-            errdefer result.deinit(self.allocator);
+            var result = ArrayList(Edge).init(self.allocator);
+            errdefer result.deinit();
 
             var it = self.edges.iterator();
             while (it.next()) |entry| {
@@ -640,10 +644,10 @@ pub fn HNSW(comptime T: type) type {
 
                 // Clone edge for return
                 const cloned = try Edge.init(self.allocator, edge.src, edge.dst, edge.edge_type, edge.weight);
-                try result.append(self.allocator, cloned);
+                try result.append(cloned);
             }
 
-            return result.toOwnedSlice(self.allocator);
+            return result.toOwnedSlice();
         }
 
         /// BFS traversal from a starting node up to max_depth
@@ -654,16 +658,16 @@ pub fn HNSW(comptime T: type) type {
             var visited = AutoHashMap(u64, void).init(self.allocator);
             defer visited.deinit();
 
-            var queue = ArrayList(struct { id: u64, depth: usize }){};
-            defer queue.deinit(self.allocator);
+            var queue = ArrayList(struct { id: u64, depth: usize }).init(self.allocator);
+            defer queue.deinit();
 
-            var result = ArrayList(u64){};
-            errdefer result.deinit(self.allocator);
+            var result = ArrayList(u64).init(self.allocator);
+            errdefer result.deinit();
 
             // Start with the initial node
-            try queue.append(self.allocator, .{ .id = start_id, .depth = 0 });
+            try queue.append(.{ .id = start_id, .depth = 0 });
             try visited.put(start_id, {});
-            try result.append(self.allocator, start_id);
+            try result.append(start_id);
 
             var queue_idx: usize = 0;
             while (queue_idx < queue.items.len) : (queue_idx += 1) {
@@ -693,13 +697,13 @@ pub fn HNSW(comptime T: type) type {
                     // Add if not visited
                     if (!visited.contains(neighbor_id)) {
                         try visited.put(neighbor_id, {});
-                        try queue.append(self.allocator, .{ .id = neighbor_id, .depth = current.depth + 1 });
-                        try result.append(self.allocator, neighbor_id);
+                        try queue.append(.{ .id = neighbor_id, .depth = current.depth + 1 });
+                        try result.append(neighbor_id);
                     }
                 }
             }
 
-            return result.toOwnedSlice(self.allocator);
+            return result.toOwnedSlice();
         }
 
         // Helper to write integers for persistence
@@ -921,7 +925,7 @@ pub fn HNSW(comptime T: type) type {
                 errdefer allocator.free(connections);
 
                 for (connections) |*conn| {
-                    conn.* = ArrayList(usize){};
+                    conn.* = ArrayList(usize).init(self.allocator);
                 }
 
                 var node = Node{
@@ -936,11 +940,11 @@ pub fn HNSW(comptime T: type) type {
                 // Read connections for each layer
                 for (node.connections) |*conn_list| {
                     const conn_count = try readIntFromFile(file, u64);
-                    try conn_list.ensureTotalCapacity(allocator, conn_count);
+                    try conn_list.ensureTotalCapacity(conn_count);
 
                     for (0..conn_count) |_| {
                         const conn_id = try readIntFromFile(file, u64);
-                        try conn_list.append(allocator, conn_id);
+                        try conn_list.append(conn_id);
                     }
                 }
 
@@ -1071,10 +1075,10 @@ pub fn HNSW(comptime T: type) type {
             defer target_node.mutex.unlock();
 
             if (level < source_node.connections.len) {
-                try source_node.connections[level].append(self.allocator, target);
+                try source_node.connections[level].append(target);
             }
             if (level < target_node.connections.len) {
-                try target_node.connections[level].append(self.allocator, source);
+                try target_node.connections[level].append(source);
             }
 
             if (level < source_node.connections.len) {
@@ -1162,7 +1166,7 @@ pub fn HNSW(comptime T: type) type {
             defer self.mutex.unlock();
 
             var result = try ArrayList(SearchResult).initCapacity(self.allocator, k);
-            errdefer result.deinit(self.allocator);
+            errdefer result.deinit();
 
             if (self.entry_point) |entry| {
                 var candidates = std.PriorityQueue(CandidateNode, void, CandidateNode.lessThan).init(self.allocator, {});
@@ -1179,7 +1183,7 @@ pub fn HNSW(comptime T: type) type {
                     const current_node = self.nodes.get(current.id).?;
                     const external_id = self.internal_to_external.get(current_node.id) orelse continue;
 
-                    try result.append(self.allocator, SearchResult{
+                    try result.append(SearchResult{
                         .external_id = external_id,
                         .point = current_node.point,
                         .distance = distance(query, current_node.point),
@@ -1203,7 +1207,7 @@ pub fn HNSW(comptime T: type) type {
             };
             std.sort.insertion(SearchResult, result.items, Context{}, Context.lessThan);
 
-            return result.toOwnedSlice(self.allocator);
+            return result.toOwnedSlice();
         }
 
         /// Search for k nearest neighbors, filtered by node type
@@ -1212,7 +1216,7 @@ pub fn HNSW(comptime T: type) type {
             defer self.mutex.unlock();
 
             var result = try ArrayList(SearchResult).initCapacity(self.allocator, k);
-            errdefer result.deinit(self.allocator);
+            errdefer result.deinit();
 
             if (self.entry_point) |entry| {
                 var candidates = std.PriorityQueue(CandidateNode, void, CandidateNode.lessThan).init(self.allocator, {});
@@ -1236,7 +1240,7 @@ pub fn HNSW(comptime T: type) type {
                         false;
 
                     if (matches_type) {
-                        try result.append(self.allocator, SearchResult{
+                        try result.append(SearchResult{
                             .external_id = external_id,
                             .point = current_node.point,
                             .distance = distance(query, current_node.point),
@@ -1261,7 +1265,7 @@ pub fn HNSW(comptime T: type) type {
             };
             std.sort.insertion(SearchResult, result.items, Context{}, Context.lessThan);
 
-            return result.toOwnedSlice(self.allocator);
+            return result.toOwnedSlice();
         }
 
         /// Hybrid query: search for similar nodes, then traverse their graph neighbors
@@ -1295,15 +1299,15 @@ pub fn HNSW(comptime T: type) type {
             }
 
             // Convert set to slice
-            var result_list = ArrayList(u64){};
-            errdefer result_list.deinit(self.allocator);
+            var result_list = ArrayList(u64).init(self.allocator);
+            errdefer result_list.deinit();
 
             var it = all_nodes.keyIterator();
             while (it.next()) |key| {
-                try result_list.append(self.allocator, key.*);
+                try result_list.append(key.*);
             }
 
-            return result_list.toOwnedSlice(self.allocator);
+            return result_list.toOwnedSlice();
         }
 
         const CandidateNode = struct {

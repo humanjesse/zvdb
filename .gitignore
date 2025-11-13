@@ -10,9 +10,12 @@ zig-out/
 *.dylib
 *.dll
 
-# Test/build directories
+# Test/build files and directories
+test_zon
 test_zon/
+check_build
 check_build/
+test_stdout
 
 # Editor files
 .vscode/
