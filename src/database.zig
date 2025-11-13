@@ -157,6 +157,107 @@ pub const Database = struct {
         self.wal = wal_ptr;
     }
 
+    /// Helper function to write a WAL record and flush to disk
+    /// Centralizes transaction ID management and WAL writing logic
+    /// Returns the transaction ID used for this record
+    fn writeWalRecord(
+        self: *Database,
+        record_type: WalRecordType,
+        table_name: []const u8,
+        row_id: u64,
+        data: []const u8,
+    ) !u64 {
+        const w = self.wal orelse return error.WalNotEnabled;
+
+        // Get transaction ID and increment
+        const tx_id = self.current_tx_id;
+        self.current_tx_id += 1;
+
+        // Create WAL record (writeRecord makes its own copy of table_name and data)
+        const table_name_owned = try self.allocator.dupe(u8, table_name);
+        defer self.allocator.free(table_name_owned);
+
+        const record = WalRecord{
+            .record_type = record_type,
+            .tx_id = tx_id,
+            .lsn = 0, // Will be assigned by WAL writer
+            .row_id = row_id,
+            .table_name = table_name_owned,
+            .data = data,
+            .checksum = 0, // Will be calculated during serialization
+        };
+
+        // Write WAL record and flush to disk (CRITICAL: must be durable before table mutation)
+        _ = try w.writeRecord(record);
+        try w.flush();
+
+        return tx_id;
+    }
+
+    /// Recover database from WAL files after a crash (Phase 2.4)
+    ///
+    /// This function will be implemented in Phase 2.4 to enable crash recovery.
+    /// Recovery process:
+    /// 1. Scan WAL directory for all wal.* files
+    /// 2. Read and validate WAL records using WalReader
+    /// 3. Replay committed transactions in order (by LSN)
+    /// 4. Apply INSERT/DELETE/UPDATE operations to tables
+    /// 5. Rebuild HNSW index from recovered table data (see rebuildHnswFromTables)
+    /// 6. Handle incomplete/corrupted records gracefully
+    /// 7. Optionally checkpoint and clean up old WAL files
+    ///
+    /// Parameters:
+    ///   - wal_dir: Directory containing WAL files (e.g., "data/wal")
+    ///
+    /// Returns: Number of transactions recovered
+    ///
+    /// Example usage:
+    /// ```
+    /// var db = Database.init(allocator);
+    /// defer db.deinit();
+    /// const recovered = try db.recoverFromWal("data/wal");
+    /// std.debug.print("Recovered {} transactions\n", .{recovered});
+    /// ```
+    pub fn recoverFromWal(self: *Database, wal_dir: []const u8) !usize {
+        _ = self;
+        _ = wal_dir;
+        // TODO Phase 2.4: Implement WAL recovery
+        // See documentation above for implementation plan
+        return error.NotImplemented;
+    }
+
+    /// Rebuild HNSW vector index from table data (Phase 2.4)
+    ///
+    /// After WAL recovery, the HNSW index will be out of sync with table data
+    /// because HNSW operations are not logged in the WAL. This function scans
+    /// all tables for embedding columns and rebuilds the HNSW index.
+    ///
+    /// Process:
+    /// 1. If HNSW is null, skip (no vector search enabled)
+    /// 2. Clear existing HNSW index
+    /// 3. Scan all tables in the database
+    /// 4. For each table, find embedding columns
+    /// 5. For each row, extract embedding and insert into HNSW with row_id
+    /// 6. Log progress for large datasets
+    ///
+    /// This should be called after recoverFromWal() completes.
+    ///
+    /// Returns: Number of vectors inserted into HNSW index
+    ///
+    /// Example usage:
+    /// ```
+    /// const recovered_tx = try db.recoverFromWal("data/wal");
+    /// const vectors_indexed = try db.rebuildHnswFromTables();
+    /// std.debug.print("Recovered {} transactions, indexed {} vectors\n",
+    ///                 .{recovered_tx, vectors_indexed});
+    /// ```
+    pub fn rebuildHnswFromTables(self: *Database) !usize {
+        _ = self;
+        // TODO Phase 2.4: Implement HNSW index rebuild
+        // See documentation above for implementation plan
+        return error.NotImplemented;
+    }
+
     /// Execute a SQL command
     pub fn execute(self: *Database, query: []const u8) !QueryResult {
         var cmd = try sql.parse(self.allocator, query);
@@ -215,7 +316,11 @@ pub const Database = struct {
         }
 
         // WAL-Ahead Protocol: Write to WAL BEFORE modifying data
-        if (self.wal) |w| {
+        // ⚠️ LIMITATION (Phase 2.3): Transaction atomicity is incomplete
+        // If WAL write succeeds but table.insert() fails (OOM, validation error), the
+        // database will be inconsistent: WAL has a record for a non-existent row.
+        // Phase 2.4 will address this with proper transaction boundaries and undo/redo.
+        if (self.wal != null) {
             // Get the row_id that will be assigned
             const row_id = table.next_id;
 
@@ -233,33 +338,17 @@ pub const Database = struct {
             const serialized_row = try temp_row.serialize(self.allocator);
             defer self.allocator.free(serialized_row);
 
-            // Get transaction ID and increment
-            const tx_id = self.current_tx_id;
-            self.current_tx_id += 1;
-
-            // Create WAL record
-            const table_name_owned = try self.allocator.dupe(u8, cmd.table_name);
-            const record = WalRecord{
-                .record_type = WalRecordType.insert_row,
-                .tx_id = tx_id,
-                .lsn = 0, // Will be assigned by WAL writer
-                .row_id = row_id,
-                .table_name = table_name_owned,
-                .data = serialized_row,
-                .checksum = 0, // Will be calculated during serialization
-            };
-
-            // Write WAL record and flush to disk (CRITICAL: must be durable before table mutation)
-            _ = try w.writeRecord(record);
-            try w.flush();
-
-            // Clean up the owned table_name (writeRecord makes its own copy)
-            self.allocator.free(table_name_owned);
+            // Write to WAL using helper function
+            _ = try self.writeWalRecord(WalRecordType.insert_row, cmd.table_name, row_id, serialized_row);
         }
 
         const row_id = try table.insert(values_map);
 
         // If there's an embedding column and vector search is enabled, add to index
+        // ⚠️ LIMITATION (Phase 2.3): HNSW index updates are NOT recorded in the WAL
+        // After crash recovery (Phase 2.4), the HNSW index will be out of sync with
+        // table data. Solution: Phase 2.4 should rebuild HNSW index from table data
+        // after WAL replay. See database.zig:262-269
         if (self.hnsw) |h| {
             const row = table.get(row_id).?;
             var it = row.values.iterator();
@@ -424,33 +513,16 @@ pub const Database = struct {
 
             if (should_delete) {
                 // WAL-Ahead Protocol: Write to WAL BEFORE deleting
-                if (self.wal) |w| {
+                // ⚠️ LIMITATION (Phase 2.3): Transaction atomicity is incomplete
+                // If WAL write succeeds but table.delete() fails, the database will be
+                // inconsistent. Phase 2.4 will address this with proper transaction boundaries.
+                if (self.wal != null) {
                     // Serialize the row being deleted (for potential recovery/undo)
                     const serialized_row = try row.serialize(self.allocator);
                     defer self.allocator.free(serialized_row);
 
-                    // Get transaction ID and increment
-                    const tx_id = self.current_tx_id;
-                    self.current_tx_id += 1;
-
-                    // Create WAL record
-                    const table_name_owned = try self.allocator.dupe(u8, cmd.table_name);
-                    const record = WalRecord{
-                        .record_type = WalRecordType.delete_row,
-                        .tx_id = tx_id,
-                        .lsn = 0, // Will be assigned by WAL writer
-                        .row_id = row_id,
-                        .table_name = table_name_owned,
-                        .data = serialized_row,
-                        .checksum = 0, // Will be calculated during serialization
-                    };
-
-                    // Write WAL record and flush (CRITICAL: must be durable before deletion)
-                    _ = try w.writeRecord(record);
-                    try w.flush();
-
-                    // Clean up the owned table_name
-                    self.allocator.free(table_name_owned);
+                    // Write to WAL using helper function
+                    _ = try self.writeWalRecord(WalRecordType.delete_row, cmd.table_name, row_id, serialized_row);
                 }
 
                 _ = table.delete(row_id);
@@ -571,7 +643,10 @@ pub const Database = struct {
             }
 
             // WAL-Ahead Protocol: Write to WAL BEFORE any mutations
-            if (self.wal) |w| {
+            // ⚠️ LIMITATION (Phase 2.3): Transaction atomicity is incomplete
+            // If WAL write succeeds but row/HNSW mutations fail, the database will be
+            // inconsistent. Phase 2.4 will address this with proper transaction boundaries.
+            if (self.wal != null) {
                 // Serialize the current row (old state) for recovery
                 const serialized_old = try row.serialize(self.allocator);
                 defer self.allocator.free(serialized_old);
@@ -605,32 +680,16 @@ pub const Database = struct {
                 @memcpy(combined_data[8..][0..serialized_old.len], serialized_old);
                 @memcpy(combined_data[8 + serialized_old.len ..][0..serialized_new.len], serialized_new);
 
-                // Get transaction ID and increment
-                const tx_id = self.current_tx_id;
-                self.current_tx_id += 1;
-
-                // Create WAL record
-                const table_name_owned = try self.allocator.dupe(u8, cmd.table_name);
-                const record = WalRecord{
-                    .record_type = WalRecordType.update_row,
-                    .tx_id = tx_id,
-                    .lsn = 0, // Will be assigned by WAL writer
-                    .row_id = row_id,
-                    .table_name = table_name_owned,
-                    .data = combined_data,
-                    .checksum = 0, // Will be calculated during serialization
-                };
-
-                // Write WAL record and flush (CRITICAL: must be durable before mutations)
-                _ = try w.writeRecord(record);
-                try w.flush();
-
-                // Clean up the owned table_name
-                self.allocator.free(table_name_owned);
+                // Write to WAL using helper function
+                _ = try self.writeWalRecord(WalRecordType.update_row, cmd.table_name, row_id, combined_data);
             }
 
             // Handle HNSW index updates BEFORE applying row updates
             // This ensures atomicity: if HNSW fails, row hasn't been mutated
+            // ⚠️ LIMITATION (Phase 2.3): HNSW index updates are NOT recorded in the WAL
+            // After crash recovery (Phase 2.4), the HNSW index will be out of sync with
+            // table data. Solution: Phase 2.4 should rebuild HNSW index from table data
+            // after WAL replay. See database.zig:634-650
             if (embedding_changed and self.hnsw != null) {
                 const h = self.hnsw.?;
 

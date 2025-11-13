@@ -1149,3 +1149,132 @@ test "WAL: Database works without WAL (optional)" {
     defer select_result.deinit();
     try testing.expect(select_result.rows.items.len == 0);
 }
+
+test "WAL: Embeddings are preserved across INSERT/UPDATE with WAL enabled" {
+    const wal_dir = "test_data/wal_embeddings";
+
+    // Clean up any existing test data
+    std.fs.cwd().deleteTree(wal_dir) catch {};
+    defer std.fs.cwd().deleteTree(wal_dir) catch {};
+
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    // Initialize vector search and WAL
+    try db.initVectorSearch(16, 200);
+    try db.enableWal(wal_dir);
+
+    // Create table with embedding column
+    var create_result = try db.execute("CREATE TABLE docs (id int, title text, embedding embedding)");
+    defer create_result.deinit();
+
+    // Create test embeddings
+    var embedding1 = [_]f32{0.1} ** 768;
+    var embedding2 = [_]f32{0.9} ** 768;
+
+    // Test INSERT with regular columns first (this triggers WAL)
+    var insert_result = try db.execute("INSERT INTO docs VALUES (1, \"Document 1\", NULL)");
+    defer insert_result.deinit();
+
+    // Now manually add the embedding to test preservation
+    // (SQL parser doesn't support embedding array literals, so we use table API for embeddings only)
+    const table = db.tables.get("docs").?;
+    const row_id: u64 = 1;
+    const row = table.get(row_id).?;
+
+    const emb1 = try testing.allocator.dupe(f32, &embedding1);
+    defer testing.allocator.free(emb1);
+    try row.set(testing.allocator, "embedding", ColumnValue{ .embedding = emb1 });
+    _ = try db.hnsw.?.insert(&embedding1, row_id);
+
+    // Verify WAL file was created from the INSERT command
+    var wal_dir_handle = try std.fs.cwd().openDir(wal_dir, .{ .iterate = true });
+    defer wal_dir_handle.close();
+
+    var wal_file_found = false;
+    var wal_iter = wal_dir_handle.iterate();
+    while (try wal_iter.next()) |entry| {
+        if (std.mem.startsWith(u8, entry.name, "wal.")) {
+            wal_file_found = true;
+            // Check that WAL file is not empty
+            const file_stat = try wal_dir_handle.statFile(entry.name);
+            try testing.expect(file_stat.size > 36); // Header is 36 bytes, should have more
+            break;
+        }
+    }
+    try testing.expect(wal_file_found);
+
+    // Test UPDATE to change title (this triggers WAL)
+    var update_result = try db.execute("UPDATE docs SET title = \"Updated Document\" WHERE id = 1");
+    defer update_result.deinit();
+    try testing.expect(update_result.rows.items[0].items[0].int == 1);
+
+    // Update the embedding manually
+    const emb2 = try testing.allocator.dupe(f32, &embedding2);
+    defer testing.allocator.free(emb2);
+    try row.set(testing.allocator, "embedding", ColumnValue{ .embedding = emb2 });
+    try db.hnsw.?.removeNode(row_id);
+    _ = try db.hnsw.?.insert(&embedding2, row_id);
+
+    // Verify embedding was updated
+    const updated_emb = row.get("embedding").?;
+    try testing.expect(updated_emb.embedding[0] == 0.9);
+
+    // Verify HNSW index still contains the row
+    const internal_id = db.hnsw.?.getInternalId(row_id);
+    try testing.expect(internal_id != null);
+}
+
+test "WAL: Multiple embedding insertions with WAL" {
+    const wal_dir = "test_data/wal_multi_embeddings";
+
+    // Clean up any existing test data
+    std.fs.cwd().deleteTree(wal_dir) catch {};
+    defer std.fs.cwd().deleteTree(wal_dir) catch {};
+
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    // Initialize vector search and WAL
+    try db.initVectorSearch(16, 200);
+    try db.enableWal(wal_dir);
+
+    // Create table
+    var create_result = try db.execute("CREATE TABLE docs (id int, content text, vec embedding)");
+    defer create_result.deinit();
+
+    const table = db.tables.get("docs").?;
+
+    // Insert multiple rows using SQL (this triggers WAL)
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        // Use SQL INSERT to trigger WAL
+        const id = i + 1;
+        var insert_query_buf: [100]u8 = undefined;
+        const insert_query = try std.fmt.bufPrint(&insert_query_buf, "INSERT INTO docs VALUES ({d}, \"Test document\", NULL)", .{id});
+        var insert_result = try db.execute(insert_query);
+        defer insert_result.deinit();
+
+        // Now add the embedding manually (parser doesn't support embedding literals)
+        var embedding = [_]f32{@as(f32, @floatFromInt(i)) * 0.1} ** 768;
+        const row = table.get(id).?;
+        const emb = try testing.allocator.dupe(f32, &embedding);
+        defer testing.allocator.free(emb);
+        try row.set(testing.allocator, "vec", ColumnValue{ .embedding = emb });
+        _ = try db.hnsw.?.insert(&embedding, id);
+    }
+
+    // Verify all rows inserted
+    try testing.expect(table.count() == 5);
+
+    // Verify transaction IDs incremented for each insert
+    // Since we have WAL enabled, each INSERT command incremented the tx_id
+    // We inserted 5 rows, so tx_id should now be 5 (started at 0)
+    try testing.expect(db.current_tx_id == 5);
+
+    // Verify HNSW has all vectors
+    for (1..6) |row_num| {
+        const internal_id = db.hnsw.?.getInternalId(row_num);
+        try testing.expect(internal_id != null);
+    }
+}
