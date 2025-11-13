@@ -300,6 +300,341 @@ pub const WalRecord = struct {
 };
 
 // ============================================================================
+// WAL Writer
+// ============================================================================
+
+/// WAL Writer - handles buffered writing of WAL records to disk
+///
+/// The writer buffers records in memory and flushes them to disk when:
+/// 1. The buffer reaches the page size threshold
+/// 2. flush() is called explicitly (e.g., on transaction commit)
+/// 3. The file reaches the rotation size limit
+///
+/// Thread safety: NOT thread-safe. Caller must synchronize access.
+pub const WalWriter = struct {
+    /// File handle for the current WAL file
+    file: std.fs.File,
+
+    /// Directory where WAL files are stored
+    wal_dir: []const u8,
+
+    /// Write buffer for batching records
+    buffer: std.ArrayList(u8),
+
+    /// Current sequence number (for file rotation)
+    sequence: u64,
+
+    /// Next LSN (Logical Sequence Number) to assign
+    next_lsn: u64,
+
+    /// Page size for buffering (flush when buffer reaches this size)
+    page_size: u32,
+
+    /// Maximum file size before rotation (default: 16MB)
+    max_file_size: u64,
+
+    /// Current file size in bytes
+    current_file_size: u64,
+
+    /// Allocator for buffer management
+    allocator: Allocator,
+
+    pub const DEFAULT_PAGE_SIZE: u32 = 4096; // 4KB
+    pub const DEFAULT_MAX_FILE_SIZE: u64 = 16 * 1024 * 1024; // 16MB
+
+    /// Initialize a new WAL writer
+    ///
+    /// Creates the WAL directory if it doesn't exist.
+    /// Creates a new WAL file with sequence number 0.
+    pub fn init(allocator: Allocator, wal_dir: []const u8) !WalWriter {
+        return initWithOptions(allocator, wal_dir, .{});
+    }
+
+    pub const InitOptions = struct {
+        page_size: u32 = DEFAULT_PAGE_SIZE,
+        max_file_size: u64 = DEFAULT_MAX_FILE_SIZE,
+        sequence: u64 = 0,
+    };
+
+    pub fn initWithOptions(allocator: Allocator, wal_dir: []const u8, options: InitOptions) !WalWriter {
+        // Create WAL directory if it doesn't exist
+        std.fs.cwd().makePath(wal_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+
+        // Create first WAL file
+        const file = try createWalFile(wal_dir, options.sequence, options.page_size);
+
+        var buffer = std.ArrayList(u8).init(allocator);
+        try buffer.ensureTotalCapacity(options.page_size);
+
+        return WalWriter{
+            .file = file,
+            .wal_dir = wal_dir,
+            .buffer = buffer,
+            .sequence = options.sequence,
+            .next_lsn = 1,
+            .page_size = options.page_size,
+            .max_file_size = options.max_file_size,
+            .current_file_size = WalHeader.SIZE, // Header already written
+            .allocator = allocator,
+        };
+    }
+
+    /// Create a new WAL file with the given sequence number
+    fn createWalFile(wal_dir: []const u8, sequence: u64, page_size: u32) !std.fs.File {
+        const allocator = std.heap.page_allocator;
+
+        // Generate filename: wal.000000, wal.000001, etc.
+        const filename = try std.fmt.allocPrint(allocator, "{s}/wal.{d:0>6}", .{ wal_dir, sequence });
+        defer allocator.free(filename);
+
+        // Create the file
+        const file = try std.fs.cwd().createFile(filename, .{
+            .read = true,
+            .truncate = false,
+        });
+
+        // Write header
+        const header = WalHeader.init(sequence, page_size);
+        var header_buffer: [WalHeader.SIZE]u8 = undefined;
+        header.serialize(&header_buffer);
+        try file.writeAll(&header_buffer);
+
+        return file;
+    }
+
+    pub fn deinit(self: *WalWriter) void {
+        // Flush any remaining buffered data
+        self.flush() catch |err| {
+            std.debug.print("Warning: Failed to flush WAL on deinit: {}\n", .{err});
+        };
+
+        self.file.close();
+        self.buffer.deinit();
+    }
+
+    /// Write a WAL record
+    ///
+    /// The record is buffered and will be flushed when:
+    /// - Buffer reaches page_size
+    /// - flush() is called explicitly
+    /// - File rotation occurs
+    pub fn writeRecord(self: *WalWriter, record: WalRecord) !u64 {
+        // Assign LSN to this record
+        const lsn = self.next_lsn;
+        self.next_lsn += 1;
+
+        // Create record with assigned LSN
+        var record_with_lsn = record;
+        record_with_lsn.lsn = lsn;
+
+        // Calculate serialized size
+        const size = record_with_lsn.serializedSize();
+
+        // Check if we need to rotate the file
+        if (self.current_file_size + size > self.max_file_size) {
+            try self.rotate();
+        }
+
+        // Ensure buffer has space
+        try self.buffer.ensureUnusedCapacity(size);
+
+        // Serialize record into buffer
+        const start = self.buffer.items.len;
+        try self.buffer.resize(start + size);
+        try record_with_lsn.serialize(self.buffer.items[start..], self.allocator);
+
+        // Update file size estimate
+        self.current_file_size += size;
+
+        // Flush if buffer is full
+        if (self.buffer.items.len >= self.page_size) {
+            try self.flush();
+        }
+
+        return lsn;
+    }
+
+    /// Flush buffered records to disk with fsync
+    ///
+    /// This ensures durability - data is guaranteed to be on disk after this returns.
+    pub fn flush(self: *WalWriter) !void {
+        if (self.buffer.items.len == 0) {
+            return; // Nothing to flush
+        }
+
+        // Write buffer to file
+        try self.file.writeAll(self.buffer.items);
+
+        // CRITICAL: fsync to ensure data is physically on disk
+        try self.file.sync();
+
+        // Clear buffer
+        self.buffer.clearRetainingCapacity();
+    }
+
+    /// Rotate to a new WAL file
+    ///
+    /// Closes the current file and creates a new one with incremented sequence number.
+    fn rotate(self: *WalWriter) !void {
+        // Flush current buffer
+        try self.flush();
+
+        // Close current file
+        self.file.close();
+
+        // Increment sequence
+        self.sequence += 1;
+
+        // Create new file
+        self.file = try createWalFile(self.wal_dir, self.sequence, self.page_size);
+
+        // Reset file size (just the header)
+        self.current_file_size = WalHeader.SIZE;
+    }
+
+    /// Write a checkpoint marker
+    ///
+    /// After a checkpoint, all WAL files with sequence < checkpoint_sequence
+    /// can be safely deleted.
+    pub fn writeCheckpoint(self: *WalWriter) !u64 {
+        const record = WalRecord{
+            .record_type = .checkpoint,
+            .tx_id = 0,
+            .lsn = 0, // Will be assigned by writeRecord
+            .row_id = 0,
+            .table_name = "",
+            .data = "",
+            .checksum = 0,
+        };
+
+        const lsn = try self.writeRecord(record);
+        try self.flush(); // Ensure checkpoint is durable
+
+        return lsn;
+    }
+
+    /// Get the current sequence number
+    pub fn getCurrentSequence(self: *const WalWriter) u64 {
+        return self.sequence;
+    }
+
+    /// Get the next LSN that will be assigned
+    pub fn getNextLsn(self: *const WalWriter) u64 {
+        return self.next_lsn;
+    }
+};
+
+// ============================================================================
+// WAL Reader
+// ============================================================================
+
+/// WAL Reader - reads WAL records from disk for recovery
+pub const WalReader = struct {
+    file: std.fs.File,
+    allocator: Allocator,
+    buffer: []u8,
+    buffer_pos: usize,
+    buffer_len: usize,
+    eof: bool,
+
+    pub const BUFFER_SIZE: usize = 65536; // 64KB read buffer
+
+    /// Open a WAL file for reading
+    pub fn init(allocator: Allocator, wal_path: []const u8) !WalReader {
+        const file = try std.fs.cwd().openFile(wal_path, .{});
+        errdefer file.close();
+
+        // Read and validate header
+        var header_buffer: [WalHeader.SIZE]u8 = undefined;
+        const n = try file.readAll(&header_buffer);
+        if (n != WalHeader.SIZE) {
+            return error.InvalidWalFile;
+        }
+
+        const header = WalHeader.deserialize(&header_buffer);
+        try header.validate();
+
+        // Allocate read buffer
+        const buffer = try allocator.alloc(u8, BUFFER_SIZE);
+
+        return WalReader{
+            .file = file,
+            .allocator = allocator,
+            .buffer = buffer,
+            .buffer_pos = 0,
+            .buffer_len = 0,
+            .eof = false,
+        };
+    }
+
+    pub fn deinit(self: *WalReader) void {
+        self.file.close();
+        self.allocator.free(self.buffer);
+    }
+
+    /// Read the next WAL record
+    ///
+    /// Returns null at end of file.
+    /// Returned record must be deinit'd by the caller.
+    pub fn readRecord(self: *WalReader) !?WalRecord {
+        if (self.eof) {
+            return null;
+        }
+
+        // Ensure we have enough data in buffer
+        if (self.buffer_len - self.buffer_pos < 1024) { // Need at least minimal record size
+            try self.fillBuffer();
+            if (self.buffer_len == 0) {
+                return null; // EOF
+            }
+        }
+
+        // Try to deserialize a record
+        const remaining = self.buffer[self.buffer_pos..self.buffer_len];
+        const result = WalRecord.deserialize(remaining, self.allocator) catch |err| switch (err) {
+            error.BufferTooSmall => {
+                // Need more data
+                try self.fillBuffer();
+                if (self.buffer_len - self.buffer_pos == 0) {
+                    return null; // EOF
+                }
+                // Try again with more data
+                const remaining2 = self.buffer[self.buffer_pos..self.buffer_len];
+                return try WalRecord.deserialize(remaining2, self.allocator);
+            },
+            else => return err,
+        };
+
+        self.buffer_pos += result.bytes_read;
+        return result.record;
+    }
+
+    /// Fill the read buffer from the file
+    fn fillBuffer(self: *WalReader) !void {
+        // Move remaining data to start of buffer
+        if (self.buffer_pos > 0 and self.buffer_pos < self.buffer_len) {
+            const remaining = self.buffer_len - self.buffer_pos;
+            std.mem.copyForwards(u8, self.buffer[0..remaining], self.buffer[self.buffer_pos..self.buffer_len]);
+            self.buffer_len = remaining;
+            self.buffer_pos = 0;
+        } else if (self.buffer_pos >= self.buffer_len) {
+            self.buffer_len = 0;
+            self.buffer_pos = 0;
+        }
+
+        // Read more data from file
+        const bytes_read = try self.file.read(self.buffer[self.buffer_len..]);
+        if (bytes_read == 0) {
+            self.eof = true;
+        }
+        self.buffer_len += bytes_read;
+    }
+};
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -492,4 +827,286 @@ test "WalRecord: all record types" {
 
         try testing.expectEqual(rt, record2.record_type);
     }
+}
+
+test "WalWriter: init and deinit" {
+    const allocator = testing.allocator;
+
+    // Create temporary directory for test
+    const test_dir = "test_wal_init";
+    defer std.fs.cwd().deleteTree(test_dir) catch {};
+
+    var writer = try WalWriter.init(allocator, test_dir);
+    defer writer.deinit();
+
+    try testing.expectEqual(@as(u64, 0), writer.sequence);
+    try testing.expectEqual(@as(u64, 1), writer.next_lsn);
+}
+
+test "WalWriter: write and flush record" {
+    const allocator = testing.allocator;
+
+    const test_dir = "test_wal_write";
+    defer std.fs.cwd().deleteTree(test_dir) catch {};
+
+    var writer = try WalWriter.init(allocator, test_dir);
+    defer writer.deinit();
+
+    // Write a BEGIN record
+    const record = WalRecord{
+        .record_type = .begin_tx,
+        .tx_id = 1,
+        .lsn = 0, // Will be assigned
+        .row_id = 0,
+        .table_name = "",
+        .data = "",
+        .checksum = 0,
+    };
+
+    const lsn = try writer.writeRecord(record);
+    try testing.expectEqual(@as(u64, 1), lsn);
+    try testing.expectEqual(@as(u64, 2), writer.next_lsn);
+
+    // Flush to ensure data is on disk
+    try writer.flush();
+}
+
+test "WalWriter: multiple records" {
+    const allocator = testing.allocator;
+
+    const test_dir = "test_wal_multiple";
+    defer std.fs.cwd().deleteTree(test_dir) catch {};
+
+    var writer = try WalWriter.init(allocator, test_dir);
+    defer writer.deinit();
+
+    // Write multiple records
+    const lsn1 = try writer.writeRecord(.{
+        .record_type = .begin_tx,
+        .tx_id = 1,
+        .lsn = 0,
+        .row_id = 0,
+        .table_name = "",
+        .data = "",
+        .checksum = 0,
+    });
+
+    const lsn2 = try writer.writeRecord(.{
+        .record_type = .insert_row,
+        .tx_id = 1,
+        .lsn = 0,
+        .row_id = 100,
+        .table_name = "users",
+        .data = "row_data",
+        .checksum = 0,
+    });
+
+    const lsn3 = try writer.writeRecord(.{
+        .record_type = .commit_tx,
+        .tx_id = 1,
+        .lsn = 0,
+        .row_id = 0,
+        .table_name = "",
+        .data = "",
+        .checksum = 0,
+    });
+
+    try testing.expectEqual(@as(u64, 1), lsn1);
+    try testing.expectEqual(@as(u64, 2), lsn2);
+    try testing.expectEqual(@as(u64, 3), lsn3);
+
+    try writer.flush();
+}
+
+test "WalWriter: checkpoint" {
+    const allocator = testing.allocator;
+
+    const test_dir = "test_wal_checkpoint";
+    defer std.fs.cwd().deleteTree(test_dir) catch {};
+
+    var writer = try WalWriter.init(allocator, test_dir);
+    defer writer.deinit();
+
+    // Write some records
+    _ = try writer.writeRecord(.{
+        .record_type = .begin_tx,
+        .tx_id = 1,
+        .lsn = 0,
+        .row_id = 0,
+        .table_name = "",
+        .data = "",
+        .checksum = 0,
+    });
+
+    // Write checkpoint
+    const checkpoint_lsn = try writer.writeCheckpoint();
+    try testing.expect(checkpoint_lsn > 0);
+}
+
+test "WalReader: read records" {
+    const allocator = testing.allocator;
+
+    const test_dir = "test_wal_read";
+    defer std.fs.cwd().deleteTree(test_dir) catch {};
+
+    // Write some records
+    {
+        var writer = try WalWriter.init(allocator, test_dir);
+        defer writer.deinit();
+
+        _ = try writer.writeRecord(.{
+            .record_type = .begin_tx,
+            .tx_id = 1,
+            .lsn = 0,
+            .row_id = 0,
+            .table_name = "",
+            .data = "",
+            .checksum = 0,
+        });
+
+        _ = try writer.writeRecord(.{
+            .record_type = .insert_row,
+            .tx_id = 1,
+            .lsn = 0,
+            .row_id = 123,
+            .table_name = "test_table",
+            .data = "test_data",
+            .checksum = 0,
+        });
+
+        _ = try writer.writeRecord(.{
+            .record_type = .commit_tx,
+            .tx_id = 1,
+            .lsn = 0,
+            .row_id = 0,
+            .table_name = "",
+            .data = "",
+            .checksum = 0,
+        });
+
+        try writer.flush();
+    }
+
+    // Read the records back
+    const wal_path = try std.fmt.allocPrint(allocator, "{s}/wal.{d:0>6}", .{ test_dir, 0 });
+    defer allocator.free(wal_path);
+
+    var reader = try WalReader.init(allocator, wal_path);
+    defer reader.deinit();
+
+    // Read first record (BEGIN)
+    const record1 = try reader.readRecord();
+    try testing.expect(record1 != null);
+    var r1 = record1.?;
+    defer r1.deinit(allocator);
+    try testing.expectEqual(WalRecordType.begin_tx, r1.record_type);
+    try testing.expectEqual(@as(u64, 1), r1.tx_id);
+    try testing.expectEqual(@as(u64, 1), r1.lsn);
+
+    // Read second record (INSERT)
+    const record2 = try reader.readRecord();
+    try testing.expect(record2 != null);
+    var r2 = record2.?;
+    defer r2.deinit(allocator);
+    try testing.expectEqual(WalRecordType.insert_row, r2.record_type);
+    try testing.expectEqual(@as(u64, 1), r2.tx_id);
+    try testing.expectEqual(@as(u64, 2), r2.lsn);
+    try testing.expectEqual(@as(u64, 123), r2.row_id);
+    try testing.expectEqualStrings("test_table", r2.table_name);
+    try testing.expectEqualStrings("test_data", r2.data);
+
+    // Read third record (COMMIT)
+    const record3 = try reader.readRecord();
+    try testing.expect(record3 != null);
+    var r3 = record3.?;
+    defer r3.deinit(allocator);
+    try testing.expectEqual(WalRecordType.commit_tx, r3.record_type);
+    try testing.expectEqual(@as(u64, 1), r3.tx_id);
+    try testing.expectEqual(@as(u64, 3), r3.lsn);
+
+    // EOF
+    const record4 = try reader.readRecord();
+    try testing.expect(record4 == null);
+}
+
+test "WalWriter: file rotation" {
+    const allocator = testing.allocator;
+
+    const test_dir = "test_wal_rotation";
+    defer std.fs.cwd().deleteTree(test_dir) catch {};
+
+    // Create writer with small max file size to trigger rotation
+    var writer = try WalWriter.initWithOptions(allocator, test_dir, .{
+        .max_file_size = 1024, // 1KB - very small for testing
+    });
+    defer writer.deinit();
+
+    const initial_sequence = writer.getCurrentSequence();
+
+    // Write many records to trigger rotation
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        _ = try writer.writeRecord(.{
+            .record_type = .insert_row,
+            .tx_id = @intCast(i),
+            .lsn = 0,
+            .row_id = @intCast(i),
+            .table_name = "test_table_with_long_name",
+            .data = "some_data_here_to_make_record_larger",
+            .checksum = 0,
+        });
+    }
+
+    try writer.flush();
+
+    // Should have rotated to a new file
+    const final_sequence = writer.getCurrentSequence();
+    try testing.expect(final_sequence > initial_sequence);
+}
+
+test "WalWriter and WalReader: round-trip with large data" {
+    const allocator = testing.allocator;
+
+    const test_dir = "test_wal_roundtrip";
+    defer std.fs.cwd().deleteTree(test_dir) catch {};
+
+    const large_data = try allocator.alloc(u8, 10000);
+    defer allocator.free(large_data);
+    @memset(large_data, 'X');
+
+    // Write a record with large data
+    {
+        var writer = try WalWriter.init(allocator, test_dir);
+        defer writer.deinit();
+
+        _ = try writer.writeRecord(.{
+            .record_type = .update_row,
+            .tx_id = 99,
+            .lsn = 0,
+            .row_id = 456,
+            .table_name = "large_table",
+            .data = large_data,
+            .checksum = 0,
+        });
+
+        try writer.flush();
+    }
+
+    // Read it back
+    const wal_path = try std.fmt.allocPrint(allocator, "{s}/wal.{d:0>6}", .{ test_dir, 0 });
+    defer allocator.free(wal_path);
+
+    var reader = try WalReader.init(allocator, wal_path);
+    defer reader.deinit();
+
+    const record = try reader.readRecord();
+    try testing.expect(record != null);
+    var r = record.?;
+    defer r.deinit(allocator);
+
+    try testing.expectEqual(WalRecordType.update_row, r.record_type);
+    try testing.expectEqual(@as(u64, 99), r.tx_id);
+    try testing.expectEqual(@as(u64, 456), r.row_id);
+    try testing.expectEqualStrings("large_table", r.table_name);
+    try testing.expectEqual(large_data.len, r.data.len);
 }
