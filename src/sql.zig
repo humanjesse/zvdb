@@ -17,6 +17,8 @@ pub const SqlError = error{
     TableNotFound,
     ColumnNotFound,
     OutOfMemory,
+    DimensionMismatch,
+    InvalidExpression,
 };
 
 /// SQL command types
@@ -25,6 +27,7 @@ pub const SqlCommand = union(enum) {
     insert: InsertCmd,
     select: SelectCmd,
     delete: DeleteCmd,
+    update: UpdateCmd,
 
     pub fn deinit(self: *SqlCommand, allocator: Allocator) void {
         switch (self.*) {
@@ -32,6 +35,7 @@ pub const SqlCommand = union(enum) {
             .insert => |*cmd| cmd.deinit(allocator),
             .select => |*cmd| cmd.deinit(allocator),
             .delete => |*cmd| cmd.deinit(allocator),
+            .update => |*cmd| cmd.deinit(allocator),
         }
     }
 };
@@ -120,6 +124,104 @@ pub const DeleteCmd = struct {
     }
 };
 
+/// Binary operators for WHERE expressions
+pub const BinaryOp = enum {
+    eq,     // =
+    neq,    // !=
+    lt,     // <
+    gt,     // >
+    lte,    // <=
+    gte,    // >=
+    and_op, // AND
+    or_op,  // OR
+};
+
+/// Unary operators for WHERE expressions
+pub const UnaryOp = enum {
+    not,         // NOT
+    is_null,     // IS NULL
+    is_not_null, // IS NOT NULL
+};
+
+/// Binary expression node
+pub const BinaryExpr = struct {
+    op: BinaryOp,
+    left: Expr,
+    right: Expr,
+
+    pub fn deinit(self: *BinaryExpr, allocator: Allocator) void {
+        self.left.deinit(allocator);
+        self.right.deinit(allocator);
+    }
+};
+
+/// Unary expression node
+pub const UnaryExpr = struct {
+    op: UnaryOp,
+    expr: Expr,
+
+    pub fn deinit(self: *UnaryExpr, allocator: Allocator) void {
+        self.expr.deinit(allocator);
+    }
+};
+
+/// Expression tree for WHERE clauses
+pub const Expr = union(enum) {
+    literal: ColumnValue,
+    column: []const u8,
+    binary: *BinaryExpr,
+    unary: *UnaryExpr,
+
+    pub fn deinit(self: *Expr, allocator: Allocator) void {
+        switch (self.*) {
+            .literal => |*val| {
+                var v = val.*;
+                v.deinit(allocator);
+            },
+            .column => |col| allocator.free(col),
+            .binary => |bin| {
+                bin.deinit(allocator);
+                allocator.destroy(bin);
+            },
+            .unary => |un| {
+                un.deinit(allocator);
+                allocator.destroy(un);
+            },
+        }
+    }
+};
+
+/// Assignment for UPDATE SET clause
+pub const Assignment = struct {
+    column: []const u8,
+    value: ColumnValue,
+
+    pub fn deinit(self: *Assignment, allocator: Allocator) void {
+        allocator.free(self.column);
+        var val = self.value;
+        val.deinit(allocator);
+    }
+};
+
+/// UPDATE command
+pub const UpdateCmd = struct {
+    table_name: []const u8,
+    assignments: ArrayList(Assignment),
+    where_expr: ?Expr,
+
+    pub fn deinit(self: *UpdateCmd, allocator: Allocator) void {
+        allocator.free(self.table_name);
+        for (self.assignments.items) |*assign| {
+            assign.deinit(allocator);
+        }
+        self.assignments.deinit();
+        if (self.where_expr) |*expr| {
+            var e = expr.*;
+            e.deinit(allocator);
+        }
+    }
+};
+
 /// Simple SQL tokenizer
 const Token = struct {
     text: []const u8,
@@ -156,9 +258,17 @@ fn tokenize(allocator: Allocator, sql: []const u8) !ArrayList(Token) {
             while (i < sql.len and (std.ascii.isAlphanumeric(sql[i]) or sql[i] == '_')) : (i += 1) {}
             try tokens.append(.{ .text = sql[start..i], .start = start });
         }
-        // Special characters
-        else if (sql[i] == '(' or sql[i] == ')' or sql[i] == ',' or sql[i] == '*' or sql[i] == '=') {
+        // Special characters and operators
+        else if (sql[i] == '(' or sql[i] == ')' or sql[i] == ',' or sql[i] == '*') {
             i += 1;
+            try tokens.append(.{ .text = sql[start..i], .start = start });
+        }
+        // Multi-character operators: <=, >=, !=
+        else if (sql[i] == '<' or sql[i] == '>' or sql[i] == '!' or sql[i] == '=') {
+            i += 1;
+            if (i < sql.len and sql[i] == '=') {
+                i += 1; // Include the = for <=, >=, !=, ==
+            }
             try tokens.append(.{ .text = sql[start..i], .start = start });
         } else {
             i += 1; // Skip unknown characters
@@ -216,6 +326,8 @@ pub fn parse(allocator: Allocator, sql: []const u8) !SqlCommand {
         return SqlCommand{ .select = try parseSelect(allocator, tokens.items) };
     } else if (eqlIgnoreCase(first, "DELETE")) {
         return SqlCommand{ .delete = try parseDelete(allocator, tokens.items) };
+    } else if (eqlIgnoreCase(first, "UPDATE")) {
+        return SqlCommand{ .update = try parseUpdate(allocator, tokens.items) };
     }
 
     return SqlError.UnknownCommand;
@@ -488,5 +600,430 @@ fn parseDelete(allocator: Allocator, tokens: []const Token) !DeleteCmd {
         .table_name = table_name,
         .where_column = where_column,
         .where_value = where_value,
+    };
+}
+
+/// Helper function to parse a value token into a ColumnValue
+fn parseValue(allocator: Allocator, token_text: []const u8) !ColumnValue {
+    if (token_text.len == 0) return SqlError.InvalidSyntax;
+
+    if (token_text[0] == '"' or token_text[0] == '\'') {
+        const str = parseString(token_text);
+        const owned = try allocator.dupe(u8, str);
+        return ColumnValue{ .text = owned };
+    } else if (std.mem.indexOf(u8, token_text, ".")) |_| {
+        const f = try std.fmt.parseFloat(f64, token_text);
+        return ColumnValue{ .float = f };
+    } else if (eqlIgnoreCase(token_text, "true")) {
+        return ColumnValue{ .bool = true };
+    } else if (eqlIgnoreCase(token_text, "false")) {
+        return ColumnValue{ .bool = false };
+    } else if (eqlIgnoreCase(token_text, "NULL")) {
+        return ColumnValue.null_value;
+    } else {
+        const num = try std.fmt.parseInt(i64, token_text, 10);
+        return ColumnValue{ .int = num };
+    }
+}
+
+/// Parse an expression (recursive descent parser)
+fn parseExpr(allocator: Allocator, tokens: []const Token, start_idx: *usize) (Allocator.Error || SqlError)!Expr {
+    return try parseOrExpr(allocator, tokens, start_idx);
+}
+
+/// Parse OR expressions (lowest precedence)
+fn parseOrExpr(allocator: Allocator, tokens: []const Token, idx: *usize) (Allocator.Error || SqlError)!Expr {
+    var left = try parseAndExpr(allocator, tokens, idx);
+
+    while (idx.* < tokens.len and eqlIgnoreCase(tokens[idx.*].text, "OR")) {
+        idx.* += 1;
+        const right = try parseAndExpr(allocator, tokens, idx);
+
+        const binary = try allocator.create(BinaryExpr);
+        binary.* = BinaryExpr{
+            .op = .or_op,
+            .left = left,
+            .right = right,
+        };
+        left = Expr{ .binary = binary };
+    }
+
+    return left;
+}
+
+/// Parse AND expressions
+fn parseAndExpr(allocator: Allocator, tokens: []const Token, idx: *usize) (Allocator.Error || SqlError)!Expr {
+    var left = try parseComparisonExpr(allocator, tokens, idx);
+
+    while (idx.* < tokens.len and eqlIgnoreCase(tokens[idx.*].text, "AND")) {
+        idx.* += 1;
+        const right = try parseComparisonExpr(allocator, tokens, idx);
+
+        const binary = try allocator.create(BinaryExpr);
+        binary.* = BinaryExpr{
+            .op = .and_op,
+            .left = left,
+            .right = right,
+        };
+        left = Expr{ .binary = binary };
+    }
+
+    return left;
+}
+
+/// Parse comparison expressions (=, !=, <, >, <=, >=)
+fn parseComparisonExpr(allocator: Allocator, tokens: []const Token, idx: *usize) (Allocator.Error || SqlError)!Expr {
+    var left = try parseUnaryExpr(allocator, tokens, idx);
+
+    if (idx.* < tokens.len) {
+        const op_text = tokens[idx.*].text;
+        const op: ?BinaryOp = if (std.mem.eql(u8, op_text, "="))
+            .eq
+        else if (std.mem.eql(u8, op_text, "!="))
+            .neq
+        else if (std.mem.eql(u8, op_text, "<"))
+            .lt
+        else if (std.mem.eql(u8, op_text, ">"))
+            .gt
+        else if (std.mem.eql(u8, op_text, "<="))
+            .lte
+        else if (std.mem.eql(u8, op_text, ">="))
+            .gte
+        else
+            null;
+
+        if (op) |o| {
+            idx.* += 1;
+            const right = try parseUnaryExpr(allocator, tokens, idx);
+
+            const binary = try allocator.create(BinaryExpr);
+            binary.* = BinaryExpr{
+                .op = o,
+                .left = left,
+                .right = right,
+            };
+            return Expr{ .binary = binary };
+        }
+    }
+
+    return left;
+}
+
+/// Parse unary expressions (NOT, IS NULL, IS NOT NULL)
+fn parseUnaryExpr(allocator: Allocator, tokens: []const Token, idx: *usize) (Allocator.Error || SqlError)!Expr {
+    if (idx.* >= tokens.len) return SqlError.InvalidExpression;
+
+    // NOT expression
+    if (eqlIgnoreCase(tokens[idx.*].text, "NOT")) {
+        idx.* += 1;
+        const expr = try parseUnaryExpr(allocator, tokens, idx);
+        const unary = try allocator.create(UnaryExpr);
+        unary.* = UnaryExpr{
+            .op = .not,
+            .expr = expr,
+        };
+        return Expr{ .unary = unary };
+    }
+
+    var expr = try parsePrimaryExpr(allocator, tokens, idx);
+
+    // IS NULL / IS NOT NULL
+    if (idx.* < tokens.len and eqlIgnoreCase(tokens[idx.*].text, "IS")) {
+        idx.* += 1;
+        if (idx.* >= tokens.len) return SqlError.InvalidExpression;
+
+        const is_not = eqlIgnoreCase(tokens[idx.*].text, "NOT");
+        if (is_not) {
+            idx.* += 1;
+            if (idx.* >= tokens.len) return SqlError.InvalidExpression;
+        }
+
+        if (!eqlIgnoreCase(tokens[idx.*].text, "NULL")) return SqlError.InvalidExpression;
+        idx.* += 1;
+
+        const unary = try allocator.create(UnaryExpr);
+        unary.* = UnaryExpr{
+            .op = if (is_not) .is_not_null else .is_null,
+            .expr = expr,
+        };
+        return Expr{ .unary = unary };
+    }
+
+    return expr;
+}
+
+/// Parse primary expressions (literals, columns, parentheses)
+fn parsePrimaryExpr(allocator: Allocator, tokens: []const Token, idx: *usize) (Allocator.Error || SqlError)!Expr {
+    if (idx.* >= tokens.len) return SqlError.InvalidExpression;
+
+    const token_text = tokens[idx.*].text;
+
+    // Parenthesized expression
+    if (std.mem.eql(u8, token_text, "(")) {
+        idx.* += 1;
+        const expr = try parseExpr(allocator, tokens, idx);
+        if (idx.* >= tokens.len or !std.mem.eql(u8, tokens[idx.*].text, ")")) {
+            return SqlError.InvalidExpression;
+        }
+        idx.* += 1;
+        return expr;
+    }
+
+    // Try to parse as a value literal
+    if (token_text[0] == '"' or token_text[0] == '\'' or
+        std.ascii.isDigit(token_text[0]) or token_text[0] == '-' or
+        eqlIgnoreCase(token_text, "true") or eqlIgnoreCase(token_text, "false") or
+        eqlIgnoreCase(token_text, "NULL")) {
+        const value = try parseValue(allocator, token_text);
+        idx.* += 1;
+        return Expr{ .literal = value };
+    }
+
+    // Otherwise, it's a column reference
+    const col_name = try allocator.dupe(u8, token_text);
+    idx.* += 1;
+    return Expr{ .column = col_name };
+}
+
+/// Evaluate an expression against a row's values
+pub fn evaluateExpr(expr: Expr, row_values: anytype) bool {
+    switch (expr) {
+        .literal => |val| {
+            // A standalone literal is truthy if not null/false
+            return switch (val) {
+                .null_value => false,
+                .bool => |b| b,
+                .int => |i| i != 0,
+                .float => |f| f != 0.0,
+                .text => |t| t.len > 0,
+                .embedding => true,
+            };
+        },
+        .column => {
+            // A column reference is truthy if it exists and is truthy
+            var it = row_values.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, expr.column)) {
+                    return switch (entry.value_ptr.*) {
+                        .null_value => false,
+                        .bool => |b| b,
+                        .int => |i| i != 0,
+                        .float => |f| f != 0.0,
+                        .text => |t| t.len > 0,
+                        .embedding => true,
+                    };
+                }
+            }
+            return false; // Column not found
+        },
+        .binary => |bin| {
+            return evaluateBinaryExpr(bin.*, row_values);
+        },
+        .unary => |un| {
+            return evaluateUnaryExpr(un.*, row_values);
+        },
+    }
+}
+
+fn evaluateBinaryExpr(expr: BinaryExpr, row_values: anytype) bool {
+    switch (expr.op) {
+        .and_op => {
+            return evaluateExpr(expr.left, row_values) and evaluateExpr(expr.right, row_values);
+        },
+        .or_op => {
+            return evaluateExpr(expr.left, row_values) or evaluateExpr(expr.right, row_values);
+        },
+        .eq, .neq, .lt, .gt, .lte, .gte => {
+            const left_val = getExprValue(expr.left, row_values);
+            const right_val = getExprValue(expr.right, row_values);
+            return compareValues(left_val, right_val, expr.op);
+        },
+    }
+}
+
+fn evaluateUnaryExpr(expr: UnaryExpr, row_values: anytype) bool {
+    switch (expr.op) {
+        .not => {
+            return !evaluateExpr(expr.expr, row_values);
+        },
+        .is_null => {
+            const val = getExprValue(expr.expr, row_values);
+            return val == .null_value;
+        },
+        .is_not_null => {
+            const val = getExprValue(expr.expr, row_values);
+            return val != .null_value;
+        },
+    }
+}
+
+fn getExprValue(expr: Expr, row_values: anytype) ColumnValue {
+    switch (expr) {
+        .literal => |val| return val,
+        .column => |col| {
+            var it = row_values.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, col)) {
+                    return entry.value_ptr.*;
+                }
+            }
+            return ColumnValue.null_value;
+        },
+        .binary, .unary => {
+            // For complex expressions in comparison context, treat as bool
+            const result = evaluateExpr(expr, row_values);
+            return ColumnValue{ .bool = result };
+        },
+    }
+}
+
+fn compareValues(left: ColumnValue, right: ColumnValue, op: BinaryOp) bool {
+    // Handle NULL comparisons
+    if (left == .null_value or right == .null_value) {
+        return switch (op) {
+            .eq => left == .null_value and right == .null_value,
+            .neq => !(left == .null_value and right == .null_value),
+            else => false,
+        };
+    }
+
+    // Type-specific comparisons
+    switch (left) {
+        .int => |l| {
+            const r = switch (right) {
+                .int => |i| i,
+                .float => |f| @as(i64, @intFromFloat(f)),
+                else => return false,
+            };
+            return switch (op) {
+                .eq => l == r,
+                .neq => l != r,
+                .lt => l < r,
+                .gt => l > r,
+                .lte => l <= r,
+                .gte => l >= r,
+                else => false,
+            };
+        },
+        .float => |l| {
+            const r = switch (right) {
+                .float => |f| f,
+                .int => |i| @as(f64, @floatFromInt(i)),
+                else => return false,
+            };
+            return switch (op) {
+                .eq => l == r,
+                .neq => l != r,
+                .lt => l < r,
+                .gt => l > r,
+                .lte => l <= r,
+                .gte => l >= r,
+                else => false,
+            };
+        },
+        .text => |l| {
+            if (right != .text) return false;
+            const cmp = std.mem.order(u8, l, right.text);
+            return switch (op) {
+                .eq => cmp == .eq,
+                .neq => cmp != .eq,
+                .lt => cmp == .lt,
+                .gt => cmp == .gt,
+                .lte => cmp == .lt or cmp == .eq,
+                .gte => cmp == .gt or cmp == .eq,
+                else => false,
+            };
+        },
+        .bool => |l| {
+            if (right != .bool) return false;
+            return switch (op) {
+                .eq => l == right.bool,
+                .neq => l != right.bool,
+                else => false,
+            };
+        },
+        .embedding, .null_value => return false,
+    }
+}
+
+/// Parse UPDATE statement
+fn parseUpdate(allocator: Allocator, tokens: []const Token) !UpdateCmd {
+    // UPDATE table SET col1 = val1, col2 = val2 WHERE expr
+    if (tokens.len < 6) return SqlError.InvalidSyntax; // UPDATE table SET col = val
+
+    const table_name = try allocator.dupe(u8, tokens[1].text);
+    errdefer allocator.free(table_name);
+
+    var i: usize = 2;
+    if (!eqlIgnoreCase(tokens[i].text, "SET")) {
+        allocator.free(table_name);
+        return SqlError.InvalidSyntax;
+    }
+    i += 1;
+
+    // Parse SET assignments
+    var assignments = ArrayList(Assignment).init(allocator);
+    errdefer {
+        for (assignments.items) |*assign| {
+            assign.deinit(allocator);
+        }
+        assignments.deinit();
+    }
+
+    while (i < tokens.len) {
+        if (eqlIgnoreCase(tokens[i].text, "WHERE")) break;
+
+        // Skip commas
+        if (std.mem.eql(u8, tokens[i].text, ",")) {
+            i += 1;
+            continue;
+        }
+
+        // Parse: column = value
+        if (i + 2 >= tokens.len) {
+            allocator.free(table_name);
+            return SqlError.InvalidSyntax;
+        }
+
+        const col_name = try allocator.dupe(u8, tokens[i].text);
+        errdefer allocator.free(col_name);
+        i += 1;
+
+        if (!std.mem.eql(u8, tokens[i].text, "=")) {
+            allocator.free(col_name);
+            allocator.free(table_name);
+            return SqlError.InvalidSyntax;
+        }
+        i += 1;
+
+        const value = try parseValue(allocator, tokens[i].text);
+        errdefer {
+            var v = value;
+            v.deinit(allocator);
+        }
+        i += 1;
+
+        try assignments.append(Assignment{
+            .column = col_name,
+            .value = value,
+        });
+    }
+
+    if (assignments.items.len == 0) {
+        allocator.free(table_name);
+        return SqlError.InvalidSyntax;
+    }
+
+    // Parse optional WHERE clause
+    var where_expr: ?Expr = null;
+    if (i < tokens.len and eqlIgnoreCase(tokens[i].text, "WHERE")) {
+        i += 1;
+        where_expr = try parseExpr(allocator, tokens, &i);
+    }
+
+    return UpdateCmd{
+        .table_name = table_name,
+        .assignments = assignments,
+        .where_expr = where_expr,
     };
 }

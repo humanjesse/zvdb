@@ -434,6 +434,75 @@ pub fn HNSW(comptime T: type) type {
             }
         }
 
+        /// Remove a node from the HNSW graph
+        pub fn removeNode(self: *Self, external_id: u64) !void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            // Get internal ID
+            const internal_id = self.external_to_internal.get(external_id) orelse return error.NodeNotFound;
+            var node = self.nodes.getPtr(internal_id) orelse return error.NodeNotFound;
+
+            // Remove from type and file_path indices if metadata exists
+            if (node.metadata) |meta| {
+                try self.removeFromTypeIndex(meta.node_type, external_id);
+                if (meta.content_ref) |file_path| {
+                    try self.removeFromFilePathIndex(file_path, external_id);
+                }
+            }
+
+            // Remove all connections from other nodes to this node
+            var nodes_it = self.nodes.iterator();
+            while (nodes_it.next()) |entry| {
+                if (entry.key_ptr.* == internal_id) continue; // Skip the node being removed
+
+                var other_node = entry.value_ptr;
+                other_node.mutex.lock();
+                defer other_node.mutex.unlock();
+
+                for (other_node.connections) |*conn_list| {
+                    var i: usize = 0;
+                    while (i < conn_list.items.len) {
+                        if (conn_list.items[i] == internal_id) {
+                            _ = conn_list.swapRemove(i);
+                            // Don't increment i, as swapRemove shifts elements
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+            }
+
+            // If this node was the entry point, find a new one
+            if (self.entry_point) |ep| {
+                if (ep == internal_id) {
+                    // Find the node with the highest level as new entry point
+                    self.entry_point = null;
+                    self.max_level = 0;
+
+                    var new_ep_it = self.nodes.iterator();
+                    while (new_ep_it.next()) |entry| {
+                        if (entry.key_ptr.* == internal_id) continue; // Skip the node being removed
+                        const node_level = entry.value_ptr.connections.len - 1;
+                        if (self.entry_point == null or node_level > self.max_level) {
+                            self.entry_point = entry.key_ptr.*;
+                            self.max_level = node_level;
+                        }
+                    }
+                }
+            }
+
+            // Remove the node itself
+            var removed_node = self.nodes.fetchRemove(internal_id);
+            if (removed_node) |*kv| {
+                kv.value.deinit(self.allocator);
+            }
+
+            // Remove ID mappings
+            _ = self.external_to_internal.remove(external_id);
+            _ = self.internal_to_external.remove(internal_id);
+        }
+
         /// Get all node IDs of a specific type
         pub fn getNodesByType(self: *Self, node_type: []const u8) ![]const u64 {
             self.mutex.lock();

@@ -139,6 +139,7 @@ pub const Database = struct {
             .insert => |insert| try self.executeInsert(insert),
             .select => |select| try self.executeSelect(select),
             .delete => |delete| try self.executeDelete(delete),
+            .update => |update| try self.executeUpdate(update),
         };
     }
 
@@ -360,6 +361,125 @@ pub const Database = struct {
         try result.addColumn("deleted");
         var row = ArrayList(ColumnValue).init(self.allocator);
         try row.append(ColumnValue{ .int = @intCast(deleted_count) });
+        try result.addRow(row);
+
+        return result;
+    }
+
+    fn executeUpdate(self: *Database, cmd: sql.UpdateCmd) !QueryResult {
+        const table = self.tables.get(cmd.table_name) orelse return sql.SqlError.TableNotFound;
+
+        // Validate all SET columns exist in table
+        for (cmd.assignments.items) |assignment| {
+            var found = false;
+            for (table.columns.items) |col| {
+                if (std.mem.eql(u8, col.name, assignment.column)) {
+                    found = true;
+                    // Validate embedding dimension if it's an embedding column
+                    if (col.col_type == .embedding and assignment.value == .embedding) {
+                        const expected_dim: usize = 768; // TODO: Make this configurable
+                        if (assignment.value.embedding.len != expected_dim) {
+                            return sql.SqlError.DimensionMismatch;
+                        }
+                    }
+                    break;
+                }
+            }
+            if (!found) {
+                return sql.SqlError.ColumnNotFound;
+            }
+        }
+
+        var updated_count: usize = 0;
+        const row_ids = try table.getAllRows(self.allocator);
+        defer self.allocator.free(row_ids);
+
+        for (row_ids) |row_id| {
+            var row = table.get(row_id) orelse continue;
+
+            // Apply WHERE filter using expression evaluator
+            var should_update = true;
+            if (cmd.where_expr) |expr| {
+                should_update = sql.evaluateExpr(expr, row.values);
+            }
+
+            if (!should_update) continue;
+
+            // Track if embedding column is being updated
+            var old_embedding: ?[]const f32 = null;
+            var new_embedding: ?[]const f32 = null;
+            var embedding_changed = false;
+
+            // Find old embedding if it exists
+            if (self.hnsw != null) {
+                var it = row.values.iterator();
+                while (it.next()) |entry| {
+                    if (entry.value_ptr.* == .embedding) {
+                        old_embedding = entry.value_ptr.embedding;
+                        break;
+                    }
+                }
+            }
+
+            // Apply all SET assignments
+            for (cmd.assignments.items) |assignment| {
+                // Check if this is updating an embedding column
+                if (assignment.value == .embedding) {
+                    new_embedding = assignment.value.embedding;
+                    // Check if embedding actually changed
+                    if (old_embedding) |old_emb| {
+                        if (old_emb.len == new_embedding.?.len) {
+                            var changed = false;
+                            for (old_emb, 0..) |val, i| {
+                                if (val != new_embedding.?[i]) {
+                                    changed = true;
+                                    break;
+                                }
+                            }
+                            embedding_changed = changed;
+                        } else {
+                            embedding_changed = true;
+                        }
+                    } else {
+                        embedding_changed = true;
+                    }
+                }
+
+                // Update the row
+                try row.set(self.allocator, assignment.column, assignment.value);
+            }
+
+            // Handle HNSW index updates if embedding changed
+            if (embedding_changed and self.hnsw != null) {
+                const h = self.hnsw.?;
+
+                // Remove old vector from HNSW (if it existed)
+                if (old_embedding != null) {
+                    h.removeNode(row_id) catch |err| {
+                        // Rollback: This is a critical error, we should revert changes
+                        // For now, we'll just log the error
+                        std.debug.print("Error removing node from HNSW: {}\n", .{err});
+                        return err;
+                    };
+                }
+
+                // Insert new vector with same row_id
+                if (new_embedding) |new_emb| {
+                    _ = h.insert(new_emb, row_id) catch |err| {
+                        // Critical error: we've already removed the old vector
+                        std.debug.print("Error inserting new vector to HNSW: {}\n", .{err});
+                        return err;
+                    };
+                }
+            }
+
+            updated_count += 1;
+        }
+
+        var result = QueryResult.init(self.allocator);
+        try result.addColumn("updated");
+        var row = ArrayList(ColumnValue).init(self.allocator);
+        try row.append(ColumnValue{ .int = @intCast(updated_count) });
         try result.addRow(row);
 
         return result;
