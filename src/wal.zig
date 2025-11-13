@@ -1,6 +1,5 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const ArrayList = std.array_list.Managed;
 
 /// Write-Ahead Log (WAL) implementation for zvdb
 ///
@@ -55,8 +54,8 @@ pub const WalRecordType = enum(u8) {
 // WAL File Header
 // ============================================================================
 
-/// WAL file header (32 bytes fixed size)
-pub const WalHeader = packed struct {
+/// WAL file header (36 bytes fixed size)
+pub const WalHeader = struct {
     /// Magic number: 0x5741_4C00 ("WAL\0" in ASCII)
     magic: u32,
 
@@ -77,7 +76,7 @@ pub const WalHeader = packed struct {
 
     pub const MAGIC: u32 = 0x5741_4C00; // "WAL\0"
     pub const VERSION: u32 = 1;
-    pub const SIZE: usize = 32;
+    pub const SIZE: usize = 36;
 
     pub fn init(sequence: u64, page_size: u32) WalHeader {
         return WalHeader{
@@ -107,7 +106,7 @@ pub const WalHeader = packed struct {
         std.mem.writeInt(u32, buffer[8..12], self.page_size, .little);
         std.mem.writeInt(u64, buffer[12..20], self.sequence, .little);
         std.mem.writeInt(i64, buffer[20..28], self.created_at, .little);
-        @memcpy(buffer[28..32], &self.reserved);
+        @memcpy(buffer[28..36], &self.reserved);
     }
 
     /// Deserialize header from bytes (little-endian)
@@ -118,7 +117,7 @@ pub const WalHeader = packed struct {
             .page_size = std.mem.readInt(u32, buffer[8..12], .little),
             .sequence = std.mem.readInt(u64, buffer[12..20], .little),
             .created_at = std.mem.readInt(i64, buffer[20..28], .little),
-            .reserved = buffer[28..32].*,
+            .reserved = buffer[28..36].*,
         };
     }
 };
@@ -282,8 +281,6 @@ pub const WalRecord = struct {
         // Verify checksum matches
         const calculated_checksum = std.hash.Crc32.hash(buffer[0 .. offset - 4]);
         if (stored_checksum != calculated_checksum) {
-            allocator.free(table_name);
-            allocator.free(data);
             return error.ChecksumMismatch;
         }
 
