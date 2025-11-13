@@ -137,10 +137,10 @@ pub const Row = struct {
         errdefer allocator.free(owned_key);
         @memcpy(owned_key, column);
 
-        const owned_value = try value.clone(allocator);
+        var owned_value = try value.clone(allocator);
         errdefer owned_value.deinit(allocator);
 
-        var result = try self.values.getOrPut(column);
+        const result = try self.values.getOrPut(column);
         if (result.found_existing) {
             // Free old key and value
             allocator.free(result.key_ptr.*);

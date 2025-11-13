@@ -441,7 +441,7 @@ pub fn HNSW(comptime T: type) type {
 
             // Get internal ID
             const internal_id = self.external_to_internal.get(external_id) orelse return error.NodeNotFound;
-            var node = self.nodes.getPtr(internal_id) orelse return error.NodeNotFound;
+            const node = self.nodes.getPtr(internal_id) orelse return error.NodeNotFound;
 
             // Remove from type and file_path indices if metadata exists
             if (node.metadata) |meta| {

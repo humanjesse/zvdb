@@ -20,6 +20,8 @@ pub const SqlError = error{
     DimensionMismatch,
     InvalidExpression,
     TypeMismatch,
+    InvalidCharacter,
+    Overflow,
 };
 
 /// SQL command types
@@ -674,7 +676,7 @@ fn parseAndExpr(allocator: Allocator, tokens: []const Token, idx: *usize) (Alloc
 
 /// Parse comparison expressions (=, !=, <, >, <=, >=)
 fn parseComparisonExpr(allocator: Allocator, tokens: []const Token, idx: *usize) (Allocator.Error || SqlError)!Expr {
-    var left = try parseUnaryExpr(allocator, tokens, idx);
+    const left = try parseUnaryExpr(allocator, tokens, idx);
 
     if (idx.* < tokens.len) {
         const op_text = tokens[idx.*].text;
@@ -726,7 +728,7 @@ fn parseUnaryExpr(allocator: Allocator, tokens: []const Token, idx: *usize) (All
         return Expr{ .unary = unary };
     }
 
-    var expr = try parsePrimaryExpr(allocator, tokens, idx);
+    const expr = try parsePrimaryExpr(allocator, tokens, idx);
 
     // IS NULL / IS NOT NULL
     if (idx.* < tokens.len and eqlIgnoreCase(tokens[idx.*].text, "IS")) {
