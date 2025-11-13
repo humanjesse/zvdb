@@ -219,11 +219,202 @@ pub const Database = struct {
     /// std.debug.print("Recovered {} transactions\n", .{recovered});
     /// ```
     pub fn recoverFromWal(self: *Database, wal_dir: []const u8) !usize {
-        _ = self;
-        _ = wal_dir;
-        // TODO Phase 2.4: Implement WAL recovery
-        // See documentation above for implementation plan
-        return error.NotImplemented;
+        // Phase 2.4: WAL Recovery Implementation
+
+        // Step 1: Find all WAL files in the directory
+        var wal_files = std.ArrayList([]const u8).init(self.allocator);
+        defer {
+            for (wal_files.items) |file| {
+                self.allocator.free(file);
+            }
+            wal_files.deinit();
+        }
+
+        // Open the WAL directory
+        var dir = std.fs.cwd().openDir(wal_dir, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => {
+                // No WAL directory = no recovery needed
+                return 0;
+            },
+            else => return err,
+        };
+        defer dir.close();
+
+        // Iterate through the directory to find all wal.* files
+        var dir_it = dir.iterate();
+        while (try dir_it.next()) |entry| {
+            if (entry.kind != .file) continue;
+
+            // Check if filename matches "wal.NNNNNN" pattern
+            if (std.mem.startsWith(u8, entry.name, "wal.")) {
+                const full_path = try std.fmt.allocPrint(
+                    self.allocator,
+                    "{s}/{s}",
+                    .{ wal_dir, entry.name },
+                );
+                try wal_files.append(full_path);
+            }
+        }
+
+        if (wal_files.items.len == 0) {
+            // No WAL files found
+            return 0;
+        }
+
+        // Sort WAL files by sequence number (filename order)
+        std.mem.sort([]const u8, wal_files.items, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.lessThan);
+
+        // Step 2: Track transactions to determine which are committed
+        // Map: tx_id -> transaction state
+        var transactions = std.AutoHashMap(u64, TransactionState).init(self.allocator);
+        defer transactions.deinit();
+
+        // Step 3: First pass - scan all records to identify committed transactions
+        for (wal_files.items) |wal_file| {
+            var reader = WalReader.init(self.allocator, wal_file) catch |err| {
+                std.debug.print("Warning: Failed to open WAL file {s}: {}\n", .{ wal_file, err });
+                continue;
+            };
+            defer reader.deinit();
+
+            while (try reader.readRecord()) |record_opt| {
+                var record = record_opt;
+                defer record.deinit(self.allocator);
+
+                switch (record.record_type) {
+                    .begin_tx => {
+                        try transactions.put(record.tx_id, .active);
+                    },
+                    .commit_tx => {
+                        try transactions.put(record.tx_id, .committed);
+                    },
+                    .rollback_tx => {
+                        try transactions.put(record.tx_id, .aborted);
+                    },
+                    else => {}, // Data operations don't change transaction state
+                }
+            }
+        }
+
+        // Step 4: Second pass - replay committed transactions
+        var recovered_count: usize = 0;
+        var applied_operations: usize = 0;
+
+        for (wal_files.items) |wal_file| {
+            var reader = WalReader.init(self.allocator, wal_file) catch |err| {
+                std.debug.print("Warning: Failed to open WAL file {s}: {}\n", .{ wal_file, err });
+                continue;
+            };
+            defer reader.deinit();
+
+            while (try reader.readRecord()) |record_opt| {
+                var record = record_opt;
+                defer record.deinit(self.allocator);
+
+                // Only process records from committed transactions
+                const tx_state = transactions.get(record.tx_id) orelse .active;
+                if (tx_state != .committed) {
+                    continue; // Skip records from uncommitted/aborted transactions
+                }
+
+                switch (record.record_type) {
+                    .insert_row => {
+                        try self.replayInsert(&record);
+                        applied_operations += 1;
+                    },
+                    .delete_row => {
+                        try self.replayDelete(&record);
+                        applied_operations += 1;
+                    },
+                    .update_row => {
+                        try self.replayUpdate(&record);
+                        applied_operations += 1;
+                    },
+                    .commit_tx => {
+                        recovered_count += 1;
+                    },
+                    else => {}, // begin_tx, rollback_tx, checkpoint - no action needed
+                }
+            }
+        }
+
+        std.debug.print("WAL Recovery complete: {} transactions, {} operations applied\n",
+                       .{ recovered_count, applied_operations });
+
+        return recovered_count;
+    }
+
+    // Transaction state for recovery
+    const TransactionState = enum {
+        active,     // Transaction started but not committed/aborted
+        committed,  // Transaction committed
+        aborted,    // Transaction rolled back
+    };
+
+    /// Replay an INSERT operation from WAL
+    fn replayInsert(self: *Database, record: *const WalRecord) !void {
+        // Get or create the table
+        const table = self.tables.get(record.table_name) orelse {
+            std.debug.print("Warning: Table '{}' not found during recovery, skipping INSERT\n",
+                           .{std.zig.fmtEscapes(record.table_name)});
+            return;
+        };
+
+        // Deserialize the row data
+        const row = try Table.Row.deserialize(record.data, self.allocator);
+
+        // Check if row already exists (idempotency - may have been partially recovered)
+        if (table.rows.contains(row.id)) {
+            // Row already exists, skip (recovery is idempotent)
+            var temp_row = row;
+            temp_row.deinit(self.allocator);
+            return;
+        }
+
+        // Insert the row into the table
+        try table.rows.put(row.id, row);
+    }
+
+    /// Replay a DELETE operation from WAL
+    fn replayDelete(self: *Database, record: *const WalRecord) !void {
+        // Get the table
+        const table = self.tables.get(record.table_name) orelse {
+            std.debug.print("Warning: Table '{}' not found during recovery, skipping DELETE\n",
+                           .{std.zig.fmtEscapes(record.table_name)});
+            return;
+        };
+
+        // Remove the row if it exists (idempotent)
+        if (table.rows.fetchRemove(record.row_id)) |entry| {
+            var row = entry.value;
+            row.deinit(self.allocator);
+        }
+    }
+
+    /// Replay an UPDATE operation from WAL
+    fn replayUpdate(self: *Database, record: *const WalRecord) !void {
+        // Get the table
+        const table = self.tables.get(record.table_name) orelse {
+            std.debug.print("Warning: Table '{}' not found during recovery, skipping UPDATE\n",
+                           .{std.zig.fmtEscapes(record.table_name)});
+            return;
+        };
+
+        // Deserialize the updated row data
+        const updated_row = try Table.Row.deserialize(record.data, self.allocator);
+
+        // Remove old row if it exists
+        if (table.rows.fetchRemove(record.row_id)) |entry| {
+            var old_row = entry.value;
+            old_row.deinit(self.allocator);
+        }
+
+        // Insert the updated row
+        try table.rows.put(updated_row.id, updated_row);
     }
 
     /// Rebuild HNSW vector index from table data (Phase 2.4)
@@ -252,10 +443,59 @@ pub const Database = struct {
     ///                 .{recovered_tx, vectors_indexed});
     /// ```
     pub fn rebuildHnswFromTables(self: *Database) !usize {
-        _ = self;
-        // TODO Phase 2.4: Implement HNSW index rebuild
-        // See documentation above for implementation plan
-        return error.NotImplemented;
+        // Phase 2.4: HNSW Index Rebuild Implementation
+
+        // Step 1: If HNSW is not enabled, skip
+        const h = self.hnsw orelse {
+            std.debug.print("HNSW not enabled, skipping index rebuild\n", .{});
+            return 0;
+        };
+
+        var vectors_indexed: usize = 0;
+
+        // Step 2: Scan all tables in the database
+        var table_it = self.tables.iterator();
+        while (table_it.next()) |table_entry| {
+            const table_name = table_entry.key_ptr.*;
+            const table = table_entry.value_ptr.*;
+
+            // Step 3: Scan all rows in this table
+            var row_it = table.rows.iterator();
+            while (row_it.next()) |row_entry| {
+                const row_id = row_entry.key_ptr.*;
+                const row = row_entry.value_ptr.*;
+
+                // Step 4: Find embedding columns in this row
+                var value_it = row.values.iterator();
+                while (value_it.next()) |value_entry| {
+                    const col_name = value_entry.key_ptr.*;
+                    const value = value_entry.value_ptr.*;
+
+                    // Step 5: If this is an embedding column, insert into HNSW
+                    if (value.* == .embedding) {
+                        const embedding = value.embedding;
+
+                        // Insert into HNSW with row_id as external_id
+                        _ = try h.insert(embedding, row_id);
+                        vectors_indexed += 1;
+
+                        if (vectors_indexed % 1000 == 0) {
+                            std.debug.print("HNSW rebuild progress: {} vectors indexed from table '{}'\n",
+                                           .{ vectors_indexed, std.zig.fmtEscapes(table_name) });
+                        }
+
+                        // Only process first embedding column per row
+                        // (current limitation: one embedding per row)
+                        break;
+                    }
+
+                    _ = col_name; // Unused but kept for clarity
+                }
+            }
+        }
+
+        std.debug.print("HNSW rebuild complete: {} vectors indexed\n", .{vectors_indexed});
+        return vectors_indexed;
     }
 
     /// Execute a SQL command

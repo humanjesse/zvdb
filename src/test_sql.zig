@@ -1278,3 +1278,429 @@ test "WAL: Multiple embedding insertions with WAL" {
         try testing.expect(internal_id != null);
     }
 }
+
+// ============================================================================
+// Phase 2.4: Crash Recovery Tests
+// ============================================================================
+
+test "WAL Recovery: Basic recovery of committed transaction" {
+    const wal_dir = "test_data/wal_recovery_basic";
+
+    // Clean up any existing test data
+    std.fs.cwd().deleteTree(wal_dir) catch {};
+    defer std.fs.cwd().deleteTree(wal_dir) catch {};
+
+    // Phase 1: Create database, insert data, "crash" before closing properly
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.enableWal(wal_dir);
+
+        // Create table
+        var create_result = try db.execute("CREATE TABLE users (id int, name text, age int)");
+        defer create_result.deinit();
+
+        // Insert data (this writes to WAL)
+        var insert1 = try db.execute("INSERT INTO users VALUES (1, \"Alice\", 25)");
+        defer insert1.deinit();
+
+        var insert2 = try db.execute("INSERT INTO users VALUES (2, \"Bob\", 30)");
+        defer insert2.deinit();
+
+        // Verify data was inserted
+        const table = db.tables.get("users").?;
+        try testing.expectEqual(@as(usize, 2), table.count());
+
+        // Simulate crash: DON'T call db.deinit() properly - just let WAL close
+        // The WAL has the data, but we'll pretend the database "crashed"
+    }
+
+    // Phase 2: Restart database and recover from WAL
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.enableWal(wal_dir);
+
+        // First create the table again (schema is not in WAL yet in Phase 2.4)
+        var create_result = try db.execute("CREATE TABLE users (id int, name text, age int)");
+        defer create_result.deinit();
+
+        // Recover from WAL
+        const recovered_count = try db.recoverFromWal(wal_dir);
+        try testing.expectEqual(@as(usize, 2), recovered_count);
+
+        // Verify data was recovered
+        const table = db.tables.get("users").?;
+        try testing.expectEqual(@as(usize, 2), table.count());
+
+        // Verify the actual data
+        var select = try db.execute("SELECT * FROM users");
+        defer select.deinit();
+        try testing.expectEqual(@as(usize, 2), select.rows.items.len);
+    }
+}
+
+test "WAL Recovery: Uncommitted transaction is discarded" {
+    const wal_dir = "test_data/wal_recovery_uncommitted";
+
+    std.fs.cwd().deleteTree(wal_dir) catch {};
+    defer std.fs.cwd().deleteTree(wal_dir) catch {};
+
+    // Phase 1: Write some committed data and some uncommitted data
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.enableWal(wal_dir);
+
+        var create = try db.execute("CREATE TABLE test (id int, value text)");
+        defer create.deinit();
+
+        // Insert committed data
+        var insert1 = try db.execute("INSERT INTO test VALUES (1, \"committed\")");
+        defer insert1.deinit();
+
+        // Manually write an uncommitted transaction to WAL
+        // (In real scenario, this would be a transaction without COMMIT before crash)
+        // For testing, we'll write records with tx_id but no commit record
+        if (db.wal) |w| {
+            // Simulate an uncommitted transaction
+            const uncommitted_tx_id: u64 = 999;
+
+            // Write a record without commit
+            _ = try w.writeRecord(.{
+                .record_type = .insert_row,
+                .tx_id = uncommitted_tx_id,
+                .lsn = 0,
+                .row_id = 2,
+                .table_name = "test",
+                .data = "", // Would normally be serialized row
+                .checksum = 0,
+            });
+
+            try w.flush();
+        }
+    }
+
+    // Phase 2: Recover - uncommitted transaction should be discarded
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.enableWal(wal_dir);
+
+        var create = try db.execute("CREATE TABLE test (id int, value text)");
+        defer create.deinit();
+
+        const recovered_count = try db.recoverFromWal(wal_dir);
+        // Should only recover the 1 committed transaction
+        try testing.expectEqual(@as(usize, 1), recovered_count);
+
+        const table = db.tables.get("test").?;
+        try testing.expectEqual(@as(usize, 1), table.count());
+    }
+}
+
+test "WAL Recovery: Multiple committed transactions" {
+    const wal_dir = "test_data/wal_recovery_multiple";
+
+    std.fs.cwd().deleteTree(wal_dir) catch {};
+    defer std.fs.cwd().deleteTree(wal_dir) catch {};
+
+    // Phase 1: Write multiple transactions
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.enableWal(wal_dir);
+
+        var create = try db.execute("CREATE TABLE items (id int, name text)");
+        defer create.deinit();
+
+        // Insert multiple items
+        var i: usize = 1;
+        while (i <= 10) : (i += 1) {
+            var buf: [100]u8 = undefined;
+            const query = try std.fmt.bufPrint(&buf, "INSERT INTO items VALUES ({d}, \"item_{d}\")", .{ i, i });
+            var result = try db.execute(query);
+            defer result.deinit();
+        }
+
+        const table = db.tables.get("items").?;
+        try testing.expectEqual(@as(usize, 10), table.count());
+    }
+
+    // Phase 2: Recover all transactions
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.enableWal(wal_dir);
+
+        var create = try db.execute("CREATE TABLE items (id int, name text)");
+        defer create.deinit();
+
+        const recovered_count = try db.recoverFromWal(wal_dir);
+        try testing.expectEqual(@as(usize, 10), recovered_count);
+
+        const table = db.tables.get("items").?;
+        try testing.expectEqual(@as(usize, 10), table.count());
+
+        // Verify all items recovered
+        var select = try db.execute("SELECT * FROM items");
+        defer select.deinit();
+        try testing.expectEqual(@as(usize, 10), select.rows.items.len);
+    }
+}
+
+test "WAL Recovery: DELETE operations" {
+    const wal_dir = "test_data/wal_recovery_delete";
+
+    std.fs.cwd().deleteTree(wal_dir) catch {};
+    defer std.fs.cwd().deleteTree(wal_dir) catch {};
+
+    // Phase 1: Insert then delete
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.enableWal(wal_dir);
+
+        var create = try db.execute("CREATE TABLE records (id int, status text)");
+        defer create.deinit();
+
+        // Insert 3 records
+        var insert1 = try db.execute("INSERT INTO records VALUES (1, \"active\")");
+        defer insert1.deinit();
+
+        var insert2 = try db.execute("INSERT INTO records VALUES (2, \"active\")");
+        defer insert2.deinit();
+
+        var insert3 = try db.execute("INSERT INTO records VALUES (3, \"active\")");
+        defer insert3.deinit();
+
+        // Delete one record
+        var delete = try db.execute("DELETE FROM records WHERE id = 2");
+        defer delete.deinit();
+
+        const table = db.tables.get("records").?;
+        try testing.expectEqual(@as(usize, 2), table.count());
+    }
+
+    // Phase 2: Recover
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.enableWal(wal_dir);
+
+        var create = try db.execute("CREATE TABLE records (id int, status text)");
+        defer create.deinit();
+
+        _ = try db.recoverFromWal(wal_dir);
+
+        const table = db.tables.get("records").?;
+        try testing.expectEqual(@as(usize, 2), table.count());
+
+        // Verify record 2 was deleted
+        try testing.expect(table.get(2) == null);
+        try testing.expect(table.get(1) != null);
+        try testing.expect(table.get(3) != null);
+    }
+}
+
+test "WAL Recovery: UPDATE operations" {
+    const wal_dir = "test_data/wal_recovery_update";
+
+    std.fs.cwd().deleteTree(wal_dir) catch {};
+    defer std.fs.cwd().deleteTree(wal_dir) catch {};
+
+    // Phase 1: Insert then update
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.enableWal(wal_dir);
+
+        var create = try db.execute("CREATE TABLE products (id int, name text, price int)");
+        defer create.deinit();
+
+        var insert = try db.execute("INSERT INTO products VALUES (1, \"Widget\", 100)");
+        defer insert.deinit();
+
+        var update = try db.execute("UPDATE products SET price = 150 WHERE id = 1");
+        defer update.deinit();
+    }
+
+    // Phase 2: Recover and verify update
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.enableWal(wal_dir);
+
+        var create = try db.execute("CREATE TABLE products (id int, name text, price int)");
+        defer create.deinit();
+
+        _ = try db.recoverFromWal(wal_dir);
+
+        var select = try db.execute("SELECT * FROM products WHERE id = 1");
+        defer select.deinit();
+
+        try testing.expectEqual(@as(usize, 1), select.rows.items.len);
+
+        // Verify price was updated to 150
+        const price_col = select.rows.items[0].items[2];
+        try testing.expectEqual(@as(i64, 150), price_col.int);
+    }
+}
+
+test "WAL Recovery: Idempotent recovery (running twice)" {
+    const wal_dir = "test_data/wal_recovery_idempotent";
+
+    std.fs.cwd().deleteTree(wal_dir) catch {};
+    defer std.fs.cwd().deleteTree(wal_dir) catch {};
+
+    // Phase 1: Create data
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.enableWal(wal_dir);
+
+        var create = try db.execute("CREATE TABLE data (id int, value int)");
+        defer create.deinit();
+
+        var insert1 = try db.execute("INSERT INTO data VALUES (1, 100)");
+        defer insert1.deinit();
+
+        var insert2 = try db.execute("INSERT INTO data VALUES (2, 200)");
+        defer insert2.deinit();
+    }
+
+    // Phase 2: Recover once
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.enableWal(wal_dir);
+
+        var create = try db.execute("CREATE TABLE data (id int, value int)");
+        defer create.deinit();
+
+        const recovered1 = try db.recoverFromWal(wal_dir);
+        try testing.expectEqual(@as(usize, 2), recovered1);
+
+        const table = db.tables.get("data").?;
+        try testing.expectEqual(@as(usize, 2), table.count());
+
+        // Recover again (should be idempotent - no duplicates)
+        const recovered2 = try db.recoverFromWal(wal_dir);
+        try testing.expectEqual(@as(usize, 2), recovered2);
+
+        // Should still have only 2 rows (no duplicates)
+        try testing.expectEqual(@as(usize, 2), table.count());
+    }
+}
+
+test "WAL Recovery: HNSW index rebuild after recovery" {
+    const wal_dir = "test_data/wal_recovery_hnsw";
+
+    std.fs.cwd().deleteTree(wal_dir) catch {};
+    defer std.fs.cwd().deleteTree(wal_dir) catch {};
+
+    // Phase 1: Create data with embeddings
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.initVectorSearch(16, 200);
+        try db.enableWal(wal_dir);
+
+        var create = try db.execute("CREATE TABLE docs (id int, title text, vec embedding)");
+        defer create.deinit();
+
+        const table = db.tables.get("docs").?;
+
+        // Insert rows with embeddings
+        var i: usize = 1;
+        while (i <= 3) : (i += 1) {
+            var buf: [100]u8 = undefined;
+            const query = try std.fmt.bufPrint(&buf, "INSERT INTO docs VALUES ({d}, \"doc_{d}\", NULL)", .{ i, i });
+            var result = try db.execute(query);
+            defer result.deinit();
+
+            // Add embedding manually
+            var embedding = [_]f32{@as(f32, @floatFromInt(i)) * 0.1} ** 128;
+            const row = table.get(i).?;
+            const emb = try testing.allocator.dupe(f32, &embedding);
+            defer testing.allocator.free(emb);
+            try row.set(testing.allocator, "vec", ColumnValue{ .embedding = emb });
+            _ = try db.hnsw.?.insert(&embedding, i);
+        }
+
+        try testing.expectEqual(@as(usize, 3), table.count());
+    }
+
+    // Phase 2: Recover and rebuild HNSW
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.initVectorSearch(16, 200);
+        try db.enableWal(wal_dir);
+
+        var create = try db.execute("CREATE TABLE docs (id int, title text, vec embedding)");
+        defer create.deinit();
+
+        // Recover from WAL
+        const recovered = try db.recoverFromWal(wal_dir);
+        try testing.expectEqual(@as(usize, 3), recovered);
+
+        // Rebuild HNSW index
+        const vectors_indexed = try db.rebuildHnswFromTables();
+        try testing.expectEqual(@as(usize, 3), vectors_indexed);
+
+        // Verify HNSW has all vectors
+        const table = db.tables.get("docs").?;
+        try testing.expectEqual(@as(usize, 3), table.count());
+
+        var row_it = table.rows.iterator();
+        while (row_it.next()) |entry| {
+            const row_id = entry.key_ptr.*;
+            const internal_id = db.hnsw.?.getInternalId(row_id);
+            try testing.expect(internal_id != null);
+        }
+    }
+}
+
+test "WAL Recovery: No WAL directory (fresh start)" {
+    const wal_dir = "test_data/wal_recovery_nodir";
+
+    // Ensure directory doesn't exist
+    std.fs.cwd().deleteTree(wal_dir) catch {};
+
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    // Recovery should return 0 (no recovery needed)
+    const recovered = try db.recoverFromWal(wal_dir);
+    try testing.expectEqual(@as(usize, 0), recovered);
+}
+
+test "WAL Recovery: Empty WAL directory" {
+    const wal_dir = "test_data/wal_recovery_empty";
+
+    std.fs.cwd().deleteTree(wal_dir) catch {};
+    try std.fs.cwd().makePath(wal_dir);
+    defer std.fs.cwd().deleteTree(wal_dir) catch {};
+
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    // Recovery should return 0 (no WAL files)
+    const recovered = try db.recoverFromWal(wal_dir);
+    try testing.expectEqual(@as(usize, 0), recovered);
+}
