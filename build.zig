@@ -29,8 +29,18 @@ pub fn build(b: *std.Build) void {
     });
     const run_hnsw_tests = b.addRunArtifact(hnsw_tests);
 
-    const hnsw_test_step = b.step("test", "Run tests");
-    hnsw_test_step.dependOn(&run_hnsw_tests.step);
+    const sql_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_sql.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_sql_tests = b.addRunArtifact(sql_tests);
+
+    const test_step = b.step("test", "Run all tests");
+    test_step.dependOn(&run_hnsw_tests.step);
+    test_step.dependOn(&run_sql_tests.step);
 
     // Add unit tests
     // const unit_tests = b.addTest(.{
@@ -96,14 +106,22 @@ pub fn build(b: *std.Build) void {
     run_multi_threaded_step.dependOn(&run_multi_threaded.step);
 
     // Examples
-    // const basic_example = b.addExecutable(.{
-    //     .name = "basic_usage",
-    //     .root_source_file = b.path("examples/basic_usage.zig"),
-    //     .target = target,
-    //     .optimize = optimize,
-    // });
-    // basic_example.root_module.addImport("zvdb", lib_module);
-    // b.installArtifact(basic_example);
+    const sql_demo = b.addExecutable(.{
+        .name = "sql_demo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/sql_demo.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zvdb", .module = lib_module },
+            },
+        }),
+    });
+    b.installArtifact(sql_demo);
+
+    const run_sql_demo = b.addRunArtifact(sql_demo);
+    const run_sql_demo_step = b.step("demo", "Run SQL demo");
+    run_sql_demo_step.dependOn(&run_sql_demo.step);
 
     // const advanced_example = b.addExecutable(.{
     //     .name = "advanced_usage",

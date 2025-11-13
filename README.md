@@ -20,6 +20,14 @@ A pure Zig vector database implementation using HNSW (Hierarchical Navigable Sma
 - **Type Filtering**: Search by node type for precise retrieval
 - **Metadata Attributes**: Flexible key-value storage (string, int, float, bool)
 
+### SQL Interface (NEW!)
+- **Familiar SQL Syntax**: Use standard SQL commands for text data
+- **Semantic Search**: `ORDER BY SIMILARITY TO "query"` for vector-powered queries
+- **Multiple Data Types**: int, float, text, bool, and embedding types
+- **CRUD Operations**: CREATE TABLE, INSERT, SELECT, DELETE
+- **Fun Parody Features**: `ORDER BY VIBES` for random ordering
+- **Hybrid Database**: Combine traditional SQL with vector search in one system
+
 ## Requirements
 
 - Zig 0.15.2 or later
@@ -149,14 +157,149 @@ const expanded_results = try hnsw.searchThenTraverse(
 defer allocator.free(expanded_results);
 ```
 
+## SQL Usage
+
+### Basic SQL Operations
+
+```zig
+const std = @import("std");
+const zvdb = @import("zvdb");
+const Database = zvdb.Database;
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Create database
+    var db = Database.init(allocator);
+    defer db.deinit();
+
+    // Create a table
+    var result1 = try db.execute("CREATE TABLE users (id int, name text, email text, age int)");
+    defer result1.deinit();
+
+    // Insert data
+    _ = try db.execute("INSERT INTO users VALUES (1, \"Alice\", \"alice@example.com\", 25)");
+    _ = try db.execute("INSERT INTO users VALUES (2, \"Bob\", \"bob@example.com\", 30)");
+
+    // Query data
+    var result2 = try db.execute("SELECT * FROM users WHERE age = 25");
+    defer result2.deinit();
+    try result2.print(); // Pretty-print results
+
+    // Delete data
+    _ = try db.execute("DELETE FROM users WHERE id = 2");
+}
+```
+
+### Semantic Search with SQL
+
+The killer feature: combine SQL with vector similarity search!
+
+```zig
+// Initialize vector search capabilities
+try db.initVectorSearch(16, 200);
+
+// Create table with text columns
+_ = try db.execute("CREATE TABLE posts (id int, title text, content text)");
+_ = try db.execute("INSERT INTO posts VALUES (1, \"Database Tutorial\", \"Learn about vector databases...\")");
+_ = try db.execute("INSERT INTO posts VALUES (2, \"Zig Programming\", \"Getting started with Zig...\")");
+_ = try db.execute("INSERT INTO posts VALUES (3, \"Machine Learning\", \"Introduction to embeddings...\")");
+
+// Semantic search: Find posts similar to a query!
+var results = try db.execute("SELECT * FROM posts ORDER BY SIMILARITY TO \"database guide\" LIMIT 2");
+defer results.deinit();
+try results.print();
+```
+
+### Supported SQL Commands
+
+#### CREATE TABLE
+```sql
+CREATE TABLE table_name (col1 type1, col2 type2, ...)
+```
+Types: `int`, `float`, `text`, `bool`, `embedding`
+
+#### INSERT
+```sql
+-- With all columns
+INSERT INTO users VALUES (1, "Alice", 25)
+
+-- With specific columns
+INSERT INTO users (name, age) VALUES ("Bob", 30)
+
+-- NULL values
+INSERT INTO users VALUES (3, "Charlie", NULL)
+```
+
+#### SELECT
+```sql
+-- Select all
+SELECT * FROM users
+
+-- Select specific columns
+SELECT name, age FROM users
+
+-- With WHERE clause
+SELECT * FROM users WHERE age = 25
+
+-- With LIMIT
+SELECT * FROM users LIMIT 10
+
+-- Semantic search (requires initVectorSearch)
+SELECT * FROM posts ORDER BY SIMILARITY TO "your query" LIMIT 5
+
+-- Fun parody feature: random order!
+SELECT * FROM users ORDER BY VIBES
+```
+
+#### DELETE
+```sql
+-- Delete all rows
+DELETE FROM users
+
+-- Delete with condition
+DELETE FROM users WHERE age < 18
+```
+
+### Advanced: Embeddings
+
+For full semantic search, you can store embeddings directly:
+
+```zig
+const table = db.tables.get("documents").?;
+
+// Create your embedding (e.g., from an embedding model)
+const embedding = [_]f32{0.1, 0.2, 0.3, ...}; // Your 128/256/768-dim vector
+
+var values = std.StringHashMap(ColumnValue).init(allocator);
+try values.put("id", ColumnValue{ .int = 1 });
+try values.put("text", ColumnValue{ .text = "My document text" });
+try values.put("embedding", ColumnValue{ .embedding = &embedding });
+
+_ = try table.insert(values);
+```
+
 ## Building
 
 ```bash
 zig build        # Build library
 zig build test   # Run tests
+zig build demo   # Run SQL demo
 ```
 
 ## Recent Updates
+
+- **2025-11-13**: SQL Interface Release 🎉
+  - **SQL Query Language**: Full SQL parser for familiar database operations
+  - **Text Storage**: Tables with rows and columns (int, float, text, bool, embedding)
+  - **Semantic Search SQL**: `ORDER BY SIMILARITY TO "query"` for vector-powered queries
+  - **CRUD Operations**: CREATE TABLE, INSERT, SELECT, DELETE with WHERE and LIMIT
+  - **Hybrid Database**: Combine traditional SQL with HNSW vector search
+  - **Fun Features**: `ORDER BY VIBES` for random ordering (parody elements!)
+  - **14 comprehensive SQL tests** covering all operations
+  - **Demo program**: Run `zig build demo` to see SQL in action
 
 - **2025-10-20**: GraphRAG MVP Release
   - **Node Metadata**: Rich typed nodes with flexible attributes
