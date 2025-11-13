@@ -376,7 +376,7 @@ pub fn validateWalPath(path: []const u8) !void {
 /// - Using exclusive file creation flags
 /// - Running the database with minimal filesystem permissions
 /// - Using process isolation (containers, chroot)
-fn isSymlink(dir_path: []const u8, file_path: []const u8) !bool {
+pub fn isSymlink(dir_path: []const u8, file_path: []const u8) !bool {
     // Try to stat the file without following symlinks
     // We use fstatat with AT.SYMLINK_NOFOLLOW flag
 
@@ -1575,4 +1575,236 @@ test "WalWriter: total size tracking accurate" {
 
     const size_after = writer.getTotalWalSize();
     try testing.expectEqual(initial_size + expected_increase, size_after);
+}
+
+test "WalReader: rejects symlink" {
+    const allocator = testing.allocator;
+
+    const test_dir = "test_walreader_symlink";
+    defer std.fs.cwd().deleteTree(test_dir) catch {};
+
+    // Create test directory
+    try std.fs.cwd().makePath(test_dir);
+
+    // Create a valid WAL file first
+    var writer = try WalWriter.init(allocator, test_dir);
+    _ = try writer.writeRecord(.{
+        .record_type = .insert_row,
+        .tx_id = 1,
+        .lsn = 0,
+        .row_id = 1,
+        .table_name = "test",
+        .data = "data",
+        .checksum = 0,
+    });
+    try writer.flush();
+    writer.deinit();
+
+    // Create symlink to the WAL file
+    const symlink_path = test_dir ++ "/wal_symlink.000000";
+    const target_path = "wal.000000";
+    std.posix.symlink(target_path, symlink_path) catch |err| {
+        std.debug.print("Skipping symlink test: {}\n", .{err});
+        return;
+    };
+
+    // WalReader should detect and reject the symlink
+    try testing.expectError(
+        error.SymlinkNotAllowed,
+        WalReader.init(allocator, symlink_path),
+    );
+}
+
+test "isSymlink: returns false for regular file" {
+    const test_dir = "test_isSymlink_regular";
+    defer std.fs.cwd().deleteTree(test_dir) catch {};
+
+    // Create test directory
+    try std.fs.cwd().makePath(test_dir);
+
+    // Create a regular file
+    {
+        const file = try std.fs.cwd().createFile(test_dir ++ "/regular.txt", .{});
+        defer file.close();
+        try file.writeAll("regular file content");
+    }
+
+    // isSymlink should return false for regular file
+    const result = try isSymlink(test_dir, "regular.txt");
+    try testing.expectEqual(false, result);
+}
+
+test "isSymlink: returns false for directory" {
+    const test_dir = "test_isSymlink_directory";
+    defer std.fs.cwd().deleteTree(test_dir) catch {};
+
+    // Create test directory with a subdirectory
+    try std.fs.cwd().makePath(test_dir ++ "/subdir");
+
+    // isSymlink should return false for directory
+    const result = try isSymlink(test_dir, "subdir");
+    try testing.expectEqual(false, result);
+}
+
+test "isSymlink: returns false for non-existent file" {
+    const test_dir = "test_isSymlink_nonexistent";
+    defer std.fs.cwd().deleteTree(test_dir) catch {};
+
+    // Create test directory only (no file)
+    try std.fs.cwd().makePath(test_dir);
+
+    // isSymlink should return false for non-existent file
+    const result = try isSymlink(test_dir, "nonexistent.txt");
+    try testing.expectEqual(false, result);
+}
+
+test "WalWriter: deleteOldWalFiles rejects deleting current file" {
+    const allocator = testing.allocator;
+
+    const test_dir = "test_wal_delete_current";
+    defer std.fs.cwd().deleteTree(test_dir) catch {};
+
+    var writer = try WalWriter.init(allocator, test_dir);
+    defer writer.deinit();
+
+    // Write some records
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        _ = try writer.writeRecord(.{
+            .record_type = .insert_row,
+            .tx_id = @intCast(i),
+            .lsn = 0,
+            .row_id = @intCast(i),
+            .table_name = "test",
+            .data = "data",
+            .checksum = 0,
+        });
+    }
+
+    const current_seq = writer.getCurrentSequence();
+
+    // Trying to delete a sequence beyond current should error
+    try testing.expectError(
+        error.CannotDeleteCurrentWalFile,
+        writer.deleteOldWalFiles(current_seq + 1),
+    );
+}
+
+test "WalWriter: deleteOldWalFiles with sequence 0 is no-op" {
+    const allocator = testing.allocator;
+
+    const test_dir = "test_wal_delete_zero";
+    defer std.fs.cwd().deleteTree(test_dir) catch {};
+
+    var writer = try WalWriter.init(allocator, test_dir);
+    defer writer.deinit();
+
+    // Write some records
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        _ = try writer.writeRecord(.{
+            .record_type = .insert_row,
+            .tx_id = @intCast(i),
+            .lsn = 0,
+            .row_id = @intCast(i),
+            .table_name = "test",
+            .data = "data",
+            .checksum = 0,
+        });
+    }
+
+    try writer.flush();
+
+    const size_before = writer.getTotalWalSize();
+
+    // Deleting with sequence 0 should be a no-op (no files before sequence 0)
+    try writer.deleteOldWalFiles(0);
+
+    const size_after = writer.getTotalWalSize();
+    try testing.expectEqual(size_before, size_after);
+}
+
+test "WalWriter: quota enforcement with very small limit" {
+    const allocator = testing.allocator;
+
+    const test_dir = "test_wal_small_quota";
+    defer std.fs.cwd().deleteTree(test_dir) catch {};
+
+    // Create writer with extremely small quota (100 bytes)
+    var writer = try WalWriter.initWithOptions(allocator, test_dir, .{
+        .max_total_wal_size = 100,
+    });
+    defer writer.deinit();
+
+    // First record should succeed (we start with just a header which is 36 bytes)
+    _ = try writer.writeRecord(.{
+        .record_type = .insert_row,
+        .tx_id = 1,
+        .lsn = 0,
+        .row_id = 1,
+        .table_name = "test",
+        .data = "data",
+        .checksum = 0,
+    });
+
+    // Second record should hit quota immediately
+    try testing.expectError(
+        error.WalDiskQuotaExceeded,
+        writer.writeRecord(.{
+            .record_type = .insert_row,
+            .tx_id = 2,
+            .lsn = 0,
+            .row_id = 2,
+            .table_name = "test",
+            .data = "data",
+            .checksum = 0,
+        }),
+    );
+}
+
+test "WalWriter: size tracking across file rotation" {
+    const allocator = testing.allocator;
+
+    const test_dir = "test_wal_rotation_size";
+    defer std.fs.cwd().deleteTree(test_dir) catch {};
+
+    // Create writer with small max_file_size to force rotation
+    var writer = try WalWriter.initWithOptions(allocator, test_dir, .{
+        .max_file_size = 200, // Very small to force rotation quickly
+    });
+    defer writer.deinit();
+
+    const initial_size = writer.getTotalWalSize();
+    try testing.expectEqual(WalHeader.SIZE, initial_size);
+
+    const initial_seq = writer.getCurrentSequence();
+
+    // Write records to force rotation
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        _ = try writer.writeRecord(.{
+            .record_type = .insert_row,
+            .tx_id = @intCast(i),
+            .lsn = 0,
+            .row_id = @intCast(i),
+            .table_name = "test_table",
+            .data = "data_here",
+            .checksum = 0,
+        });
+    }
+
+    try writer.flush();
+
+    // Verify rotation occurred
+    const final_seq = writer.getCurrentSequence();
+    try testing.expect(final_seq > initial_seq);
+
+    // Verify total_wal_size tracks all files (should be > 0 and account for multiple files)
+    const total_size = writer.getTotalWalSize();
+    try testing.expect(total_size > initial_size);
+
+    // Total size should account for all rotated files
+    // Each file has a header (36 bytes) plus data
+    const expected_min_size = (final_seq - initial_seq + 1) * WalHeader.SIZE;
+    try testing.expect(total_size >= expected_min_size);
 }
