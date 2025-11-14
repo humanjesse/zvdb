@@ -152,6 +152,7 @@ pub const Database = struct {
 
     /// Enable Write-Ahead Logging for durability
     /// Creates WAL directory and initializes WAL writer
+    /// If WAL files already exist, finds the next sequence number to use
     pub fn enableWal(self: *Database, wal_dir: []const u8) !void {
         if (self.wal != null) {
             return error.WalAlreadyEnabled;
@@ -160,14 +161,57 @@ pub const Database = struct {
         const wal_ptr = try self.allocator.create(WalWriter);
         errdefer self.allocator.destroy(wal_ptr);
 
-        wal_ptr.* = try WalWriter.init(self.allocator, wal_dir);
+        // Find the highest existing sequence number in the WAL directory
+        const next_sequence = blk: {
+            var dir = std.fs.cwd().openDir(wal_dir, .{ .iterate = true }) catch |err| switch (err) {
+                error.FileNotFound => {
+                    // Directory doesn't exist, start from sequence 0
+                    break :blk 0;
+                },
+                else => return err,
+            };
+            defer dir.close();
+
+            var max_sequence: u64 = 0;
+            var found_any = false;
+
+            var dir_it = dir.iterate();
+            while (try dir_it.next()) |entry| {
+                if (entry.kind != .file) continue;
+
+                // Check if filename matches "wal.NNNNNN" pattern
+                if (std.mem.startsWith(u8, entry.name, "wal.")) {
+                    const seq_str = entry.name[4..]; // Skip "wal."
+                    if (std.fmt.parseInt(u64, seq_str, 10)) |seq| {
+                        found_any = true;
+                        if (seq > max_sequence) {
+                            max_sequence = seq;
+                        }
+                    } else |_| {
+                        // Ignore files with invalid sequence numbers
+                        continue;
+                    }
+                }
+            }
+
+            // Start from next sequence after the highest found
+            if (found_any) {
+                break :blk max_sequence + 1;
+            } else {
+                break :blk 0;
+            }
+        };
+
+        wal_ptr.* = try WalWriter.initWithOptions(self.allocator, wal_dir, .{
+            .sequence = next_sequence,
+        });
         self.wal = wal_ptr;
     }
 
     /// Helper function to write a WAL record and flush to disk
     /// Centralizes transaction ID management and WAL writing logic
     /// Returns the transaction ID used for this record
-    fn writeWalRecord(
+    pub fn writeWalRecord(
         self: *Database,
         record_type: WalRecordType,
         table_name: []const u8,
@@ -346,6 +390,7 @@ pub const Database = struct {
         // Step 4: Second pass - replay committed transactions
         var recovered_count: usize = 0;
         var applied_operations: usize = 0;
+        var max_tx_id: u64 = 0;
 
         for (wal_files.items) |wal_file| {
             var reader = WalReader.init(self.allocator, wal_file) catch |err| {
@@ -373,6 +418,11 @@ pub const Database = struct {
                 if (record_opt) |rec| {
                     var record = rec;
                     defer record.deinit(self.allocator);
+
+                    // Track maximum transaction ID
+                    if (record.tx_id > max_tx_id) {
+                        max_tx_id = record.tx_id;
+                    }
 
                     // Only process records from committed transactions
                     const tx_state = transactions.get(record.tx_id) orelse .active;
@@ -414,6 +464,11 @@ pub const Database = struct {
                            .{ recovered_count, applied_operations });
         }
 
+        // Update current_tx_id to prevent ID reuse in future transactions
+        if (max_tx_id > 0) {
+            self.current_tx_id = max_tx_id + 1;
+        }
+
         return recovered_count;
     }
 
@@ -434,18 +489,23 @@ pub const Database = struct {
         };
 
         // Deserialize the row data
-        const row = try Row.deserialize(record.data, self.allocator);
+        var row = try Row.deserialize(record.data, self.allocator);
+        errdefer row.deinit(self.allocator);
 
         // Check if row already exists (idempotency - may have been partially recovered)
         if (table.rows.contains(row.id)) {
             // Row already exists, skip (recovery is idempotent)
-            var temp_row = row;
-            temp_row.deinit(self.allocator);
+            row.deinit(self.allocator);
             return;
         }
 
         // Insert the row into the table
         try table.rows.put(row.id, row);
+
+        // Update next_id to prevent ID conflicts with future inserts
+        if (row.id >= table.next_id) {
+            table.next_id = row.id + 1;
+        }
     }
 
     /// Replay a DELETE operation from WAL
@@ -491,16 +551,24 @@ pub const Database = struct {
         const new_data = record.data[new_data_start..];
 
         // Deserialize the new row state
-        const updated_row = try Row.deserialize(new_data, self.allocator);
+        var updated_row = try Row.deserialize(new_data, self.allocator);
+        errdefer updated_row.deinit(self.allocator);
 
         // Remove old row if it exists
-        if (table.rows.fetchRemove(record.row_id)) |entry| {
-            var old_row = entry.value;
-            old_row.deinit(self.allocator);
+        if (table.rows.fetchRemove(record.row_id)) |old_entry| {
+            // Call deinit directly on the returned value to avoid extra copies
+            // We can't use |*old_entry| because it's const
+            var temp_row = old_entry.value;
+            temp_row.deinit(self.allocator);
         }
 
         // Insert the updated row
         try table.rows.put(updated_row.id, updated_row);
+
+        // Update next_id to prevent ID conflicts with future inserts
+        if (updated_row.id >= table.next_id) {
+            table.next_id = updated_row.id + 1;
+        }
     }
 
     /// Rebuild HNSW vector index from table data (Phase 2.4)
@@ -532,32 +600,46 @@ pub const Database = struct {
         // Phase 2.4: HNSW Index Rebuild Implementation
 
         // Step 1: If HNSW is not enabled, skip
-        const h = self.hnsw orelse {
+        if (self.hnsw == null) {
             std.debug.print("HNSW not enabled, skipping index rebuild\n", .{});
             return 0;
-        };
+        }
+
+        // Step 2: Clear and reinitialize HNSW to start fresh
+        // We need to rebuild the entire index from scratch
+        if (self.hnsw) |old_hnsw| {
+            old_hnsw.deinit();
+            self.allocator.destroy(old_hnsw);
+        }
+
+        // Reinitialize with the same parameters (use reasonable defaults if not set)
+        const hnsw_ptr = try self.allocator.create(HNSW(f32));
+        hnsw_ptr.* = HNSW(f32).init(self.allocator, 16, 200);
+        self.hnsw = hnsw_ptr;
+
+        const h = self.hnsw.?;
 
         var vectors_indexed: usize = 0;
 
-        // Step 2: Scan all tables in the database
+        // Step 3: Scan all tables in the database
         var table_it = self.tables.iterator();
         while (table_it.next()) |table_entry| {
             const table_name = table_entry.key_ptr.*;
             const table = table_entry.value_ptr.*;
 
-            // Step 3: Scan all rows in this table
+            // Step 4: Scan all rows in this table
             var row_it = table.rows.iterator();
             while (row_it.next()) |row_entry| {
                 const row_id = row_entry.key_ptr.*;
                 const row = row_entry.value_ptr.*;
 
-                // Step 4: Find embedding columns in this row
+                // Step 5: Find embedding columns in this row
                 var value_it = row.values.iterator();
                 while (value_it.next()) |value_entry| {
                     const col_name = value_entry.key_ptr.*;
                     const value = value_entry.value_ptr.*;
 
-                    // Step 5: If this is an embedding column, insert into HNSW
+                    // Step 6: If this is an embedding column, insert into HNSW
                     if (value == .embedding) {
                         const embedding = value.embedding;
 
@@ -687,20 +769,28 @@ pub const Database = struct {
             }
         }
 
+        // Check if an explicit ID is provided (must be non-negative)
+        var explicit_id: ?u64 = null;
+        if (values_map.get("id")) |id_value| {
+            if (id_value == .int and id_value.int >= 0) {
+                explicit_id = @intCast(id_value.int);
+            }
+        }
+
+        // Determine the row_id that will be used
+        const row_id = explicit_id orelse table.next_id;
+
         // WAL-Ahead Protocol: Write to WAL BEFORE modifying data
         // ⚠️ LIMITATION (Phase 2.3): Transaction atomicity is incomplete
         // If WAL write succeeds but table.insert() fails (OOM, validation error), the
         // database will be inconsistent: WAL has a record for a non-existent row.
         // Phase 2.4 will address this with proper transaction boundaries and undo/redo.
         if (self.wal != null) {
-            // Get the row_id that will be assigned
-            const row_id = table.next_id;
-
             // Create a temporary row for serialization
             var temp_row = Row.init(self.allocator, row_id);
             defer temp_row.deinit(self.allocator);
 
-            // Populate the temporary row with values
+            // Populate the temporary row with all values
             var it = values_map.iterator();
             while (it.next()) |entry| {
                 try temp_row.set(self.allocator, entry.key_ptr.*, entry.value_ptr.*);
@@ -714,7 +804,11 @@ pub const Database = struct {
             _ = try self.writeWalRecord(WalRecordType.insert_row, cmd.table_name, row_id, serialized_row);
         }
 
-        const row_id = try table.insert(values_map);
+        // Insert the row using appropriate method
+        const final_row_id = if (explicit_id) |id| blk: {
+            try table.insertWithId(id, values_map);
+            break :blk id;
+        } else try table.insert(values_map);
 
         // If there's an embedding column and vector search is enabled, add to index
         // ⚠️ LIMITATION (Phase 2.3): HNSW index updates are NOT recorded in the WAL
@@ -722,25 +816,25 @@ pub const Database = struct {
         // table data. Solution: Phase 2.4 should rebuild HNSW index from table data
         // after WAL replay. See database.zig:262-269
         if (self.hnsw) |h| {
-            const row = table.get(row_id).?;
+            const row = table.get(final_row_id).?;
             var it = row.values.iterator();
             while (it.next()) |entry| {
                 if (entry.value_ptr.* == .embedding) {
                     const embedding = entry.value_ptr.embedding;
-                    _ = try h.insert(embedding, row_id);
+                    _ = try h.insert(embedding, final_row_id);
                     break;
                 }
             }
         }
 
         // Phase 1: Update B-tree indexes automatically
-        const inserted_row = table.get(row_id).?;
-        try self.index_manager.onInsert(cmd.table_name, row_id, inserted_row);
+        const inserted_row = table.get(final_row_id).?;
+        try self.index_manager.onInsert(cmd.table_name, final_row_id, inserted_row);
 
         var result = QueryResult.init(self.allocator);
         try result.addColumn("row_id");
         var row = ArrayList(ColumnValue).init(self.allocator);
-        try row.append(ColumnValue{ .int = @intCast(row_id) });
+        try row.append(ColumnValue{ .int = @intCast(final_row_id) });
         try result.addRow(row);
 
         return result;
@@ -753,7 +847,20 @@ pub const Database = struct {
         // Determine which columns to select
         const select_all = cmd.columns.items.len == 0;
         if (select_all) {
-            try result.addColumn("id");
+            // Check if table has an "id" column in its schema
+            var has_id_column = false;
+            for (table.columns.items) |col| {
+                if (std.mem.eql(u8, col.name, "id")) {
+                    has_id_column = true;
+                    break;
+                }
+            }
+
+            // Only add row_id as "id" if table doesn't have its own "id" column
+            if (!has_id_column) {
+                try result.addColumn("id");
+            }
+
             for (table.columns.items) |col| {
                 try result.addColumn(col.name);
             }
@@ -858,7 +965,20 @@ pub const Database = struct {
             var result_row = ArrayList(ColumnValue).init(self.allocator);
 
             if (select_all) {
-                try result_row.append(ColumnValue{ .int = @intCast(row_id) });
+                // Check if table has an "id" column in its schema
+                var has_id_column = false;
+                for (table.columns.items) |col| {
+                    if (std.mem.eql(u8, col.name, "id")) {
+                        has_id_column = true;
+                        break;
+                    }
+                }
+
+                // Only append row_id if table doesn't have its own "id" column
+                if (!has_id_column) {
+                    try result_row.append(ColumnValue{ .int = @intCast(row_id) });
+                }
+
                 for (table.columns.items) |col| {
                     if (row.get(col.name)) |val| {
                         try result_row.append(try val.clone(self.allocator));

@@ -216,7 +216,7 @@ pub const Row = struct {
             offset += col_name.len;
 
             // Write value type tag
-            buffer[offset] = @intFromEnum(value);
+            buffer[offset] = @intFromEnum(std.meta.activeTag(value));
             offset += 1;
 
             // Write value data
@@ -282,7 +282,7 @@ pub const Row = struct {
             offset += 8;
 
             if (offset + col_name_len > buffer.len) return error.BufferTooSmall;
-            const col_name = buffer[offset..][0..col_name_len];
+            const col_name_slice = buffer[offset..][0..col_name_len];
             offset += col_name_len;
 
             // Read value type tag
@@ -290,8 +290,12 @@ pub const Row = struct {
             const value_tag = buffer[offset];
             offset += 1;
 
+            // Allocate owned column name
+            const owned_col_name = try allocator.dupe(u8, col_name_slice);
+            errdefer allocator.free(owned_col_name);
+
             // Read value data based on type
-            const value = switch (value_tag) {
+            var value = switch (value_tag) {
                 0 => ColumnValue.null_value, // null_value
                 1 => blk: { // int
                     if (offset + 8 > buffer.len) return error.BufferTooSmall;
@@ -337,8 +341,19 @@ pub const Row = struct {
                 },
                 else => return error.InvalidValueType,
             };
+            errdefer value.deinit(allocator);
 
-            try row.set(allocator, col_name, value);
+            // Insert directly into the hashmap without cloning, since we already own the data
+            // This avoids the double allocation that would occur with row.set()
+            const result = try row.values.getOrPut(col_name_slice);
+            if (result.found_existing) {
+                // Free old key and value (shouldn't happen during deserialization, but be safe)
+                allocator.free(result.key_ptr.*);
+                var old_val = result.value_ptr.*;
+                old_val.deinit(allocator);
+            }
+            result.key_ptr.* = owned_col_name;
+            result.value_ptr.* = value;
         }
 
         return row;
@@ -376,8 +391,7 @@ pub const Table = struct {
 
         var it = self.rows.iterator();
         while (it.next()) |entry| {
-            var row = entry.value_ptr.*;
-            row.deinit(self.allocator);
+            entry.value_ptr.deinit(self.allocator);
         }
         self.rows.deinit();
     }
@@ -496,7 +510,7 @@ pub const Table = struct {
                 try file.writeAll(col_name);
 
                 // Write value type tag
-                try writeInt(file, u8, @intFromEnum(value));
+                try writeInt(file, u8, @intFromEnum(std.meta.activeTag(value)));
 
                 // Write value data
                 switch (value) {

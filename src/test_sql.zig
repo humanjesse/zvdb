@@ -29,7 +29,7 @@ test "SQL: INSERT and SELECT" {
     defer select_result.deinit();
 
     try testing.expect(select_result.rows.items.len == 1);
-    try testing.expect(select_result.columns.items.len == 4); // id + 3 columns
+    try testing.expect(select_result.columns.items.len == 3); // id, name, age (no duplicate id)
 }
 
 test "SQL: INSERT with column names" {
@@ -242,7 +242,7 @@ test "SQL: NULL values" {
     defer result.deinit();
 
     try testing.expect(result.rows.items.len == 1);
-    try testing.expect(result.rows.items[0].items[2] == .null_value);
+    try testing.expect(result.rows.items[0].items[1] == .null_value); // items[1] is the value column
 }
 
 // =============================================================================
@@ -461,8 +461,8 @@ test "Persistence: NULL values" {
         defer result.deinit();
 
         try testing.expect(result.rows.items.len == 2);
-        // First row should have NULL value
-        try testing.expect(result.rows.items[0].items[2] == .null_value);
+        // First row should have NULL value (items[1] is the value column)
+        try testing.expect(result.rows.items[0].items[1] == .null_value);
     }
 
     // Clean up
@@ -652,7 +652,7 @@ test "SQL: Basic UPDATE single column" {
     defer select_result.deinit();
 
     try testing.expect(select_result.rows.items.len == 1);
-    try testing.expect(std.mem.eql(u8, select_result.rows.items[0].items[2].text, "Alicia"));
+    try testing.expect(std.mem.eql(u8, select_result.rows.items[0].items[1].text, "Alicia")); // items[1] is name column
 }
 
 test "SQL: UPDATE multiple columns" {
@@ -675,8 +675,8 @@ test "SQL: UPDATE multiple columns" {
     var select_result = try db.execute("SELECT * FROM products WHERE id = 1");
     defer select_result.deinit();
 
-    try testing.expect(select_result.rows.items[0].items[3].float == 24.99);
-    try testing.expect(select_result.rows.items[0].items[4].int == 150);
+    try testing.expect(select_result.rows.items[0].items[2].float == 24.99); // items[2] is price
+    try testing.expect(select_result.rows.items[0].items[3].int == 150); // items[3] is stock
 }
 
 test "SQL: UPDATE with WHERE AND condition" {
@@ -703,7 +703,7 @@ test "SQL: UPDATE with WHERE AND condition" {
     var select_result = try db.execute("SELECT * FROM items WHERE id = 1");
     defer select_result.deinit();
 
-    try testing.expect(select_result.rows.items[0].items[3].float == 89.99);
+    try testing.expect(select_result.rows.items[0].items[2].float == 89.99); // items[2] is price
 }
 
 test "SQL: UPDATE with WHERE OR condition" {
@@ -780,7 +780,7 @@ test "SQL: UPDATE with IS NULL" {
     var select_result = try db.execute("SELECT * FROM contacts WHERE id = 2");
     defer select_result.deinit();
 
-    try testing.expect(std.mem.eql(u8, select_result.rows.items[0].items[2].text, "unknown@example.com"));
+    try testing.expect(std.mem.eql(u8, select_result.rows.items[0].items[1].text, "unknown@example.com")); // items[1] is email
 }
 
 test "SQL: UPDATE with IS NOT NULL" {
@@ -844,7 +844,7 @@ test "SQL: UPDATE all rows (no WHERE)" {
     defer select_result.deinit();
 
     for (select_result.rows.items) |row| {
-        try testing.expect(row.items[2].bool == false);
+        try testing.expect(row.items[1].bool == false); // items[1] is enabled column
     }
 }
 
@@ -871,7 +871,7 @@ test "SQL: UPDATE with NOT operator" {
     defer select_result.deinit();
 
     for (select_result.rows.items) |row| {
-        try testing.expect(row.items[2].bool == true);
+        try testing.expect(row.items[1].bool == true); // items[1] is active column
     }
 }
 
@@ -1544,7 +1544,9 @@ test "WAL Recovery: UPDATE operations" {
         try testing.expectEqual(@as(usize, 1), select.rows.items.len);
 
         // Verify price was updated to 150
-        const price_col = select.rows.items[0].items[2];
+        // SELECT * returns: id (row_id), id, name, price
+        // So price is at index 3
+        const price_col = select.rows.items[0].items[3];
         try testing.expectEqual(@as(i64, 150), price_col.int);
     }
 }
@@ -1623,13 +1625,33 @@ test "WAL Recovery: HNSW index rebuild after recovery" {
             var result = try db.execute(query);
             defer result.deinit();
 
-            // Add embedding manually
+            // Add embedding manually and log to WAL
             var embedding = [_]f32{@as(f32, @floatFromInt(i)) * 0.1} ** 128;
             const row = table.get(i).?;
+
+            // Serialize old row state for WAL
+            const old_serialized = try row.serialize(testing.allocator);
+            defer testing.allocator.free(old_serialized);
+
             const emb = try testing.allocator.dupe(f32, &embedding);
             defer testing.allocator.free(emb);
             try row.set(testing.allocator, "vec", ColumnValue{ .embedding = emb });
             _ = try db.hnsw.?.insert(&embedding, i);
+
+            // Serialize new row state for WAL
+            const new_serialized = try row.serialize(testing.allocator);
+            defer testing.allocator.free(new_serialized);
+
+            // Write UPDATE to WAL
+            const combined_size = 8 + old_serialized.len + new_serialized.len;
+            const combined_data = try testing.allocator.alloc(u8, combined_size);
+            defer testing.allocator.free(combined_data);
+
+            std.mem.writeInt(u64, combined_data[0..8], old_serialized.len, .little);
+            @memcpy(combined_data[8..][0..old_serialized.len], old_serialized);
+            @memcpy(combined_data[8 + old_serialized.len..][0..new_serialized.len], new_serialized);
+
+            _ = try db.writeWalRecord(.update_row, "docs", i, combined_data);
         }
 
         try testing.expectEqual(@as(usize, 3), table.count());
@@ -1647,7 +1669,8 @@ test "WAL Recovery: HNSW index rebuild after recovery" {
 
         // Recover from WAL
         const recovered = try db.recoverFromWal(wal_dir);
-        try testing.expectEqual(@as(usize, 3), recovered);
+        // Expect 6 transactions: 3 INSERTs + 3 UPDATEs (each auto-committed separately)
+        try testing.expectEqual(@as(usize, 6), recovered);
 
         // Rebuild HNSW index
         const vectors_indexed = try db.rebuildHnswFromTables();
@@ -1844,6 +1867,7 @@ test "WAL Crash: Multiple crashes and recoveries" {
         var db = Database.init(testing.allocator);
         defer db.deinit();
 
+        try db.enableWal(wal_dir);
 
         var create = try db.execute("CREATE TABLE events (id int, type text)");
         defer create.deinit();
@@ -2031,7 +2055,7 @@ test "WAL Crash: Recovery with WAL file rotation" {
 
         // Use custom WAL with small file size to force rotation
         const wal_ptr = try testing.allocator.create(WalWriter);
-        defer testing.allocator.destroy(wal_ptr);
+        // Note: db.deinit() will destroy wal_ptr, so we don't defer destroy here
 
         wal_ptr.* = try WalWriter.initWithOptions(testing.allocator, wal_dir, .{
             .max_file_size = 2048, // 2KB - small to force rotation
