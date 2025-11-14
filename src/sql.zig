@@ -124,6 +124,7 @@ pub const SelectCmd = struct {
     similar_to_text: ?[]const u8,
     order_by_similarity: ?[]const u8, // ORDER BY SIMILARITY TO "text"
     order_by_vibes: bool, // Fun parody feature!
+    group_by: ArrayList([]const u8), // GROUP BY columns
     limit: ?usize,
 
     pub fn deinit(self: *SelectCmd, allocator: Allocator) void {
@@ -140,6 +141,12 @@ pub const SelectCmd = struct {
         if (self.similar_to_column) |col| allocator.free(col);
         if (self.similar_to_text) |text| allocator.free(text);
         if (self.order_by_similarity) |text| allocator.free(text);
+
+        // Free GROUP BY columns
+        for (self.group_by.items) |col| {
+            allocator.free(col);
+        }
+        self.group_by.deinit();
     }
 };
 
@@ -648,9 +655,10 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
     var similar_to_text: ?[]const u8 = null;
     var order_by_similarity: ?[]const u8 = null;
     var order_by_vibes = false;
+    var group_by = ArrayList([]const u8).init(allocator);
     var limit: ?usize = null;
 
-    // Parse WHERE, ORDER BY, LIMIT
+    // Parse WHERE, GROUP BY, ORDER BY, LIMIT
     while (i < tokens.len) {
         if (eqlIgnoreCase(tokens[i].text, "WHERE")) {
             i += 1;
@@ -686,6 +694,25 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
                 } else {
                     const num = try std.fmt.parseInt(i64, token_text, 10);
                     where_value = ColumnValue{ .int = num };
+                }
+                i += 1;
+            }
+        } else if (eqlIgnoreCase(tokens[i].text, "GROUP")) {
+            i += 1;
+            if (i >= tokens.len or !eqlIgnoreCase(tokens[i].text, "BY")) {
+                return SqlError.InvalidSyntax;
+            }
+            i += 1;
+
+            // Parse comma-separated list of columns
+            while (i < tokens.len) {
+                if (eqlIgnoreCase(tokens[i].text, "ORDER") or
+                    eqlIgnoreCase(tokens[i].text, "LIMIT")) {
+                    break;
+                }
+
+                if (!std.mem.eql(u8, tokens[i].text, ",")) {
+                    try group_by.append(try allocator.dupe(u8, tokens[i].text));
                 }
                 i += 1;
             }
@@ -731,6 +758,7 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
         .similar_to_text = similar_to_text,
         .order_by_similarity = order_by_similarity,
         .order_by_vibes = order_by_vibes,
+        .group_by = group_by,
         .limit = limit,
     };
 }

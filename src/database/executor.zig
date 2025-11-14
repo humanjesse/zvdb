@@ -186,6 +186,41 @@ fn compareForMinMax(a: ColumnValue, b: ColumnValue) std.math.Order {
 }
 
 // ============================================================================
+// GROUP BY Support
+// ============================================================================
+
+/// Create a hash key from group column values
+fn makeGroupKey(allocator: Allocator, row: *const Row, group_columns: []const []const u8) ![]u8 {
+    var key_parts = std.ArrayList([]const u8).init(allocator);
+    defer {
+        for (key_parts.items) |part| {
+            allocator.free(part);
+        }
+        key_parts.deinit();
+    }
+
+    for (group_columns) |col| {
+        const val = row.get(col) orelse {
+            try key_parts.append(try allocator.dupe(u8, "NULL"));
+            continue;
+        };
+
+        const val_str = switch (val) {
+            .int => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
+            .float => |f| try std.fmt.allocPrint(allocator, "{d}", .{f}),
+            .text => |t| try allocator.dupe(u8, t),
+            .bool => |b| if (b) try allocator.dupe(u8, "true") else try allocator.dupe(u8, "false"),
+            .null_value => try allocator.dupe(u8, "NULL"),
+            else => try allocator.dupe(u8, ""),
+        };
+        try key_parts.append(val_str);
+    }
+
+    // Join with separator
+    return std.mem.join(allocator, "|", key_parts.items);
+}
+
+// ============================================================================
 // SQL Command Execution
 // ============================================================================
 
@@ -394,7 +429,12 @@ fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
         return error.MixedAggregateAndRegular;
     }
 
-    // Route to aggregate handler if needed
+    // Route to GROUP BY handler if needed
+    if (cmd.group_by.items.len > 0) {
+        return executeGroupBySelect(db, table, cmd);
+    }
+
+    // Route to aggregate handler if needed (without GROUP BY)
     if (has_aggregates) {
         return executeAggregateSelect(db, table, cmd);
     }
@@ -632,6 +672,153 @@ fn executeAggregateSelect(db: *Database, table: *Table, cmd: sql.SelectCmd) !Que
         try result_row.append(final_value);
     }
     try result.addRow(result_row);
+
+    return result;
+}
+
+fn executeGroupBySelect(db: *Database, table: *Table, cmd: sql.SelectCmd) !QueryResult {
+    var result = QueryResult.init(db.allocator);
+
+    // Group data structure: group_key -> (group_values, aggregate_states)
+    const GroupData = struct {
+        group_values: ArrayList(ColumnValue),
+        agg_states: ArrayList(AggregateState),
+
+        fn deinit(self: *@This(), allocator: Allocator) void {
+            for (self.group_values.items) |*val| {
+                var v = val.*;
+                v.deinit(allocator);
+            }
+            self.group_values.deinit();
+
+            for (self.agg_states.items) |*state| {
+                state.deinit();
+            }
+            self.agg_states.deinit();
+        }
+    };
+
+    var groups = StringHashMap(GroupData).init(db.allocator);
+    defer {
+        var it = groups.iterator();
+        while (it.next()) |entry| {
+            db.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(db.allocator);
+        }
+        groups.deinit();
+    }
+
+    // Setup result columns
+    // 1. Group columns
+    for (cmd.group_by.items) |col| {
+        try result.addColumn(col);
+    }
+
+    // 2. Aggregate columns and validate regular columns
+    for (cmd.columns.items) |col| {
+        switch (col) {
+            .aggregate => |agg| {
+                const col_name = switch (agg.func) {
+                    .count => if (agg.column) |c|
+                        try std.fmt.allocPrint(db.allocator, "COUNT({s})", .{c})
+                    else
+                        try db.allocator.dupe(u8, "COUNT(*)"),
+                    .sum => try std.fmt.allocPrint(db.allocator, "SUM({s})", .{agg.column.?}),
+                    .avg => try std.fmt.allocPrint(db.allocator, "AVG({s})", .{agg.column.?}),
+                    .min => try std.fmt.allocPrint(db.allocator, "MIN({s})", .{agg.column.?}),
+                    .max => try std.fmt.allocPrint(db.allocator, "MAX({s})", .{agg.column.?}),
+                };
+                try result.addColumn(col_name);
+            },
+            .regular => |col_name| {
+                // Regular column must be in GROUP BY
+                var found = false;
+                for (cmd.group_by.items) |group_col| {
+                    if (std.mem.eql(u8, col_name, group_col)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    return error.ColumnNotInGroupBy;
+                }
+            },
+            .star => return error.CannotUseStarWithGroupBy,
+        }
+    }
+
+    // Scan rows and build groups
+    const row_ids = try table.getAllRows(db.allocator);
+    defer db.allocator.free(row_ids);
+
+    for (row_ids) |row_id| {
+        const row = table.get(row_id) orelse continue;
+
+        // Apply WHERE filter
+        if (cmd.where_column) |where_col| {
+            if (cmd.where_value) |where_val| {
+                const row_val = row.get(where_col) orelse continue;
+                if (!valuesEqual(row_val, where_val)) continue;
+            }
+        }
+
+        // Create group key
+        const group_key = try makeGroupKey(db.allocator, row, cmd.group_by.items);
+
+        // Get or create group
+        const gop = try groups.getOrPut(group_key);
+        if (!gop.found_existing) {
+            // New group - initialize
+            var group_values = ArrayList(ColumnValue).init(db.allocator);
+            for (cmd.group_by.items) |col| {
+                const val = row.get(col) orelse ColumnValue.null_value;
+                try group_values.append(try val.clone(db.allocator));
+            }
+
+            var agg_states = ArrayList(AggregateState).init(db.allocator);
+            for (cmd.columns.items) |col| {
+                if (col == .aggregate) {
+                    try agg_states.append(AggregateState.init(
+                        db.allocator,
+                        col.aggregate.func,
+                        col.aggregate.column,
+                    ));
+                }
+            }
+
+            gop.value_ptr.* = GroupData{
+                .group_values = group_values,
+                .agg_states = agg_states,
+            };
+        } else {
+            // Group exists - free the duplicate key
+            db.allocator.free(group_key);
+        }
+
+        // Accumulate in aggregate states
+        for (gop.value_ptr.agg_states.items) |*state| {
+            try state.accumulate(row);
+        }
+    }
+
+    // Finalize all groups and create result rows
+    var group_it = groups.iterator();
+    while (group_it.next()) |entry| {
+        var result_row = ArrayList(ColumnValue).init(db.allocator);
+
+        // Add group column values
+        for (entry.value_ptr.group_values.items) |val| {
+            try result_row.append(try val.clone(db.allocator));
+        }
+
+        // Add aggregate results
+        for (entry.value_ptr.agg_states.items) |*state| {
+            const final_value = try state.finalize();
+            try result_row.append(final_value);
+        }
+
+        try result.addRow(result_row);
+    }
 
     return result;
 }
