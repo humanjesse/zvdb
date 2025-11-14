@@ -668,12 +668,14 @@ fn executeBegin(db: *Database) !QueryResult {
 
     // Write BEGIN to WAL if enabled
     if (db.wal) |w| {
-        try w.writeRecord(.{
+        _ = try w.writeRecord(.{
             .record_type = WalRecordType.begin_tx,
             .tx_id = tx_id,
+            .lsn = 0, // Will be assigned by writeRecord
             .table_name = "",
             .row_id = 0,
             .data = &[_]u8{},
+            .checksum = 0, // Will be calculated during serialization
         });
         try w.flush();
     }
@@ -695,12 +697,14 @@ fn executeCommit(db: *Database) !QueryResult {
 
     // Write COMMIT to WAL if enabled
     if (db.wal) |w| {
-        try w.writeRecord(.{
+        _ = try w.writeRecord(.{
             .record_type = WalRecordType.commit_tx,
             .tx_id = tx_id,
+            .lsn = 0, // Will be assigned by writeRecord
             .table_name = "",
             .row_id = 0,
             .data = &[_]u8{},
+            .checksum = 0, // Will be calculated during serialization
         });
         try w.flush(); // Ensure durable
     }
@@ -733,12 +737,14 @@ fn executeRollback(db: *Database) !QueryResult {
 
     // Write ROLLBACK to WAL if enabled
     if (db.wal) |w| {
-        try w.writeRecord(.{
+        _ = try w.writeRecord(.{
             .record_type = WalRecordType.rollback_tx,
             .tx_id = tx_id,
+            .lsn = 0, // Will be assigned by writeRecord
             .table_name = "",
             .row_id = 0,
             .data = &[_]u8{},
+            .checksum = 0, // Will be calculated during serialization
         });
         try w.flush();
     }
