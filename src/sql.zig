@@ -117,7 +117,7 @@ pub const InsertCmd = struct {
 /// SELECT command with semantic search support
 pub const SelectCmd = struct {
     table_name: []const u8,
-    columns: ArrayList([]const u8), // empty = SELECT *
+    columns: ArrayList(SelectColumn), // Changed to support aggregates
     where_column: ?[]const u8,
     where_value: ?ColumnValue,
     similar_to_column: ?[]const u8, // For SIMILAR TO queries
@@ -128,8 +128,8 @@ pub const SelectCmd = struct {
 
     pub fn deinit(self: *SelectCmd, allocator: Allocator) void {
         allocator.free(self.table_name);
-        for (self.columns.items) |col| {
-            allocator.free(col);
+        for (self.columns.items) |*col| {
+            col.deinit(allocator);
         }
         self.columns.deinit();
         if (self.where_column) |col| allocator.free(col);
@@ -155,6 +155,49 @@ pub const DeleteCmd = struct {
         if (self.where_value) |*val| {
             var v = val.*;
             v.deinit(allocator);
+        }
+    }
+};
+
+/// Aggregate function types
+pub const AggregateFunc = enum {
+    count,
+    sum,
+    avg,
+    min,
+    max,
+
+    pub fn fromString(s: []const u8) ?AggregateFunc {
+        if (eqlIgnoreCase(s, "COUNT")) return .count;
+        if (eqlIgnoreCase(s, "SUM")) return .sum;
+        if (eqlIgnoreCase(s, "AVG")) return .avg;
+        if (eqlIgnoreCase(s, "MIN")) return .min;
+        if (eqlIgnoreCase(s, "MAX")) return .max;
+        return null;
+    }
+};
+
+/// Aggregate expression (e.g., COUNT(*), SUM(balance))
+pub const AggregateExpr = struct {
+    func: AggregateFunc,
+    column: ?[]const u8, // null for COUNT(*)
+
+    pub fn deinit(self: *AggregateExpr, allocator: Allocator) void {
+        if (self.column) |col| allocator.free(col);
+    }
+};
+
+/// Column selection with optional aggregation
+pub const SelectColumn = union(enum) {
+    regular: []const u8,      // Regular column: "name"
+    aggregate: AggregateExpr, // Aggregate: COUNT(*), SUM(balance)
+    star: void,               // SELECT *
+
+    pub fn deinit(self: *SelectColumn, allocator: Allocator) void {
+        switch (self.*) {
+            .regular => |col| allocator.free(col),
+            .aggregate => |*agg| agg.deinit(allocator),
+            .star => {},
         }
     }
 };
@@ -539,21 +582,55 @@ fn parseInsert(allocator: Allocator, tokens: []const Token) !InsertCmd {
 fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
     // SELECT * FROM table
     // SELECT col1, col2 FROM table WHERE col = val
+    // SELECT COUNT(*), SUM(amount) FROM table
     // SELECT * FROM table WHERE col SIMILAR TO "text"
     // SELECT * FROM table ORDER BY SIMILARITY TO "text" LIMIT 5
     // SELECT * FROM table ORDER BY VIBES
     if (tokens.len < 4) return SqlError.InvalidSyntax;
 
-    var columns = ArrayList([]const u8).init(allocator);
+    var columns = ArrayList(SelectColumn).init(allocator);
     var i: usize = 1;
 
     // Parse columns
     while (i < tokens.len and !eqlIgnoreCase(tokens[i].text, "FROM")) {
         if (!std.mem.eql(u8, tokens[i].text, ",")) {
             if (std.mem.eql(u8, tokens[i].text, "*")) {
-                // SELECT * means all columns (empty list)
+                // SELECT * means all columns
+                try columns.append(.star);
+            } else if (AggregateFunc.fromString(tokens[i].text)) |func| {
+                // Parse aggregate function: COUNT(*) or COUNT(column)
+                i += 1;
+                if (i >= tokens.len or !std.mem.eql(u8, tokens[i].text, "(")) {
+                    return SqlError.InvalidSyntax;
+                }
+                i += 1;
+
+                var agg_column: ?[]const u8 = null;
+                if (i < tokens.len and !std.mem.eql(u8, tokens[i].text, "*") and !std.mem.eql(u8, tokens[i].text, ")")) {
+                    // Named column: COUNT(age)
+                    agg_column = try allocator.dupe(u8, tokens[i].text);
+                    i += 1;
+                } else if (i < tokens.len and std.mem.eql(u8, tokens[i].text, "*")) {
+                    // COUNT(*) - column remains null
+                    i += 1;
+                }
+
+                if (i >= tokens.len or !std.mem.eql(u8, tokens[i].text, ")")) {
+                    if (agg_column) |col| allocator.free(col);
+                    return SqlError.InvalidSyntax;
+                }
+
+                try columns.append(.{
+                    .aggregate = .{
+                        .func = func,
+                        .column = agg_column,
+                    },
+                });
             } else {
-                try columns.append(try allocator.dupe(u8, tokens[i].text));
+                // Regular column
+                try columns.append(.{
+                    .regular = try allocator.dupe(u8, tokens[i].text),
+                });
             }
         }
         i += 1;

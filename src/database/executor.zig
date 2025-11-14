@@ -9,12 +9,173 @@ const ColumnValue = @import("../table.zig").ColumnValue;
 const ColumnType = @import("../table.zig").ColumnType;
 const Row = @import("../table.zig").Row;
 const sql = @import("../sql.zig");
+const AggregateFunc = sql.AggregateFunc;
 const StringHashMap = std.StringHashMap;
 const ArrayList = std.array_list.Managed;
 const WalRecordType = @import("../wal.zig").WalRecordType;
 const Transaction = @import("../transaction.zig");
 const Operation = Transaction.Operation;
 const TxRow = Transaction.Row;
+const Allocator = std.mem.Allocator;
+
+// ============================================================================
+// Aggregate Functions Support
+// ============================================================================
+
+/// Aggregate accumulator for COUNT, SUM, AVG, MIN, MAX
+const AggregateState = struct {
+    func: AggregateFunc,
+    column: ?[]const u8,
+
+    // Accumulator state
+    count: u64,
+    sum: f64,
+    min: ?ColumnValue,
+    max: ?ColumnValue,
+
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator, func: AggregateFunc, column: ?[]const u8) AggregateState {
+        return .{
+            .func = func,
+            .column = column,
+            .count = 0,
+            .sum = 0.0,
+            .min = null,
+            .max = null,
+            .allocator = allocator,
+        };
+    }
+
+    /// Process a single row
+    pub fn accumulate(self: *AggregateState, row: *const Row) !void {
+        switch (self.func) {
+            .count => {
+                // COUNT(*) counts all rows
+                if (self.column == null) {
+                    self.count += 1;
+                } else {
+                    // COUNT(column) counts non-null values
+                    if (row.get(self.column.?)) |val| {
+                        if (val != .null_value) {
+                            self.count += 1;
+                        }
+                    }
+                }
+            },
+            .sum, .avg => {
+                if (self.column) |col| {
+                    if (row.get(col)) |val| {
+                        const num = switch (val) {
+                            .int => |i| @as(f64, @floatFromInt(i)),
+                            .float => |f| f,
+                            .null_value => return, // Skip nulls
+                            else => return error.TypeMismatch,
+                        };
+                        self.sum += num;
+                        self.count += 1;
+                    }
+                }
+            },
+            .min => {
+                if (self.column) |col| {
+                    if (row.get(col)) |val| {
+                        if (val == .null_value) return; // Skip nulls
+
+                        if (self.min == null) {
+                            self.min = try val.clone(self.allocator);
+                        } else {
+                            // Compare and update if smaller
+                            if (compareForMinMax(val, self.min.?) == .lt) {
+                                var old = self.min.?;
+                                old.deinit(self.allocator);
+                                self.min = try val.clone(self.allocator);
+                            }
+                        }
+                    }
+                }
+            },
+            .max => {
+                if (self.column) |col| {
+                    if (row.get(col)) |val| {
+                        if (val == .null_value) return; // Skip nulls
+
+                        if (self.max == null) {
+                            self.max = try val.clone(self.allocator);
+                        } else {
+                            // Compare and update if larger
+                            if (compareForMinMax(val, self.max.?) == .gt) {
+                                var old = self.max.?;
+                                old.deinit(self.allocator);
+                                self.max = try val.clone(self.allocator);
+                            }
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+    /// Get final result
+    pub fn finalize(self: *AggregateState) !ColumnValue {
+        switch (self.func) {
+            .count => return ColumnValue{ .int = @intCast(self.count) },
+            .sum => return ColumnValue{ .float = self.sum },
+            .avg => {
+                if (self.count == 0) return ColumnValue.null_value;
+                return ColumnValue{ .float = self.sum / @as(f64, @floatFromInt(self.count)) };
+            },
+            .min => return self.min orelse ColumnValue.null_value,
+            .max => return self.max orelse ColumnValue.null_value,
+        }
+    }
+
+    pub fn deinit(self: *AggregateState) void {
+        if (self.min) |*m| {
+            var val = m.*;
+            val.deinit(self.allocator);
+        }
+        if (self.max) |*m| {
+            var val = m.*;
+            val.deinit(self.allocator);
+        }
+    }
+};
+
+fn compareForMinMax(a: ColumnValue, b: ColumnValue) std.math.Order {
+    // Similar to compareValues but returns Order
+    switch (a) {
+        .int => |ai| {
+            const bi = switch (b) {
+                .int => |i| i,
+                .float => |f| @as(i64, @intFromFloat(f)),
+                else => return .eq,
+            };
+            if (ai < bi) return .lt;
+            if (ai > bi) return .gt;
+            return .eq;
+        },
+        .float => |af| {
+            const bf = switch (b) {
+                .float => |f| f,
+                .int => |i| @as(f64, @floatFromInt(i)),
+                else => return .eq,
+            };
+            if (af < bf) return .lt;
+            if (af > bf) return .gt;
+            return .eq;
+        },
+        .text => |at| {
+            if (b != .text) return .eq;
+            return std.mem.order(u8, at, b.text);
+        },
+        else => return .eq,
+    }
+}
+
+// ============================================================================
+// SQL Command Execution
+// ============================================================================
 
 /// Execute a SQL command
 pub fn execute(db: *Database, query: []const u8) !QueryResult {
@@ -199,10 +360,38 @@ fn executeInsert(db: *Database, cmd: sql.InsertCmd) !QueryResult {
 
 fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
     const table = db.tables.get(cmd.table_name) orelse return sql.SqlError.TableNotFound;
+
+    // Check if this is an aggregate query
+    var has_aggregates = false;
+    var has_regular_columns = false;
+    var select_all = false;
+
+    for (cmd.columns.items) |col| {
+        switch (col) {
+            .aggregate => has_aggregates = true,
+            .regular => has_regular_columns = true,
+            .star => {
+                select_all = true;
+                has_regular_columns = true;
+            },
+        }
+    }
+
+    // Error: Cannot mix aggregates with regular columns without GROUP BY
+    if (has_aggregates and has_regular_columns) {
+        return error.MixedAggregateAndRegular;
+    }
+
+    // Route to aggregate handler if needed
+    if (has_aggregates) {
+        return executeAggregateSelect(db, table, cmd);
+    }
+
+    // Regular SELECT (non-aggregate)
     var result = QueryResult.init(db.allocator);
 
     // Determine which columns to select
-    const select_all = cmd.columns.items.len == 0;
+    select_all = select_all or cmd.columns.items.len == 0;
     if (select_all) {
         // Check if table has an "id" column in its schema
         var has_id_column = false;
@@ -223,7 +412,11 @@ fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
         }
     } else {
         for (cmd.columns.items) |col| {
-            try result.addColumn(col);
+            switch (col) {
+                .regular => |col_name| try result.addColumn(col_name),
+                .star => unreachable, // Already handled above
+                .aggregate => unreachable, // Already handled above
+            }
         }
     }
 
@@ -341,10 +534,16 @@ fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
             }
         } else {
             for (cmd.columns.items) |col| {
-                if (row.get(col)) |val| {
-                    try result_row.append(try val.clone(db.allocator));
-                } else {
-                    try result_row.append(ColumnValue.null_value);
+                switch (col) {
+                    .regular => |col_name| {
+                        if (row.get(col_name)) |val| {
+                            try result_row.append(try val.clone(db.allocator));
+                        } else {
+                            try result_row.append(ColumnValue.null_value);
+                        }
+                    },
+                    .star => unreachable, // Already handled above
+                    .aggregate => unreachable, // Already handled above
                 }
             }
         }
@@ -352,6 +551,74 @@ fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
         try result.addRow(result_row);
         count += 1;
     }
+
+    return result;
+}
+
+fn executeAggregateSelect(db: *Database, table: *Table, cmd: sql.SelectCmd) !QueryResult {
+    var result = QueryResult.init(db.allocator);
+
+    // Initialize aggregate states
+    var agg_states = std.ArrayList(AggregateState).init(db.allocator);
+    defer {
+        for (agg_states.items) |*state| {
+            state.deinit();
+        }
+        agg_states.deinit();
+    }
+
+    // Setup result columns and aggregate states
+    for (cmd.columns.items) |col| {
+        switch (col) {
+            .aggregate => |agg| {
+                // Add column name to result
+                const col_name = switch (agg.func) {
+                    .count => if (agg.column) |c|
+                        try std.fmt.allocPrint(db.allocator, "COUNT({s})", .{c})
+                    else
+                        try db.allocator.dupe(u8, "COUNT(*)"),
+                    .sum => try std.fmt.allocPrint(db.allocator, "SUM({s})", .{agg.column.?}),
+                    .avg => try std.fmt.allocPrint(db.allocator, "AVG({s})", .{agg.column.?}),
+                    .min => try std.fmt.allocPrint(db.allocator, "MIN({s})", .{agg.column.?}),
+                    .max => try std.fmt.allocPrint(db.allocator, "MAX({s})", .{agg.column.?}),
+                };
+                try result.addColumn(col_name);
+
+                // Initialize aggregate state
+                try agg_states.append(AggregateState.init(db.allocator, agg.func, agg.column));
+            },
+            else => unreachable, // Already validated
+        }
+    }
+
+    // Scan all rows and accumulate
+    const row_ids = try table.getAllRows(db.allocator);
+    defer db.allocator.free(row_ids);
+
+    for (row_ids) |row_id| {
+        const row = table.get(row_id) orelse continue;
+
+        // Apply WHERE filter
+        if (cmd.where_column) |where_col| {
+            if (cmd.where_value) |where_val| {
+                const row_val = row.get(where_col) orelse continue;
+                if (!valuesEqual(row_val, where_val)) continue;
+            }
+        }
+
+        // Accumulate in all aggregate states
+        for (agg_states.items) |*state| {
+            try state.accumulate(row);
+        }
+    }
+
+    // Finalize and create result row
+    var result_row = ArrayList(ColumnValue).init(db.allocator);
+    for (agg_states.items) |*state| {
+        const final_value = try state.finalize();
+        try result_row.append(final_value);
+    }
+    try result.addRow(result_row);
 
     return result;
 }
