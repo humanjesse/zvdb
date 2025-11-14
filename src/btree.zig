@@ -215,7 +215,10 @@ pub const BTree = struct {
         right.parent = parent;
 
         // Move upper half of keys to right sibling
-        var i: usize = mid + 1;
+        // For leaf nodes, include the middle key in the right sibling (B+ tree style)
+        // For internal nodes, the middle key is only promoted to parent
+        const start_idx = if (child.is_leaf) mid else mid + 1;
+        var i: usize = start_idx;
         while (i < child.keys.items.len) : (i += 1) {
             try right.keys.append(child.keys.items[i]);
             if (child.is_leaf) {
@@ -268,39 +271,77 @@ pub const BTree = struct {
 
     /// Search for a key within a specific node and its children
     fn searchInNode(self: *const BTree, node: *BTreeNode, key: ColumnValue, results: *ArrayList(u64)) !void {
-        // Search through keys in this node
+        if (node.is_leaf) {
+            // In a leaf node, collect all matching values
+            var i: usize = 0;
+            while (i < node.keys.items.len) : (i += 1) {
+                const cmp = compareColumnValues(key, node.keys.items[i]);
+                if (cmp == .eq) {
+                    try results.append(node.values.items[i]);
+                } else if (cmp == .lt) {
+                    // Keys are sorted, so we can stop early
+                    return;
+                }
+            }
+            return;
+        }
+
+        // Internal node: check each separator key to find which child(ren) to search
+        // When splits occur, duplicate separator keys can exist, and matching values
+        // may be distributed across multiple adjacent children
+
+        // First, find the range of matching separators
+        var first_match: ?usize = null;
+        var last_match: ?usize = null;
+
         var i: usize = 0;
         while (i < node.keys.items.len) : (i += 1) {
             const cmp = compareColumnValues(key, node.keys.items[i]);
 
-            if (cmp == .eq) {
-                // Found exact match
-                if (node.is_leaf) {
-                    try results.append(node.values.items[i]);
-                }
-                // Continue searching for duplicates
-                i += 1;
-                while (i < node.keys.items.len) : (i += 1) {
-                    const cmp2 = compareColumnValues(key, node.keys.items[i]);
-                    if (cmp2 != .eq) break;
-                    if (node.is_leaf) {
-                        try results.append(node.values.items[i]);
-                    }
-                }
-                return;
-            } else if (cmp == .lt) {
-                // Key is less than current, search left child
-                if (!node.is_leaf) {
+            if (cmp == .lt) {
+                // Key is less than this separator
+                if (first_match) |_| {
+                    // We already found matches, so stop here
+                    break;
+                } else {
+                    // Key must be in the left child
                     try self.searchInNode(node.children.items[i].?, key, results);
+                    return;
                 }
-                return;
+            } else if (cmp == .eq) {
+                // Found a matching separator
+                if (first_match == null) {
+                    first_match = i;
+                }
+                last_match = i;
+            } else {
+                // key > separator
+                if (first_match) |_| {
+                    // We've passed all matching separators, stop here
+                    break;
+                }
             }
         }
 
-        // Key is greater than all keys, search rightmost child
-        if (!node.is_leaf and node.children.items.len > 0) {
-            const last_child = node.children.items[node.children.items.len - 1].?;
-            try self.searchInNode(last_child, key, results);
+        // If we found matching separators, search the relevant children
+        if (first_match) |first| {
+            const last = last_match.?;
+
+            // Search the left child of the first match and all children between first and last+1
+            // For keys=[2, 2, 3], first=0, last=1
+            // We need to search child[0], child[1], and child[2]
+            try self.searchInNode(node.children.items[first].?, key, results);
+
+            var child_idx = first + 1;
+            while (child_idx <= last + 1 and child_idx < node.children.items.len) : (child_idx += 1) {
+                try self.searchInNode(node.children.items[child_idx].?, key, results);
+            }
+            return;
+        }
+
+        // Key is greater than all separators, search rightmost child
+        if (node.children.items.len > 0) {
+            try self.searchInNode(node.children.items[node.children.items.len - 1].?, key, results);
         }
     }
 

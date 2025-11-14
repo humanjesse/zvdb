@@ -152,6 +152,60 @@ pub const Database = struct {
         self.data_dir = try self.allocator.dupe(u8, data_dir);
         self.auto_save = auto_save;
     }
+
+    // ========================================================================
+    // Delegation methods for backward compatibility
+    // These delegate to the modular implementations while maintaining the
+    // original method-based API
+    // ========================================================================
+
+    /// Execute a SQL query - delegates to executor module
+    pub fn execute(self: *Database, query: []const u8) !QueryResult {
+        const executor = @import("executor.zig");
+        return executor.execute(self, query);
+    }
+
+    /// Save all tables to disk - delegates to persistence module
+    pub fn saveAll(self: *Database, dir_path: []const u8) !void {
+        const persistence = @import("persistence.zig");
+        return persistence.saveAll(self, dir_path);
+    }
+
+    /// Load all tables from disk - static method delegates to persistence module
+    pub fn loadAll(allocator: Allocator, dir_path: []const u8) !Database {
+        const persistence = @import("persistence.zig");
+        return persistence.loadAll(allocator, dir_path);
+    }
+
+    /// Enable Write-Ahead Logging - delegates to recovery module
+    pub fn enableWal(self: *Database, wal_dir: []const u8) !void {
+        const recovery = @import("recovery.zig");
+        return recovery.enableWal(self, wal_dir);
+    }
+
+    /// Recover from WAL after a crash - delegates to recovery module
+    pub fn recoverFromWal(self: *Database, wal_dir: []const u8) !usize {
+        const recovery = @import("recovery.zig");
+        return recovery.recoverFromWal(self, wal_dir);
+    }
+
+    /// Write a WAL record - delegates to recovery module
+    pub fn writeWalRecord(
+        self: *Database,
+        record_type: @import("../wal.zig").WalRecordType,
+        table_name: []const u8,
+        row_id: u64,
+        data: []const u8,
+    ) !u64 {
+        const recovery = @import("recovery.zig");
+        return recovery.writeWalRecord(self, record_type, table_name, row_id, data);
+    }
+
+    /// Rebuild HNSW index from table data - delegates to vector_ops module
+    pub fn rebuildHnswFromTables(self: *Database) !usize {
+        const vector_ops = @import("vector_ops.zig");
+        return vector_ops.rebuildHnswFromTables(self);
+    }
 };
 
 /// Helper function to compare column values for equality
