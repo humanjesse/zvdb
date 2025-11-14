@@ -33,6 +33,9 @@ pub const SqlCommand = union(enum) {
     select: SelectCmd,
     delete: DeleteCmd,
     update: UpdateCmd,
+    begin: void,
+    commit: void,
+    rollback: void,
 
     pub fn deinit(self: *SqlCommand, allocator: Allocator) void {
         switch (self.*) {
@@ -43,6 +46,9 @@ pub const SqlCommand = union(enum) {
             .select => |*cmd| cmd.deinit(allocator),
             .delete => |*cmd| cmd.deinit(allocator),
             .update => |*cmd| cmd.deinit(allocator),
+            .begin => {},
+            .commit => {},
+            .rollback => {},
         }
     }
 };
@@ -371,6 +377,15 @@ pub fn parse(allocator: Allocator, sql: []const u8) !SqlCommand {
         return SqlCommand{ .delete = try parseDelete(allocator, tokens.items) };
     } else if (eqlIgnoreCase(first, "UPDATE")) {
         return SqlCommand{ .update = try parseUpdate(allocator, tokens.items) };
+    } else if (eqlIgnoreCase(first, "BEGIN")) {
+        // Support both "BEGIN" and "BEGIN TRANSACTION"
+        return SqlCommand{ .begin = {} };
+    } else if (eqlIgnoreCase(first, "COMMIT")) {
+        // Support both "COMMIT" and "COMMIT TRANSACTION"
+        return SqlCommand{ .commit = {} };
+    } else if (eqlIgnoreCase(first, "ROLLBACK")) {
+        // Support both "ROLLBACK" and "ROLLBACK TRANSACTION"
+        return SqlCommand{ .rollback = {} };
     }
 
     return SqlError.UnknownCommand;

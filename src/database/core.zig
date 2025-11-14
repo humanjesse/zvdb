@@ -7,6 +7,7 @@ const ColumnValue = @import("../table.zig").ColumnValue;
 const HNSW = @import("../hnsw.zig").HNSW;
 const WalWriter = @import("../wal.zig").WalWriter;
 const IndexManager = @import("../index_manager.zig").IndexManager;
+const TransactionManager = @import("../transaction.zig").TransactionManager;
 
 /// Query result set
 pub const QueryResult = struct {
@@ -86,6 +87,7 @@ pub const Database = struct {
     auto_save: bool, // Auto-save on deinit
     wal: ?*WalWriter, // Write-Ahead Log for durability (optional)
     current_tx_id: u64, // Simple transaction ID counter (for Phase 2.3)
+    tx_manager: TransactionManager, // Transaction manager for BEGIN/COMMIT/ROLLBACK
 
     pub fn init(allocator: Allocator) Database {
         return Database{
@@ -97,6 +99,7 @@ pub const Database = struct {
             .auto_save = false,
             .wal = null,
             .current_tx_id = 0,
+            .tx_manager = TransactionManager.init(allocator),
         };
     }
 
@@ -115,6 +118,9 @@ pub const Database = struct {
             w.deinit();
             self.allocator.destroy(w);
         }
+
+        // Clean up transaction manager
+        self.tx_manager.deinit();
 
         var it = self.tables.iterator();
         while (it.next()) |entry| {
