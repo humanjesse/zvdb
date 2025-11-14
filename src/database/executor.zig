@@ -191,7 +191,7 @@ fn compareForMinMax(a: ColumnValue, b: ColumnValue) std.math.Order {
 
 /// Create a hash key from group column values
 fn makeGroupKey(allocator: Allocator, row: *const Row, group_columns: []const []const u8) ![]u8 {
-    var key_parts = std.ArrayList([]const u8).init(allocator);
+    var key_parts = ArrayList([]const u8).init(allocator);
     defer {
         for (key_parts.items) |part| {
             allocator.free(part);
@@ -424,14 +424,14 @@ fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
         }
     }
 
-    // Error: Cannot mix aggregates with regular columns without GROUP BY
-    if (has_aggregates and has_regular_columns) {
-        return error.MixedAggregateAndRegular;
-    }
-
     // Route to GROUP BY handler if needed
     if (cmd.group_by.items.len > 0) {
         return executeGroupBySelect(db, table, cmd);
+    }
+
+    // Error: Cannot mix aggregates with regular columns without GROUP BY
+    if (has_aggregates and has_regular_columns) {
+        return error.MixedAggregateAndRegular;
     }
 
     // Route to aggregate handler if needed (without GROUP BY)
@@ -728,6 +728,7 @@ fn executeGroupBySelect(db: *Database, table: *Table, cmd: sql.SelectCmd) !Query
                     .min => try std.fmt.allocPrint(db.allocator, "MIN({s})", .{agg.column.?}),
                     .max => try std.fmt.allocPrint(db.allocator, "MAX({s})", .{agg.column.?}),
                 };
+                defer db.allocator.free(col_name);
                 try result.addColumn(col_name);
             },
             .regular => |col_name| {
