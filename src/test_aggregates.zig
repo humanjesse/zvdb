@@ -7,10 +7,22 @@ test "aggregate: COUNT(*) basic" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE users (id int, name text, age int)");
-    _ = try db.execute("INSERT INTO users VALUES (1, 'Alice', 25)");
-    _ = try db.execute("INSERT INTO users VALUES (2, 'Bob', 30)");
-    _ = try db.execute("INSERT INTO users VALUES (3, 'Charlie', 35)");
+    {
+        var result = try db.execute("CREATE TABLE users (id int, name text, age int)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO users VALUES (1, 'Alice', 25)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO users VALUES (2, 'Bob', 30)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO users VALUES (3, 'Charlie', 35)");
+        defer result.deinit();
+    }
 
     var result = try db.execute("SELECT COUNT(*) FROM users");
     defer result.deinit();
@@ -23,7 +35,10 @@ test "aggregate: COUNT(*) empty table" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE empty (id int)");
+    {
+        var result = try db.execute("CREATE TABLE empty (id int)");
+        defer result.deinit();
+    }
 
     var result = try db.execute("SELECT COUNT(*) FROM empty");
     defer result.deinit();
@@ -36,11 +51,26 @@ test "aggregate: COUNT(column) with nulls" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE users (id int, name text, age int)");
-    _ = try db.execute("INSERT INTO users VALUES (1, 'Alice', 25)");
-    _ = try db.execute("INSERT INTO users VALUES (2, 'Bob', NULL)");
-    _ = try db.execute("INSERT INTO users VALUES (3, 'Charlie', 35)");
-    _ = try db.execute("INSERT INTO users VALUES (4, 'David', NULL)");
+    {
+        var result = try db.execute("CREATE TABLE users (id int, name text, age int)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO users VALUES (1, 'Alice', 25)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO users VALUES (2, 'Bob', NULL)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO users VALUES (3, 'Charlie', 35)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO users VALUES (4, 'David', NULL)");
+        defer result.deinit();
+    }
 
     var result = try db.execute("SELECT COUNT(age) FROM users");
     defer result.deinit();
@@ -53,10 +83,22 @@ test "aggregate: SUM basic" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE sales (id int, amount float)");
-    _ = try db.execute("INSERT INTO sales VALUES (1, 100.5)");
-    _ = try db.execute("INSERT INTO sales VALUES (2, 200.0)");
-    _ = try db.execute("INSERT INTO sales VALUES (3, 150.5)");
+    {
+        var result = try db.execute("CREATE TABLE sales (id int, amount float)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO sales VALUES (1, 100.5)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO sales VALUES (2, 200.0)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO sales VALUES (3, 150.5)");
+        defer result.deinit();
+    }
 
     var result = try db.execute("SELECT SUM(amount) FROM sales");
     defer result.deinit();
@@ -69,10 +111,22 @@ test "aggregate: SUM with integers" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE scores (id int, points int)");
-    _ = try db.execute("INSERT INTO scores VALUES (1, 10)");
-    _ = try db.execute("INSERT INTO scores VALUES (2, 20)");
-    _ = try db.execute("INSERT INTO scores VALUES (3, 30)");
+    {
+        var result = try db.execute("CREATE TABLE scores (id int, points int)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO scores VALUES (1, 10)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO scores VALUES (2, 20)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO scores VALUES (3, 30)");
+        defer result.deinit();
+    }
 
     var result = try db.execute("SELECT SUM(points) FROM scores");
     defer result.deinit();
@@ -85,10 +139,22 @@ test "aggregate: AVG basic" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE sales (id int, amount float)");
-    _ = try db.execute("INSERT INTO sales VALUES (1, 100.0)");
-    _ = try db.execute("INSERT INTO sales VALUES (2, 200.0)");
-    _ = try db.execute("INSERT INTO sales VALUES (3, 150.0)");
+    {
+        var result = try db.execute("CREATE TABLE sales (id int, amount float)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO sales VALUES (1, 100.0)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO sales VALUES (2, 200.0)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO sales VALUES (3, 150.0)");
+        defer result.deinit();
+    }
 
     var result = try db.execute("SELECT AVG(amount) FROM sales");
     defer result.deinit();
@@ -101,7 +167,10 @@ test "aggregate: AVG empty table returns NULL" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE empty (id int, value float)");
+    {
+        var result = try db.execute("CREATE TABLE empty (id int, value float)");
+        defer result.deinit();
+    }
 
     var result = try db.execute("SELECT AVG(value) FROM empty");
     defer result.deinit();
@@ -114,11 +183,26 @@ test "aggregate: MIN and MAX with floats" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE prices (id int, price float)");
-    _ = try db.execute("INSERT INTO prices VALUES (1, 9.99)");
-    _ = try db.execute("INSERT INTO prices VALUES (2, 19.99)");
-    _ = try db.execute("INSERT INTO prices VALUES (3, 4.99)");
-    _ = try db.execute("INSERT INTO prices VALUES (4, 14.99)");
+    {
+        var result = try db.execute("CREATE TABLE prices (id int, price float)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO prices VALUES (1, 9.99)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO prices VALUES (2, 19.99)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO prices VALUES (3, 4.99)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO prices VALUES (4, 14.99)");
+        defer result.deinit();
+    }
 
     var result = try db.execute("SELECT MIN(price), MAX(price) FROM prices");
     defer result.deinit();
@@ -132,11 +216,26 @@ test "aggregate: MIN and MAX with integers" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE scores (id int, points int)");
-    _ = try db.execute("INSERT INTO scores VALUES (1, 85)");
-    _ = try db.execute("INSERT INTO scores VALUES (2, 92)");
-    _ = try db.execute("INSERT INTO scores VALUES (3, 78)");
-    _ = try db.execute("INSERT INTO scores VALUES (4, 95)");
+    {
+        var result = try db.execute("CREATE TABLE scores (id int, points int)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO scores VALUES (1, 85)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO scores VALUES (2, 92)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO scores VALUES (3, 78)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO scores VALUES (4, 95)");
+        defer result.deinit();
+    }
 
     var result = try db.execute("SELECT MIN(points), MAX(points) FROM scores");
     defer result.deinit();
@@ -150,10 +249,22 @@ test "aggregate: MIN and MAX with text" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE names (id int, name text)");
-    _ = try db.execute("INSERT INTO names VALUES (1, 'Zebra')");
-    _ = try db.execute("INSERT INTO names VALUES (2, 'Apple')");
-    _ = try db.execute("INSERT INTO names VALUES (3, 'Mango')");
+    {
+        var result = try db.execute("CREATE TABLE names (id int, name text)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO names VALUES (1, 'Zebra')");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO names VALUES (2, 'Apple')");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO names VALUES (3, 'Mango')");
+        defer result.deinit();
+    }
 
     var result = try db.execute("SELECT MIN(name), MAX(name) FROM names");
     defer result.deinit();
@@ -167,11 +278,26 @@ test "aggregate: COUNT(*) with WHERE clause" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE users (id int, name text, age int)");
-    _ = try db.execute("INSERT INTO users VALUES (1, 'Alice', 25)");
-    _ = try db.execute("INSERT INTO users VALUES (2, 'Bob', 30)");
-    _ = try db.execute("INSERT INTO users VALUES (3, 'Charlie', 35)");
-    _ = try db.execute("INSERT INTO users VALUES (4, 'David', 40)");
+    {
+        var result = try db.execute("CREATE TABLE users (id int, name text, age int)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO users VALUES (1, 'Alice', 25)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO users VALUES (2, 'Bob', 30)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO users VALUES (3, 'Charlie', 35)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO users VALUES (4, 'David', 40)");
+        defer result.deinit();
+    }
 
     var result = try db.execute("SELECT COUNT(*) FROM users WHERE age = 30");
     defer result.deinit();
@@ -184,10 +310,22 @@ test "aggregate: SUM with WHERE clause" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE sales (id int, amount float, category text)");
-    _ = try db.execute("INSERT INTO sales VALUES (1, 100.0, 'electronics')");
-    _ = try db.execute("INSERT INTO sales VALUES (2, 200.0, 'electronics')");
-    _ = try db.execute("INSERT INTO sales VALUES (3, 50.0, 'clothing')");
+    {
+        var result = try db.execute("CREATE TABLE sales (id int, amount float, category text)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO sales VALUES (1, 100.0, 'electronics')");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO sales VALUES (2, 200.0, 'electronics')");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO sales VALUES (3, 50.0, 'clothing')");
+        defer result.deinit();
+    }
 
     var result = try db.execute("SELECT SUM(amount) FROM sales WHERE category = 'electronics'");
     defer result.deinit();
@@ -200,10 +338,22 @@ test "aggregate: multiple aggregates in one query" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE products (id int, price float, stock int)");
-    _ = try db.execute("INSERT INTO products VALUES (1, 10.99, 5)");
-    _ = try db.execute("INSERT INTO products VALUES (2, 25.50, 3)");
-    _ = try db.execute("INSERT INTO products VALUES (3, 15.00, 8)");
+    {
+        var result = try db.execute("CREATE TABLE products (id int, price float, stock int)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO products VALUES (1, 10.99, 5)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO products VALUES (2, 25.50, 3)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO products VALUES (3, 15.00, 8)");
+        defer result.deinit();
+    }
 
     var result = try db.execute("SELECT COUNT(*), SUM(price), AVG(price), MIN(price), MAX(price) FROM products");
     defer result.deinit();
@@ -220,7 +370,10 @@ test "aggregate: MIN/MAX return NULL for empty result" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE products (id int, price float)");
+    {
+        var result = try db.execute("CREATE TABLE products (id int, price float)");
+        defer result.deinit();
+    }
 
     var result = try db.execute("SELECT MIN(price), MAX(price) FROM products");
     defer result.deinit();
@@ -234,10 +387,22 @@ test "aggregate: COUNT with different columns" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE users (id int, name text, email text)");
-    _ = try db.execute("INSERT INTO users VALUES (1, 'Alice', 'alice@example.com')");
-    _ = try db.execute("INSERT INTO users VALUES (2, 'Bob', NULL)");
-    _ = try db.execute("INSERT INTO users VALUES (3, 'Charlie', 'charlie@example.com')");
+    {
+        var result = try db.execute("CREATE TABLE users (id int, name text, email text)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO users VALUES (1, 'Alice', 'alice@example.com')");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO users VALUES (2, 'Bob', NULL)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO users VALUES (3, 'Charlie', 'charlie@example.com')");
+        defer result.deinit();
+    }
 
     var result = try db.execute("SELECT COUNT(*), COUNT(name), COUNT(email) FROM users");
     defer result.deinit();
@@ -252,8 +417,14 @@ test "aggregate: result column names" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE sales (id int, amount float)");
-    _ = try db.execute("INSERT INTO sales VALUES (1, 100.0)");
+    {
+        var result = try db.execute("CREATE TABLE sales (id int, amount float)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO sales VALUES (1, 100.0)");
+        defer result.deinit();
+    }
 
     var result = try db.execute("SELECT COUNT(*), SUM(amount), AVG(amount), MIN(amount), MAX(amount) FROM sales");
     defer result.deinit();

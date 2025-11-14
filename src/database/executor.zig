@@ -125,8 +125,20 @@ const AggregateState = struct {
                 if (self.count == 0) return ColumnValue.null_value;
                 return ColumnValue{ .float = self.sum / @as(f64, @floatFromInt(self.count)) };
             },
-            .min => return self.min orelse ColumnValue.null_value,
-            .max => return self.max orelse ColumnValue.null_value,
+            .min => {
+                if (self.min) |m| {
+                    return try m.clone(self.allocator);
+                } else {
+                    return ColumnValue.null_value;
+                }
+            },
+            .max => {
+                if (self.max) |m| {
+                    return try m.clone(self.allocator);
+                } else {
+                    return ColumnValue.null_value;
+                }
+            },
         }
     }
 
@@ -559,7 +571,7 @@ fn executeAggregateSelect(db: *Database, table: *Table, cmd: sql.SelectCmd) !Que
     var result = QueryResult.init(db.allocator);
 
     // Initialize aggregate states
-    var agg_states = std.ArrayList(AggregateState).init(db.allocator);
+    var agg_states = ArrayList(AggregateState).init(db.allocator);
     defer {
         for (agg_states.items) |*state| {
             state.deinit();
@@ -582,6 +594,7 @@ fn executeAggregateSelect(db: *Database, table: *Table, cmd: sql.SelectCmd) !Que
                     .min => try std.fmt.allocPrint(db.allocator, "MIN({s})", .{agg.column.?}),
                     .max => try std.fmt.allocPrint(db.allocator, "MAX({s})", .{agg.column.?}),
                 };
+                defer db.allocator.free(col_name);
                 try result.addColumn(col_name);
 
                 // Initialize aggregate state
