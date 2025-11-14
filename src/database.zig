@@ -11,6 +11,7 @@ const SqlCommand = sql.SqlCommand;
 const HNSW = @import("hnsw.zig").HNSW;
 const wal = @import("wal.zig");
 const WalWriter = wal.WalWriter;
+const WalReader = wal.WalReader;
 const WalRecord = wal.WalRecord;
 const WalRecordType = wal.WalRecordType;
 const IndexManager = @import("index_manager.zig").IndexManager;
@@ -195,6 +196,19 @@ pub const Database = struct {
 
         // Write WAL record and flush to disk (CRITICAL: must be durable before table mutation)
         _ = try w.writeRecord(record);
+
+        // Write COMMIT record to mark this transaction as committed
+        // (Each SQL statement is an auto-committed transaction)
+        const commit_record = WalRecord{
+            .record_type = .commit_tx,
+            .tx_id = tx_id,
+            .lsn = 0,
+            .row_id = 0,
+            .table_name = "",
+            .data = "",
+            .checksum = 0,
+        };
+        _ = try w.writeRecord(commit_record);
         try w.flush();
 
         return tx_id;
@@ -228,7 +242,7 @@ pub const Database = struct {
         // Phase 2.4: WAL Recovery Implementation
 
         // Step 1: Find all WAL files in the directory
-        var wal_files = std.ArrayList([]const u8).init(self.allocator);
+        var wal_files = ArrayList([]const u8).init(self.allocator);
         defer {
             for (wal_files.items) |file| {
                 self.allocator.free(file);
@@ -279,6 +293,9 @@ pub const Database = struct {
         var transactions = std.AutoHashMap(u64, TransactionState).init(self.allocator);
         defer transactions.deinit();
 
+        // Track corruption statistics
+        var corrupted_records: usize = 0;
+
         // Step 3: First pass - scan all records to identify committed transactions
         for (wal_files.items) |wal_file| {
             var reader = WalReader.init(self.allocator, wal_file) catch |err| {
@@ -287,21 +304,41 @@ pub const Database = struct {
             };
             defer reader.deinit();
 
-            while (try reader.readRecord()) |record_opt| {
-                var record = record_opt;
-                defer record.deinit(self.allocator);
+            // Read records with error handling - skip corrupted records
+            while (true) {
+                const record_result = reader.readRecord();
+                const record_opt = record_result catch |err| switch (err) {
+                    // Recoverable errors - skip corrupted record and continue
+                    error.ChecksumMismatch,
+                    error.BufferTooSmall,
+                    error.InvalidRecordType => {
+                        corrupted_records += 1;
+                        std.debug.print("Warning: Skipping corrupted record in {s}: {}\n", .{ wal_file, err });
+                        break; // Skip rest of this file, move to next
+                    },
+                    // Fatal errors - propagate
+                    else => return err,
+                };
 
-                switch (record.record_type) {
-                    .begin_tx => {
-                        try transactions.put(record.tx_id, .active);
-                    },
-                    .commit_tx => {
-                        try transactions.put(record.tx_id, .committed);
-                    },
-                    .rollback_tx => {
-                        try transactions.put(record.tx_id, .aborted);
-                    },
-                    else => {}, // Data operations don't change transaction state
+                if (record_opt) |rec| {
+                    var record = rec;
+                    defer record.deinit(self.allocator);
+
+                    switch (record.record_type) {
+                        .begin_tx => {
+                            try transactions.put(record.tx_id, .active);
+                        },
+                        .commit_tx => {
+                            try transactions.put(record.tx_id, .committed);
+                        },
+                        .rollback_tx => {
+                            try transactions.put(record.tx_id, .aborted);
+                        },
+                        else => {}, // Data operations don't change transaction state
+                    }
+                } else {
+                    // End of file
+                    break;
                 }
             }
         }
@@ -317,39 +354,65 @@ pub const Database = struct {
             };
             defer reader.deinit();
 
-            while (try reader.readRecord()) |record_opt| {
-                var record = record_opt;
-                defer record.deinit(self.allocator);
+            // Read records with error handling - skip corrupted records
+            while (true) {
+                const record_result = reader.readRecord();
+                const record_opt = record_result catch |err| switch (err) {
+                    // Recoverable errors - skip corrupted record and continue
+                    error.ChecksumMismatch,
+                    error.BufferTooSmall,
+                    error.InvalidRecordType => {
+                        // Already counted in first pass
+                        std.debug.print("Warning: Skipping corrupted record in {s} (pass 2): {}\n", .{ wal_file, err });
+                        break; // Skip rest of this file, move to next
+                    },
+                    // Fatal errors - propagate
+                    else => return err,
+                };
 
-                // Only process records from committed transactions
-                const tx_state = transactions.get(record.tx_id) orelse .active;
-                if (tx_state != .committed) {
-                    continue; // Skip records from uncommitted/aborted transactions
-                }
+                if (record_opt) |rec| {
+                    var record = rec;
+                    defer record.deinit(self.allocator);
 
-                switch (record.record_type) {
-                    .insert_row => {
-                        try self.replayInsert(&record);
-                        applied_operations += 1;
-                    },
-                    .delete_row => {
-                        try self.replayDelete(&record);
-                        applied_operations += 1;
-                    },
-                    .update_row => {
-                        try self.replayUpdate(&record);
-                        applied_operations += 1;
-                    },
-                    .commit_tx => {
-                        recovered_count += 1;
-                    },
-                    else => {}, // begin_tx, rollback_tx, checkpoint - no action needed
+                    // Only process records from committed transactions
+                    const tx_state = transactions.get(record.tx_id) orelse .active;
+                    if (tx_state != .committed) {
+                        continue; // Skip records from uncommitted/aborted transactions
+                    }
+
+                    switch (record.record_type) {
+                        .insert_row => {
+                            try self.replayInsert(&record);
+                            applied_operations += 1;
+                        },
+                        .delete_row => {
+                            try self.replayDelete(&record);
+                            applied_operations += 1;
+                        },
+                        .update_row => {
+                            try self.replayUpdate(&record);
+                            applied_operations += 1;
+                        },
+                        .commit_tx => {
+                            recovered_count += 1;
+                        },
+                        else => {}, // begin_tx, rollback_tx, checkpoint - no action needed
+                    }
+                } else {
+                    // End of file
+                    break;
                 }
             }
         }
 
-        std.debug.print("WAL Recovery complete: {} transactions, {} operations applied\n",
-                       .{ recovered_count, applied_operations });
+        // Report recovery statistics
+        if (corrupted_records > 0) {
+            std.debug.print("WAL Recovery complete: {} transactions, {} operations applied ({} corrupted records skipped)\n",
+                           .{ recovered_count, applied_operations, corrupted_records });
+        } else {
+            std.debug.print("WAL Recovery complete: {} transactions, {} operations applied\n",
+                           .{ recovered_count, applied_operations });
+        }
 
         return recovered_count;
     }
@@ -365,13 +428,13 @@ pub const Database = struct {
     fn replayInsert(self: *Database, record: *const WalRecord) !void {
         // Get or create the table
         const table = self.tables.get(record.table_name) orelse {
-            std.debug.print("Warning: Table '{}' not found during recovery, skipping INSERT\n",
-                           .{std.zig.fmtEscapes(record.table_name)});
+            std.debug.print("Warning: Table '{s}' not found during recovery, skipping INSERT\n",
+                           .{record.table_name});
             return;
         };
 
         // Deserialize the row data
-        const row = try Table.Row.deserialize(record.data, self.allocator);
+        const row = try Row.deserialize(record.data, self.allocator);
 
         // Check if row already exists (idempotency - may have been partially recovered)
         if (table.rows.contains(row.id)) {
@@ -389,8 +452,8 @@ pub const Database = struct {
     fn replayDelete(self: *Database, record: *const WalRecord) !void {
         // Get the table
         const table = self.tables.get(record.table_name) orelse {
-            std.debug.print("Warning: Table '{}' not found during recovery, skipping DELETE\n",
-                           .{std.zig.fmtEscapes(record.table_name)});
+            std.debug.print("Warning: Table '{s}' not found during recovery, skipping DELETE\n",
+                           .{record.table_name});
             return;
         };
 
@@ -405,13 +468,30 @@ pub const Database = struct {
     fn replayUpdate(self: *Database, record: *const WalRecord) !void {
         // Get the table
         const table = self.tables.get(record.table_name) orelse {
-            std.debug.print("Warning: Table '{}' not found during recovery, skipping UPDATE\n",
-                           .{std.zig.fmtEscapes(record.table_name)});
+            std.debug.print("Warning: Table '{s}' not found during recovery, skipping UPDATE\n",
+                           .{record.table_name});
             return;
         };
 
-        // Deserialize the updated row data
-        const updated_row = try Table.Row.deserialize(record.data, self.allocator);
+        // UPDATE record format: [old_size:u64][old_data][new_data]
+        // Extract the new row data from the combined format
+        if (record.data.len < 8) {
+            std.debug.print("Warning: Invalid UPDATE record data (too short), skipping\n", .{});
+            return;
+        }
+
+        const old_size = std.mem.readInt(u64, record.data[0..8], .little);
+        const new_data_start = 8 + old_size;
+
+        if (new_data_start > record.data.len) {
+            std.debug.print("Warning: Invalid UPDATE record data (size mismatch), skipping\n", .{});
+            return;
+        }
+
+        const new_data = record.data[new_data_start..];
+
+        // Deserialize the new row state
+        const updated_row = try Row.deserialize(new_data, self.allocator);
 
         // Remove old row if it exists
         if (table.rows.fetchRemove(record.row_id)) |entry| {
@@ -478,7 +558,7 @@ pub const Database = struct {
                     const value = value_entry.value_ptr.*;
 
                     // Step 5: If this is an embedding column, insert into HNSW
-                    if (value.* == .embedding) {
+                    if (value == .embedding) {
                         const embedding = value.embedding;
 
                         // Insert into HNSW with row_id as external_id
@@ -486,8 +566,8 @@ pub const Database = struct {
                         vectors_indexed += 1;
 
                         if (vectors_indexed % 1000 == 0) {
-                            std.debug.print("HNSW rebuild progress: {} vectors indexed from table '{}'\n",
-                                           .{ vectors_indexed, std.zig.fmtEscapes(table_name) });
+                            std.debug.print("HNSW rebuild progress: {} vectors indexed from table '{s}'\n",
+                                           .{ vectors_indexed, table_name });
                         }
 
                         // Only process first embedding column per row
@@ -654,8 +734,8 @@ pub const Database = struct {
         }
 
         // Phase 1: Update B-tree indexes automatically
-        const row = table.get(row_id).?;
-        try self.index_manager.onInsert(cmd.table_name, row_id, row);
+        const inserted_row = table.get(row_id).?;
+        try self.index_manager.onInsert(cmd.table_name, row_id, inserted_row);
 
         var result = QueryResult.init(self.allocator);
         try result.addColumn("row_id");
@@ -703,44 +783,46 @@ pub const Database = struct {
         } else false;
 
         // Handle ORDER BY SIMILARITY TO "text"
-        if (!use_index and cmd.order_by_similarity) |similarity_text| {
-            if (self.hnsw == null) return sql.SqlError.InvalidSyntax;
+        if (!use_index) {
+            if (cmd.order_by_similarity) |similarity_text| {
+                if (self.hnsw == null) return sql.SqlError.InvalidSyntax;
 
-            // For semantic search, we need to generate an embedding from the text
-            // For now, we'll use a simple hash-based mock embedding
-            const query_embedding = try self.allocator.alloc(f32, 128);
-            defer self.allocator.free(query_embedding);
+                // For semantic search, we need to generate an embedding from the text
+                // For now, we'll use a simple hash-based mock embedding
+                const query_embedding = try self.allocator.alloc(f32, 128);
+                defer self.allocator.free(query_embedding);
 
-            // Simple hash-based embedding (in real use, you'd use an actual embedding model)
-            const hash = std.hash.Wyhash.hash(0, similarity_text);
-            for (query_embedding, 0..) |*val, i| {
-                const seed = hash +% i;
-                val.* = @as(f32, @floatFromInt(seed & 0xFF)) / 255.0;
+                // Simple hash-based embedding (in real use, you'd use an actual embedding model)
+                const hash = std.hash.Wyhash.hash(0, similarity_text);
+                for (query_embedding, 0..) |*val, i| {
+                    const seed = hash +% i;
+                    val.* = @as(f32, @floatFromInt(seed & 0xFF)) / 255.0;
+                }
+
+                const search_results = try self.hnsw.?.search(query_embedding, cmd.limit orelse 10);
+                defer self.allocator.free(search_results);
+
+                row_ids = try self.allocator.alloc(u64, search_results.len);
+                for (search_results, 0..) |res, i| {
+                    row_ids[i] = res.external_id;
+                }
+            } else if (cmd.order_by_vibes) {
+                // Fun parody feature: random order!
+                row_ids = try table.getAllRows(self.allocator);
+                var prng = std.Random.DefaultPrng.init(@intCast(std.time.timestamp()));
+                const random = prng.random();
+
+                // Shuffle
+                for (row_ids, 0..) |_, i| {
+                    const j = random.intRangeLessThan(usize, 0, row_ids.len);
+                    const temp = row_ids[i];
+                    row_ids[i] = row_ids[j];
+                    row_ids[j] = temp;
+                }
+            } else {
+                // Fallback to full table scan (no index available)
+                row_ids = try table.getAllRows(self.allocator);
             }
-
-            const search_results = try self.hnsw.?.search(query_embedding, cmd.limit orelse 10);
-            defer self.allocator.free(search_results);
-
-            row_ids = try self.allocator.alloc(u64, search_results.len);
-            for (search_results, 0..) |res, i| {
-                row_ids[i] = res.external_id;
-            }
-        } else if (!use_index and cmd.order_by_vibes) {
-            // Fun parody feature: random order!
-            row_ids = try table.getAllRows(self.allocator);
-            var prng = std.Random.DefaultPrng.init(@intCast(std.time.timestamp()));
-            const random = prng.random();
-
-            // Shuffle
-            for (row_ids, 0..) |_, i| {
-                const j = random.intRangeLessThan(usize, 0, row_ids.len);
-                const temp = row_ids[i];
-                row_ids[i] = row_ids[j];
-                row_ids[j] = temp;
-            }
-        } else if (!use_index) {
-            // Fallback to full table scan (no index available)
-            row_ids = try table.getAllRows(self.allocator);
         }
 
         defer if (should_free_ids) self.allocator.free(row_ids);
@@ -756,10 +838,12 @@ pub const Database = struct {
             const row = table.get(row_id) orelse continue;
 
             // Apply WHERE filter (skip if we already used an index to filter)
-            if (!use_index and cmd.where_column) |where_col| {
-                if (cmd.where_value) |where_val| {
-                    const row_val = row.get(where_col) orelse continue;
-                    if (!valuesEqual(row_val, where_val)) continue;
+            if (!use_index) {
+                if (cmd.where_column) |where_col| {
+                    if (cmd.where_value) |where_val| {
+                        const row_val = row.get(where_col) orelse continue;
+                        if (!valuesEqual(row_val, where_val)) continue;
+                    }
                 }
             }
 

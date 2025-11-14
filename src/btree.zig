@@ -99,7 +99,7 @@ pub const BTreeNode = struct {
         var i: usize = 0;
         while (i < self.keys.items.len) : (i += 1) {
             const cmp = compareColumnValues(key, self.keys.items[i]);
-            if (cmp == .less) {
+            if (cmp == .lt) {
                 return i;
             }
         }
@@ -111,7 +111,7 @@ pub const BTreeNode = struct {
         var i: usize = 0;
         while (i < self.keys.items.len) : (i += 1) {
             const cmp = compareColumnValues(key, self.keys.items[i]);
-            if (cmp == .less) {
+            if (cmp == .lt) {
                 return i;
             }
         }
@@ -195,7 +195,7 @@ pub const BTree = struct {
 
                 // After split, determine which child to use
                 const cmp = compareColumnValues(key, node.keys.items[child_idx]);
-                const new_child_idx = if (cmp == .greater) child_idx + 1 else child_idx;
+                const new_child_idx = if (cmp == .gt) child_idx + 1 else child_idx;
                 const new_child = node.children.items[new_child_idx].?;
                 try self.insertNonFull(new_child, key, row_id);
             } else {
@@ -273,7 +273,7 @@ pub const BTree = struct {
         while (i < node.keys.items.len) : (i += 1) {
             const cmp = compareColumnValues(key, node.keys.items[i]);
 
-            if (cmp == .equal) {
+            if (cmp == .eq) {
                 // Found exact match
                 if (node.is_leaf) {
                     try results.append(node.values.items[i]);
@@ -282,13 +282,13 @@ pub const BTree = struct {
                 i += 1;
                 while (i < node.keys.items.len) : (i += 1) {
                     const cmp2 = compareColumnValues(key, node.keys.items[i]);
-                    if (cmp2 != .equal) break;
+                    if (cmp2 != .eq) break;
                     if (node.is_leaf) {
                         try results.append(node.values.items[i]);
                     }
                 }
                 return;
-            } else if (cmp == .less) {
+            } else if (cmp == .lt) {
                 // Key is less than current, search left child
                 if (!node.is_leaf) {
                     try self.searchInNode(node.children.items[i].?, key, results);
@@ -335,21 +335,21 @@ pub const BTree = struct {
             const cmp_max = compareColumnValues(key, max_key);
 
             // Search left child if key >= min_key
-            if (!node.is_leaf and (cmp_min == .greater or cmp_min == .equal)) {
+            if (!node.is_leaf and (cmp_min == .gt or cmp_min == .eq)) {
                 if (i < node.children.items.len) {
                     try self.findRangeInNode(node.children.items[i].?, min_key, max_key, results);
                 }
             }
 
             // Add this key if in range
-            if ((cmp_min == .greater or cmp_min == .equal) and (cmp_max == .less or cmp_max == .equal)) {
+            if ((cmp_min == .gt or cmp_min == .eq) and (cmp_max == .lt or cmp_max == .eq)) {
                 if (node.is_leaf) {
                     try results.append(node.values.items[i]);
                 }
             }
 
             // Stop if we've passed max_key
-            if (cmp_max == .greater) {
+            if (cmp_max == .gt) {
                 return;
             }
         }
@@ -391,20 +391,19 @@ pub const BTree = struct {
     /// Delete from a specific node (simplified version for now)
     /// TODO: Implement full B-tree deletion with rebalancing
     fn deleteFromNode(self: *BTree, node: *BTreeNode, key: ColumnValue, row_id: u64) !bool {
-        _ = self;
 
         // Find the key in this node
         var i: usize = 0;
         while (i < node.keys.items.len) : (i += 1) {
             const cmp = compareColumnValues(key, node.keys.items[i]);
 
-            if (cmp == .equal and node.is_leaf and node.values.items[i] == row_id) {
+            if (cmp == .eq and node.is_leaf and node.values.items[i] == row_id) {
                 // Found it - remove key and value
                 var removed_key = node.keys.orderedRemove(i);
                 removed_key.deinit(node.allocator);
                 _ = node.values.orderedRemove(i);
                 return true;
-            } else if (cmp == .less) {
+            } else if (cmp == .lt) {
                 // Key would be in left child
                 if (!node.is_leaf and i < node.children.items.len) {
                     return try self.deleteFromNode(node.children.items[i].?, key, row_id);
@@ -432,9 +431,9 @@ pub const BTree = struct {
 /// Returns .less, .equal, or .greater
 fn compareColumnValues(a: ColumnValue, b: ColumnValue) std.math.Order {
     // Handle NULL values
-    if (a == .null_value and b == .null_value) return .equal;
-    if (a == .null_value) return .less;
-    if (b == .null_value) return .greater;
+    if (a == .null_value and b == .null_value) return .eq;
+    if (a == .null_value) return .lt;
+    if (b == .null_value) return .gt;
 
     // Different types - use type ordering
     const type_order_a = getTypeOrder(a);
@@ -448,13 +447,13 @@ fn compareColumnValues(a: ColumnValue, b: ColumnValue) std.math.Order {
         .null_value => unreachable,
         .int => |a_val| std.math.order(a_val, b.int),
         .float => |a_val| {
-            if (a_val < b.float) return .less;
-            if (a_val > b.float) return .greater;
-            return .equal;
+            if (a_val < b.float) return .lt;
+            if (a_val > b.float) return .gt;
+            return .eq;
         },
         .bool => |a_val| std.math.order(@intFromBool(a_val), @intFromBool(b.bool)),
         .text => |a_val| std.mem.order(u8, a_val, b.text),
-        .embedding => .equal, // Embeddings not comparable for ordering
+        .embedding => .eq, // Embeddings not comparable for ordering
     };
 }
 

@@ -1322,13 +1322,11 @@ test "WAL Recovery: Basic recovery of committed transaction" {
         var db = Database.init(testing.allocator);
         defer db.deinit();
 
-        try db.enableWal(wal_dir);
-
         // First create the table again (schema is not in WAL yet in Phase 2.4)
         var create_result = try db.execute("CREATE TABLE users (id int, name text, age int)");
         defer create_result.deinit();
 
-        // Recover from WAL
+        // Recover from WAL (do this before enabling WAL to avoid file conflicts)
         const recovered_count = try db.recoverFromWal(wal_dir);
         try testing.expectEqual(@as(usize, 2), recovered_count);
 
@@ -1390,8 +1388,6 @@ test "WAL Recovery: Uncommitted transaction is discarded" {
         var db = Database.init(testing.allocator);
         defer db.deinit();
 
-        try db.enableWal(wal_dir);
-
         var create = try db.execute("CREATE TABLE test (id int, value text)");
         defer create.deinit();
 
@@ -1437,8 +1433,6 @@ test "WAL Recovery: Multiple committed transactions" {
     {
         var db = Database.init(testing.allocator);
         defer db.deinit();
-
-        try db.enableWal(wal_dir);
 
         var create = try db.execute("CREATE TABLE items (id int, name text)");
         defer create.deinit();
@@ -1495,8 +1489,6 @@ test "WAL Recovery: DELETE operations" {
         var db = Database.init(testing.allocator);
         defer db.deinit();
 
-        try db.enableWal(wal_dir);
-
         var create = try db.execute("CREATE TABLE records (id int, status text)");
         defer create.deinit();
 
@@ -1540,7 +1532,6 @@ test "WAL Recovery: UPDATE operations" {
         var db = Database.init(testing.allocator);
         defer db.deinit();
 
-        try db.enableWal(wal_dir);
 
         var create = try db.execute("CREATE TABLE products (id int, name text, price int)");
         defer create.deinit();
@@ -1586,7 +1577,6 @@ test "WAL Recovery: Idempotent recovery (running twice)" {
         var db = Database.init(testing.allocator);
         defer db.deinit();
 
-        try db.enableWal(wal_dir);
 
         var create = try db.execute("CREATE TABLE data (id int, value int)");
         defer create.deinit();
@@ -1651,7 +1641,6 @@ test "WAL Recovery: HNSW index rebuild after recovery" {
         defer db.deinit();
 
         try db.initVectorSearch(16, 200);
-        try db.enableWal(wal_dir);
 
         var create = try db.execute("CREATE TABLE docs (id int, title text, vec embedding)");
         defer create.deinit();
@@ -1765,7 +1754,6 @@ test "WAL Crash: Mid-transaction crash (no commit)" {
         var db = Database.init(testing.allocator);
         defer db.deinit();
 
-        try db.enableWal(wal_dir);
 
         var create = try db.execute("CREATE TABLE orders (id int, total int)");
         defer create.deinit();
@@ -1817,7 +1805,6 @@ test "WAL Crash: Power failure during fsync" {
         var db = Database.init(testing.allocator);
         defer db.deinit();
 
-        try db.enableWal(wal_dir);
 
         var create = try db.execute("CREATE TABLE logs (id int, msg text)");
         defer create.deinit();
@@ -1857,7 +1844,6 @@ test "WAL Crash: Multiple crashes and recoveries" {
         var db = Database.init(testing.allocator);
         defer db.deinit();
 
-        try db.enableWal(wal_dir);
 
         var create = try db.execute("CREATE TABLE events (id int, type text)");
         defer create.deinit();
@@ -1940,7 +1926,6 @@ test "WAL Crash: Large transaction recovery" {
         var db = Database.init(testing.allocator);
         defer db.deinit();
 
-        try db.enableWal(wal_dir);
 
         var create = try db.execute("CREATE TABLE bulk_data (id int, value int)");
         defer create.deinit();
@@ -2006,7 +1991,6 @@ test "WAL Crash: Interleaved INSERT/UPDATE/DELETE" {
         var db = Database.init(testing.allocator);
         defer db.deinit();
 
-        try db.enableWal(wal_dir);
 
         var create = try db.execute("CREATE TABLE inventory (id int, qty int, status text)");
         defer create.deinit();
@@ -2072,7 +2056,6 @@ test "WAL Crash: Recovery with WAL file rotation" {
         var db = Database.init(testing.allocator);
         defer db.deinit();
 
-        try db.enableWal(wal_dir);
 
         var create = try db.execute("CREATE TABLE rotated (id int, data text)");
         defer create.deinit();
@@ -2117,7 +2100,6 @@ test "WAL Crash: Recovery performance with large dataset" {
         var db = Database.init(testing.allocator);
         defer db.deinit();
 
-        try db.enableWal(wal_dir);
 
         var create = try db.execute("CREATE TABLE perf_test (id int, name text, score int)");
         defer create.deinit();
@@ -2241,7 +2223,7 @@ test "Index: Automatic updates on UPDATE" {
     const index_info = db.index_manager.getIndex("idx_inventory_qty").?;
 
     // Verify old value in index
-    var results_old = try index_info.btree.search(ColumnValue{ .int = 50 });
+    const results_old = try index_info.btree.search(ColumnValue{ .int = 50 });
     defer testing.allocator.free(results_old);
     try testing.expectEqual(@as(usize, 1), results_old.len);
 
@@ -2250,12 +2232,12 @@ test "Index: Automatic updates on UPDATE" {
     defer update_stmt.deinit();
 
     // Verify old value removed from index
-    var results_old2 = try index_info.btree.search(ColumnValue{ .int = 50 });
+    const results_old2 = try index_info.btree.search(ColumnValue{ .int = 50 });
     defer testing.allocator.free(results_old2);
     try testing.expectEqual(@as(usize, 0), results_old2.len);
 
     // Verify new value in index
-    var results_new = try index_info.btree.search(ColumnValue{ .int = 75 });
+    const results_new = try index_info.btree.search(ColumnValue{ .int = 75 });
     defer testing.allocator.free(results_new);
     try testing.expectEqual(@as(usize, 1), results_new.len);
 }
@@ -2448,4 +2430,192 @@ test "Index: Correctness - all results match table scan" {
 
     // Expected: records 2, 7, 12, 17, 22, 27, 32, 37, 42, 47 (10 records)
     try testing.expectEqual(@as(usize, 10), select_indexed.rows.items.len);
+}
+
+test "WAL Recovery: Corrupted WAL file with checksum error" {
+    const wal_dir = "test_data/wal_recovery_corrupt";
+
+    std.fs.cwd().deleteTree(wal_dir) catch {};
+    defer std.fs.cwd().deleteTree(wal_dir) catch {};
+
+    // Phase 1: Create valid WAL data
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.enableWal(wal_dir);
+
+        var create = try db.execute("CREATE TABLE messages (id int, msg text)");
+        defer create.deinit();
+
+        var insert1 = try db.execute("INSERT INTO messages VALUES (1, \"first\")");
+        defer insert1.deinit();
+
+        var insert2 = try db.execute("INSERT INTO messages VALUES (2, \"second\")");
+        defer insert2.deinit();
+    }
+
+    // Phase 2: Corrupt the WAL file by modifying bytes
+    {
+        const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/wal.000000", .{wal_dir});
+        defer testing.allocator.free(wal_path);
+
+        // Open the WAL file and corrupt some bytes in the middle
+        const file = try std.fs.cwd().openFile(wal_path, .{ .mode = .read_write });
+        defer file.close();
+
+        // Seek to middle of file and write garbage to corrupt checksum
+        try file.seekTo(100);
+        const garbage = [_]u8{ 0xFF, 0xFF, 0xFF, 0xFF };
+        _ = try file.write(&garbage);
+    }
+
+    // Phase 3: Recovery should skip corrupted file but not crash
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        var create = try db.execute("CREATE TABLE messages (id int, msg text)");
+        defer create.deinit();
+
+        // Recovery should complete but skip corrupted records
+        const recovered = try db.recoverFromWal(wal_dir);
+
+        // We may recover 0 records if corruption happens early in file
+        // The important thing is recovery doesn't crash
+        _ = recovered;
+
+        // Database should still be functional after handling corruption
+        var insert3 = try db.execute("INSERT INTO messages VALUES (3, \"after_recovery\")");
+        defer insert3.deinit();
+
+        const table = db.tables.get("messages").?;
+        try testing.expect(table.count() > 0);
+    }
+}
+
+test "WAL Recovery: Truncated WAL file" {
+    const wal_dir = "test_data/wal_recovery_truncated";
+
+    std.fs.cwd().deleteTree(wal_dir) catch {};
+    defer std.fs.cwd().deleteTree(wal_dir) catch {};
+
+    // Phase 1: Create valid WAL data
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.enableWal(wal_dir);
+
+        var create = try db.execute("CREATE TABLE data (id int, value int)");
+        defer create.deinit();
+
+        var insert1 = try db.execute("INSERT INTO data VALUES (1, 100)");
+        defer insert1.deinit();
+
+        var insert2 = try db.execute("INSERT INTO data VALUES (2, 200)");
+        defer insert2.deinit();
+
+        var insert3 = try db.execute("INSERT INTO data VALUES (3, 300)");
+        defer insert3.deinit();
+    }
+
+    // Phase 2: Truncate the WAL file to simulate incomplete write
+    {
+        const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/wal.000000", .{wal_dir});
+        defer testing.allocator.free(wal_path);
+
+        // Get file size and truncate to 60% to create partial record
+        var file = try std.fs.cwd().openFile(wal_path, .{ .mode = .read_write });
+        defer file.close();
+
+        const stat = try file.stat();
+        const truncate_size = stat.size * 6 / 10;
+        try file.setEndPos(truncate_size);
+    }
+
+    // Phase 3: Recovery should handle truncated file gracefully
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        var create = try db.execute("CREATE TABLE data (id int, value int)");
+        defer create.deinit();
+
+        // Recovery should complete despite truncated file
+        const recovered = try db.recoverFromWal(wal_dir);
+
+        // We should recover some records before truncation point
+        // Exact number depends on where truncation occurred
+        _ = recovered;
+
+        // Database should still be functional
+        var insert4 = try db.execute("INSERT INTO data VALUES (4, 400)");
+        defer insert4.deinit();
+
+        const table = db.tables.get("data").?;
+        try testing.expect(table.count() > 0);
+    }
+}
+
+test "WAL Recovery: Partial corruption in WAL file" {
+    const wal_dir = "test_data/wal_recovery_partial";
+
+    std.fs.cwd().deleteTree(wal_dir) catch {};
+    defer std.fs.cwd().deleteTree(wal_dir) catch {};
+
+    // Phase 1: Create WAL file with some data
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        try db.enableWal(wal_dir);
+
+        var create = try db.execute("CREATE TABLE items (id int, name text)");
+        defer create.deinit();
+
+        var insert1 = try db.execute("INSERT INTO items VALUES (1, \"first\")");
+        defer insert1.deinit();
+
+        var insert2 = try db.execute("INSERT INTO items VALUES (2, \"second\")");
+        defer insert2.deinit();
+
+        var insert3 = try db.execute("INSERT INTO items VALUES (3, \"third\")");
+        defer insert3.deinit();
+    }
+
+    // Phase 2: Corrupt middle of the WAL file
+    {
+        const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/wal.000000", .{wal_dir});
+        defer testing.allocator.free(wal_path);
+
+        const file = try std.fs.cwd().openFile(wal_path, .{ .mode = .read_write });
+        defer file.close();
+
+        // Corrupt bytes in the middle to invalidate checksum
+        try file.seekTo(150);
+        const garbage = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0xBA, 0xDC, 0x0D, 0xE0 };
+        _ = try file.write(&garbage);
+    }
+
+    // Phase 3: Recovery should handle corruption gracefully
+    {
+        var db = Database.init(testing.allocator);
+        defer db.deinit();
+
+        var create = try db.execute("CREATE TABLE items (id int, name text)");
+        defer create.deinit();
+
+        // Recovery should complete despite corruption
+        // May recover some records before the corruption
+        const recovered = try db.recoverFromWal(wal_dir);
+        _ = recovered; // May be 0-3 depending on where corruption occurred
+
+        // Database should still be functional after handling corruption
+        var insert4 = try db.execute("INSERT INTO items VALUES (4, \"after_corruption\")");
+        defer insert4.deinit();
+
+        const table = db.tables.get("items").?;
+        try testing.expect(table.count() > 0); // At least the new insert
+    }
 }

@@ -5,6 +5,7 @@ const ArrayList = std.array_list.Managed;
 const BTree = @import("btree.zig").BTree;
 const ColumnValue = @import("table.zig").ColumnValue;
 const Table = @import("table.zig").Table;
+const Row = @import("table.zig").Row;
 
 /// Index metadata
 pub const IndexInfo = struct {
@@ -115,8 +116,8 @@ pub const IndexManager = struct {
         // Build index from existing table data
         try self.buildIndexFromTable(info, table);
 
-        // Store index
-        try self.indexes.put(index_name, info);
+        // Store index (use owned copy of name from info, not the parameter)
+        try self.indexes.put(info.name, info);
     }
 
     /// Build index by scanning table data
@@ -193,7 +194,7 @@ pub const IndexManager = struct {
         self: *IndexManager,
         table_name: []const u8,
         row_id: u64,
-        row: *const Table.Row,
+        row: *const Row,
     ) !void {
         var it = self.indexes.iterator();
         while (it.next()) |entry| {
@@ -216,7 +217,7 @@ pub const IndexManager = struct {
         self: *IndexManager,
         table_name: []const u8,
         row_id: u64,
-        row: *const Table.Row,
+        row: *const Row,
     ) !void {
         var it = self.indexes.iterator();
         while (it.next()) |entry| {
@@ -239,8 +240,8 @@ pub const IndexManager = struct {
         self: *IndexManager,
         table_name: []const u8,
         row_id: u64,
-        old_row: *const Table.Row,
-        new_row: *const Table.Row,
+        old_row: *const Row,
+        new_row: *const Row,
     ) !void {
         var it = self.indexes.iterator();
         while (it.next()) |entry| {
@@ -312,7 +313,7 @@ pub const IndexManager = struct {
 const testing = std.testing;
 
 test "IndexManager: create and drop index" {
-    var allocator = testing.allocator;
+    const allocator = testing.allocator;
     var mgr = IndexManager.init(allocator);
     defer mgr.deinit();
 
@@ -342,7 +343,7 @@ test "IndexManager: create and drop index" {
 }
 
 test "IndexManager: create index from existing data" {
-    var allocator = testing.allocator;
+    const allocator = testing.allocator;
     var mgr = IndexManager.init(allocator);
     defer mgr.deinit();
 
@@ -374,7 +375,7 @@ test "IndexManager: create index from existing data" {
 }
 
 test "IndexManager: automatic index updates on insert" {
-    var allocator = testing.allocator;
+    const allocator = testing.allocator;
     var mgr = IndexManager.init(allocator);
     defer mgr.deinit();
 
@@ -405,7 +406,7 @@ test "IndexManager: automatic index updates on insert" {
 }
 
 test "IndexManager: automatic index updates on delete" {
-    var allocator = testing.allocator;
+    const allocator = testing.allocator;
     var mgr = IndexManager.init(allocator);
     defer mgr.deinit();
 
@@ -425,7 +426,7 @@ test "IndexManager: automatic index updates on delete" {
     // Delete row and update index
     const row = table.get(row_id).?;
     try mgr.onDelete("users", row_id, row);
-    _ = try table.delete(row_id);
+    _ = table.delete(row_id);
 
     // Query index - should be empty
     const results = try mgr.query("idx_users_id", ColumnValue{ .int = 42 });
@@ -435,7 +436,7 @@ test "IndexManager: automatic index updates on delete" {
 }
 
 test "IndexManager: find indexes for table" {
-    var allocator = testing.allocator;
+    const allocator = testing.allocator;
     var mgr = IndexManager.init(allocator);
     defer mgr.deinit();
 
@@ -457,7 +458,7 @@ test "IndexManager: find indexes for table" {
 }
 
 test "IndexManager: find index for column" {
-    var allocator = testing.allocator;
+    const allocator = testing.allocator;
     var mgr = IndexManager.init(allocator);
     defer mgr.deinit();
 

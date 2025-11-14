@@ -151,7 +151,7 @@ pub const Row = struct {
         result.value_ptr.* = owned_value;
     }
 
-    pub fn get(self: *Row, column: []const u8) ?ColumnValue {
+    pub fn get(self: *const Row, column: []const u8) ?ColumnValue {
         return self.values.get(column);
     }
 
