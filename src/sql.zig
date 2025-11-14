@@ -27,6 +27,8 @@ pub const SqlError = error{
 /// SQL command types
 pub const SqlCommand = union(enum) {
     create_table: CreateTableCmd,
+    create_index: CreateIndexCmd,
+    drop_index: DropIndexCmd,
     insert: InsertCmd,
     select: SelectCmd,
     delete: DeleteCmd,
@@ -35,6 +37,8 @@ pub const SqlCommand = union(enum) {
     pub fn deinit(self: *SqlCommand, allocator: Allocator) void {
         switch (self.*) {
             .create_table => |*cmd| cmd.deinit(allocator),
+            .create_index => |*cmd| cmd.deinit(allocator),
+            .drop_index => |*cmd| cmd.deinit(allocator),
             .insert => |*cmd| cmd.deinit(allocator),
             .select => |*cmd| cmd.deinit(allocator),
             .delete => |*cmd| cmd.deinit(allocator),
@@ -60,6 +64,28 @@ pub const CreateTableCmd = struct {
 pub const ColumnDef = struct {
     name: []const u8,
     col_type: ColumnType,
+};
+
+/// CREATE INDEX command
+pub const CreateIndexCmd = struct {
+    index_name: []const u8,
+    table_name: []const u8,
+    column_name: []const u8,
+
+    pub fn deinit(self: *CreateIndexCmd, allocator: Allocator) void {
+        allocator.free(self.index_name);
+        allocator.free(self.table_name);
+        allocator.free(self.column_name);
+    }
+};
+
+/// DROP INDEX command
+pub const DropIndexCmd = struct {
+    index_name: []const u8,
+
+    pub fn deinit(self: *DropIndexCmd, allocator: Allocator) void {
+        allocator.free(self.index_name);
+    }
 };
 
 /// INSERT command
@@ -322,7 +348,21 @@ pub fn parse(allocator: Allocator, sql: []const u8) !SqlCommand {
     const first = tokens.items[0].text;
 
     if (eqlIgnoreCase(first, "CREATE")) {
-        return SqlCommand{ .create_table = try parseCreateTable(allocator, tokens.items) };
+        // Distinguish between CREATE TABLE and CREATE INDEX
+        if (tokens.items.len < 2) return SqlError.InvalidSyntax;
+        if (eqlIgnoreCase(tokens.items[1].text, "TABLE")) {
+            return SqlCommand{ .create_table = try parseCreateTable(allocator, tokens.items) };
+        } else if (eqlIgnoreCase(tokens.items[1].text, "INDEX")) {
+            return SqlCommand{ .create_index = try parseCreateIndex(allocator, tokens.items) };
+        }
+        return SqlError.InvalidSyntax;
+    } else if (eqlIgnoreCase(first, "DROP")) {
+        // DROP INDEX
+        if (tokens.items.len < 2) return SqlError.InvalidSyntax;
+        if (eqlIgnoreCase(tokens.items[1].text, "INDEX")) {
+            return SqlCommand{ .drop_index = try parseDropIndex(allocator, tokens.items) };
+        }
+        return SqlError.InvalidSyntax;
     } else if (eqlIgnoreCase(first, "INSERT")) {
         return SqlCommand{ .insert = try parseInsert(allocator, tokens.items) };
     } else if (eqlIgnoreCase(first, "SELECT")) {
@@ -365,6 +405,49 @@ fn parseCreateTable(allocator: Allocator, tokens: []const Token) !CreateTableCmd
     return CreateTableCmd{
         .table_name = table_name,
         .columns = columns,
+    };
+}
+
+fn parseCreateIndex(allocator: Allocator, tokens: []const Token) !CreateIndexCmd {
+    // CREATE INDEX idx_name ON table_name(column_name)
+    if (tokens.len < 6) return SqlError.InvalidSyntax;
+    if (!eqlIgnoreCase(tokens[1].text, "INDEX")) return SqlError.InvalidSyntax;
+
+    const index_name = try allocator.dupe(u8, tokens[2].text);
+    errdefer allocator.free(index_name);
+
+    if (!eqlIgnoreCase(tokens[3].text, "ON")) return SqlError.InvalidSyntax;
+
+    const table_name = try allocator.dupe(u8, tokens[4].text);
+    errdefer allocator.free(table_name);
+
+    // Parse column name - may be with parentheses: (column_name)
+    var column_name: []const u8 = undefined;
+    if (std.mem.eql(u8, tokens[5].text, "(")) {
+        // Format: ON table (column)
+        if (tokens.len < 7) return SqlError.InvalidSyntax;
+        column_name = try allocator.dupe(u8, tokens[6].text);
+    } else {
+        // Format: ON table column (no parentheses)
+        column_name = try allocator.dupe(u8, tokens[5].text);
+    }
+
+    return CreateIndexCmd{
+        .index_name = index_name,
+        .table_name = table_name,
+        .column_name = column_name,
+    };
+}
+
+fn parseDropIndex(allocator: Allocator, tokens: []const Token) !DropIndexCmd {
+    // DROP INDEX idx_name
+    if (tokens.len < 3) return SqlError.InvalidSyntax;
+    if (!eqlIgnoreCase(tokens[1].text, "INDEX")) return SqlError.InvalidSyntax;
+
+    const index_name = try allocator.dupe(u8, tokens[2].text);
+
+    return DropIndexCmd{
+        .index_name = index_name,
     };
 }
 

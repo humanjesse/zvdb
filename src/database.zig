@@ -13,6 +13,7 @@ const wal = @import("wal.zig");
 const WalWriter = wal.WalWriter;
 const WalRecord = wal.WalRecord;
 const WalRecordType = wal.WalRecordType;
+const IndexManager = @import("index_manager.zig").IndexManager;
 
 /// Query result set
 pub const QueryResult = struct {
@@ -86,6 +87,7 @@ pub const QueryResult = struct {
 pub const Database = struct {
     tables: StringHashMap(*Table),
     hnsw: ?*HNSW(f32), // Optional vector index
+    index_manager: IndexManager, // B-tree indexes for fast queries
     allocator: Allocator,
     data_dir: ?[]const u8, // Data directory for persistence (owned)
     auto_save: bool, // Auto-save on deinit
@@ -96,6 +98,7 @@ pub const Database = struct {
         return Database{
             .tables = StringHashMap(*Table).init(allocator),
             .hnsw = null,
+            .index_manager = IndexManager.init(allocator),
             .allocator = allocator,
             .data_dir = null,
             .auto_save = false,
@@ -130,6 +133,9 @@ pub const Database = struct {
             h.deinit();
             self.allocator.destroy(h);
         }
+
+        // Clean up indexes
+        self.index_manager.deinit();
 
         if (self.data_dir) |dir| {
             self.allocator.free(dir);
@@ -505,6 +511,8 @@ pub const Database = struct {
 
         return switch (cmd) {
             .create_table => |create| try self.executeCreateTable(create),
+            .create_index => |create_idx| try self.executeCreateIndex(create_idx),
+            .drop_index => |drop_idx| try self.executeDropIndex(drop_idx),
             .insert => |insert| try self.executeInsert(insert),
             .select => |select| try self.executeSelect(select),
             .delete => |delete| try self.executeDelete(delete),
@@ -527,6 +535,50 @@ pub const Database = struct {
         try result.addColumn("status");
         var row = ArrayList(ColumnValue).init(self.allocator);
         const msg = try std.fmt.allocPrint(self.allocator, "Table '{s}' created", .{cmd.table_name});
+        try row.append(ColumnValue{ .text = msg });
+        try result.addRow(row);
+
+        return result;
+    }
+
+    fn executeCreateIndex(self: *Database, cmd: sql.CreateIndexCmd) !QueryResult {
+        // Get the table
+        const table = self.tables.get(cmd.table_name) orelse return sql.SqlError.TableNotFound;
+
+        // Create the index
+        try self.index_manager.createIndex(
+            cmd.index_name,
+            cmd.table_name,
+            cmd.column_name,
+            table,
+        );
+
+        var result = QueryResult.init(self.allocator);
+        try result.addColumn("status");
+        var row = ArrayList(ColumnValue).init(self.allocator);
+        const msg = try std.fmt.allocPrint(
+            self.allocator,
+            "Index '{s}' created on {s}({s})",
+            .{ cmd.index_name, cmd.table_name, cmd.column_name },
+        );
+        try row.append(ColumnValue{ .text = msg });
+        try result.addRow(row);
+
+        return result;
+    }
+
+    fn executeDropIndex(self: *Database, cmd: sql.DropIndexCmd) !QueryResult {
+        // Drop the index
+        try self.index_manager.dropIndex(cmd.index_name);
+
+        var result = QueryResult.init(self.allocator);
+        try result.addColumn("status");
+        var row = ArrayList(ColumnValue).init(self.allocator);
+        const msg = try std.fmt.allocPrint(
+            self.allocator,
+            "Index '{s}' dropped",
+            .{cmd.index_name},
+        );
         try row.append(ColumnValue{ .text = msg });
         try result.addRow(row);
 
