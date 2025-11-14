@@ -5,6 +5,7 @@ const AutoHashMap = std.AutoHashMap;
 const StringHashMap = std.StringHashMap;
 const Order = std.math.Order;
 const Mutex = std.Thread.Mutex;
+const utils = @import("utils.zig");
 
 /// Metadata value types for flexible node attributes
 pub const MetadataValue = union(enum) {
@@ -775,20 +776,6 @@ pub fn HNSW(comptime T: type) type {
             return result.toOwnedSlice();
         }
 
-        // Helper to write integers for persistence
-        fn writeIntToFile(file: std.fs.File, comptime IntType: type, value: IntType) !void {
-            var bytes: [@sizeOf(IntType)]u8 = undefined;
-            std.mem.writeInt(IntType, &bytes, value, .little);
-            try file.writeAll(&bytes);
-        }
-
-        // Helper to read integers for persistence
-        fn readIntFromFile(file: std.fs.File, comptime IntType: type) !IntType {
-            var bytes: [@sizeOf(IntType)]u8 = undefined;
-            const n = try file.readAll(&bytes);
-            if (n != @sizeOf(IntType)) return error.UnexpectedEOF;
-            return std.mem.readInt(IntType, &bytes, .little);
-        }
 
         /// Save the index to a file
         pub fn save(self: *Self, path: []const u8) !void {
@@ -806,25 +793,25 @@ pub fn HNSW(comptime T: type) type {
             // Write header
             const magic: u32 = 0x48_4E_53_57; // "HNSW"
             const version: u32 = 2; // Bumped to v2 for metadata/edge support
-            try writeIntToFile(file, u32, magic);
-            try writeIntToFile(file, u32, version);
+            try utils.writeInt(file, u32, magic);
+            try utils.writeInt(file, u32, version);
 
             // Write configuration
-            try writeIntToFile(file, u64, self.m);
-            try writeIntToFile(file, u64, self.ef_construction);
-            try writeIntToFile(file, u64, self.max_level);
-            try writeIntToFile(file, u64, self.next_external_id);
+            try utils.writeInt(file, u64, self.m);
+            try utils.writeInt(file, u64, self.ef_construction);
+            try utils.writeInt(file, u64, self.max_level);
+            try utils.writeInt(file, u64, self.next_external_id);
 
             // Write entry point
             const has_entry = self.entry_point != null;
-            try writeIntToFile(file, u8, if (has_entry) 1 else 0);
+            try utils.writeInt(file, u8, if (has_entry) 1 else 0);
             if (has_entry) {
-                try writeIntToFile(file, u64, self.entry_point.?);
+                try utils.writeInt(file, u64, self.entry_point.?);
             }
 
             // Write node count
             const node_count = self.nodes.count();
-            try writeIntToFile(file, u64, node_count);
+            try utils.writeInt(file, u64, node_count);
 
             if (node_count == 0) return;
 
@@ -832,7 +819,7 @@ pub fn HNSW(comptime T: type) type {
             var it = self.nodes.iterator();
             const first_node = it.next().?.value_ptr;
             const dim = first_node.point.len;
-            try writeIntToFile(file, u64, dim);
+            try utils.writeInt(file, u64, dim);
 
             // Write all nodes
             it = self.nodes.iterator();
@@ -842,12 +829,12 @@ pub fn HNSW(comptime T: type) type {
                 const external_id = self.internal_to_external.get(internal_id) orelse return error.MissingExternalId;
 
                 // Write IDs
-                try writeIntToFile(file, u64, internal_id);
-                try writeIntToFile(file, u64, external_id);
+                try utils.writeInt(file, u64, internal_id);
+                try utils.writeInt(file, u64, external_id);
 
                 // Write level (number of connection layers - 1)
                 const level = node.connections.len - 1;
-                try writeIntToFile(file, u64, level);
+                try utils.writeInt(file, u64, level);
 
                 // Write point data
                 for (node.point) |val| {
@@ -857,37 +844,37 @@ pub fn HNSW(comptime T: type) type {
                 // Write connections for each layer
                 for (node.connections) |conn_list| {
                     const conn_count = conn_list.items.len;
-                    try writeIntToFile(file, u64, conn_count);
+                    try utils.writeInt(file, u64, conn_count);
                     for (conn_list.items) |conn_id| {
-                        try writeIntToFile(file, u64, conn_id);
+                        try utils.writeInt(file, u64, conn_id);
                     }
                 }
 
                 // Write metadata (v2 feature)
                 const has_metadata = node.metadata != null;
-                try writeIntToFile(file, u8, if (has_metadata) 1 else 0);
+                try utils.writeInt(file, u8, if (has_metadata) 1 else 0);
                 if (has_metadata) {
                     const meta = node.metadata.?;
 
                     // Write node_type
-                    try writeIntToFile(file, u64, meta.node_type.len);
+                    try utils.writeInt(file, u64, meta.node_type.len);
                     try file.writeAll(meta.node_type);
 
                     // Write content_ref
                     const has_content_ref = meta.content_ref != null;
-                    try writeIntToFile(file, u8, if (has_content_ref) 1 else 0);
+                    try utils.writeInt(file, u8, if (has_content_ref) 1 else 0);
                     if (has_content_ref) {
                         const ref = meta.content_ref.?;
-                        try writeIntToFile(file, u64, ref.len);
+                        try utils.writeInt(file, u64, ref.len);
                         try file.writeAll(ref);
                     }
 
                     // Write timestamp
-                    try writeIntToFile(file, i64, meta.timestamp);
+                    try utils.writeInt(file, i64, meta.timestamp);
 
                     // Write attributes count
                     const attr_count = meta.attributes.count();
-                    try writeIntToFile(file, u64, attr_count);
+                    try utils.writeInt(file, u64, attr_count);
 
                     // Write each attribute
                     var attr_it = meta.attributes.iterator();
@@ -896,20 +883,20 @@ pub fn HNSW(comptime T: type) type {
                         const value = attr_entry.value_ptr.*;
 
                         // Write key
-                        try writeIntToFile(file, u64, key.len);
+                        try utils.writeInt(file, u64, key.len);
                         try file.writeAll(key);
 
                         // Write value type and data
                         const value_tag = @intFromEnum(value);
-                        try writeIntToFile(file, u8, value_tag);
+                        try utils.writeInt(file, u8, value_tag);
                         switch (value) {
                             .string => |s| {
-                                try writeIntToFile(file, u64, s.len);
+                                try utils.writeInt(file, u64, s.len);
                                 try file.writeAll(s);
                             },
-                            .int => |i| try writeIntToFile(file, i64, i),
+                            .int => |i| try utils.writeInt(file, i64, i),
                             .float => |f| try file.writeAll(std.mem.asBytes(&f)),
-                            .bool => |b| try writeIntToFile(file, u8, if (b) 1 else 0),
+                            .bool => |b| try utils.writeInt(file, u8, if (b) 1 else 0),
                         }
                     }
                 }
@@ -917,15 +904,15 @@ pub fn HNSW(comptime T: type) type {
 
             // Write edges (v2 feature)
             const edge_count = self.edges.count();
-            try writeIntToFile(file, u64, edge_count);
+            try utils.writeInt(file, u64, edge_count);
 
             var edge_it = self.edges.iterator();
             while (edge_it.next()) |entry| {
                 const edge = entry.value_ptr.*;
 
-                try writeIntToFile(file, u64, edge.src);
-                try writeIntToFile(file, u64, edge.dst);
-                try writeIntToFile(file, u64, edge.edge_type.len);
+                try utils.writeInt(file, u64, edge.src);
+                try utils.writeInt(file, u64, edge.dst);
+                try utils.writeInt(file, u64, edge.edge_type.len);
                 try file.writeAll(edge.edge_type);
                 try file.writeAll(std.mem.asBytes(&edge.weight));
             }
@@ -937,24 +924,24 @@ pub fn HNSW(comptime T: type) type {
             defer file.close();
 
             // Read and verify header
-            const magic = try readIntFromFile(file, u32);
+            const magic = try utils.readInt(file, u32);
             if (magic != 0x48_4E_53_57) return error.InvalidFileFormat;
 
-            const version = try readIntFromFile(file, u32);
+            const version = try utils.readInt(file, u32);
             if (version != 1 and version != 2) return error.UnsupportedVersion;
 
             // Read configuration
-            const m = try readIntFromFile(file, u64);
-            const ef_construction = try readIntFromFile(file, u64);
-            const max_level = try readIntFromFile(file, u64);
-            const next_external_id = try readIntFromFile(file, u64);
+            const m = try utils.readInt(file, u64);
+            const ef_construction = try utils.readInt(file, u64);
+            const max_level = try utils.readInt(file, u64);
+            const next_external_id = try utils.readInt(file, u64);
 
             // Read entry point
-            const has_entry = (try readIntFromFile(file, u8)) != 0;
-            const entry_point: ?usize = if (has_entry) try readIntFromFile(file, u64) else null;
+            const has_entry = (try utils.readInt(file, u8)) != 0;
+            const entry_point: ?usize = if (has_entry) try utils.readInt(file, u64) else null;
 
             // Read node count
-            const node_count = try readIntFromFile(file, u64);
+            const node_count = try utils.readInt(file, u64);
 
             // Initialize HNSW
             var self = Self.init(allocator, m, ef_construction);
@@ -967,16 +954,16 @@ pub fn HNSW(comptime T: type) type {
             if (node_count == 0) return self;
 
             // Read dimension
-            const dim = try readIntFromFile(file, u64);
+            const dim = try utils.readInt(file, u64);
 
             // Read all nodes
             for (0..node_count) |_| {
                 // Read IDs
-                const internal_id = try readIntFromFile(file, u64);
-                const external_id = try readIntFromFile(file, u64);
+                const internal_id = try utils.readInt(file, u64);
+                const external_id = try utils.readInt(file, u64);
 
                 // Read level
-                const level = try readIntFromFile(file, u64);
+                const level = try utils.readInt(file, u64);
 
                 // Read point data
                 const point = try allocator.alloc(T, dim);
@@ -1008,29 +995,29 @@ pub fn HNSW(comptime T: type) type {
 
                 // Read connections for each layer
                 for (node.connections) |*conn_list| {
-                    const conn_count = try readIntFromFile(file, u64);
+                    const conn_count = try utils.readInt(file, u64);
                     try conn_list.ensureTotalCapacity(conn_count);
 
                     for (0..conn_count) |_| {
-                        const conn_id = try readIntFromFile(file, u64);
+                        const conn_id = try utils.readInt(file, u64);
                         try conn_list.append(conn_id);
                     }
                 }
 
                 // Read metadata (v2 only)
                 if (version == 2) {
-                    const has_metadata = (try readIntFromFile(file, u8)) != 0;
+                    const has_metadata = (try utils.readInt(file, u8)) != 0;
                     if (has_metadata) {
                         // Read node_type
-                        const type_len = try readIntFromFile(file, u64);
+                        const type_len = try utils.readInt(file, u64);
                         const node_type = try allocator.alloc(u8, type_len);
                         errdefer allocator.free(node_type);
                         _ = try file.readAll(node_type);
 
                         // Read content_ref
-                        const has_content_ref = (try readIntFromFile(file, u8)) != 0;
+                        const has_content_ref = (try utils.readInt(file, u8)) != 0;
                         const content_ref: ?[]const u8 = if (has_content_ref) blk: {
-                            const ref_len = try readIntFromFile(file, u64);
+                            const ref_len = try utils.readInt(file, u64);
                             const ref = try allocator.alloc(u8, ref_len);
                             errdefer allocator.free(ref);
                             _ = try file.readAll(ref);
@@ -1038,7 +1025,7 @@ pub fn HNSW(comptime T: type) type {
                         } else null;
 
                         // Read timestamp
-                        const timestamp = try readIntFromFile(file, i64);
+                        const timestamp = try utils.readInt(file, i64);
 
                         // Create metadata
                         var metadata = NodeMetadata{
@@ -1050,34 +1037,34 @@ pub fn HNSW(comptime T: type) type {
                         errdefer metadata.deinit(allocator);
 
                         // Read attributes
-                        const attr_count = try readIntFromFile(file, u64);
+                        const attr_count = try utils.readInt(file, u64);
                         var attr_keys = try allocator.alloc([]u8, attr_count);
                         defer allocator.free(attr_keys);
 
                         for (0..attr_count) |i| {
                             // Read key
-                            const key_len = try readIntFromFile(file, u64);
+                            const key_len = try utils.readInt(file, u64);
                             const key = try allocator.alloc(u8, key_len);
                             attr_keys[i] = key;
                             _ = try file.readAll(key);
 
                             // Read value
-                            const value_tag = try readIntFromFile(file, u8);
+                            const value_tag = try utils.readInt(file, u8);
                             const value: MetadataValue = switch (value_tag) {
                                 0 => blk: { // string
-                                    const str_len = try readIntFromFile(file, u64);
+                                    const str_len = try utils.readInt(file, u64);
                                     const str = try allocator.alloc(u8, str_len);
                                     _ = try file.readAll(str);
                                     break :blk MetadataValue{ .string = str };
                                 },
-                                1 => MetadataValue{ .int = try readIntFromFile(file, i64) }, // int
+                                1 => MetadataValue{ .int = try utils.readInt(file, i64) }, // int
                                 2 => blk: { // float
                                     var bytes: [@sizeOf(f64)]u8 = undefined;
                                     _ = try file.readAll(&bytes);
                                     break :blk MetadataValue{ .float = std.mem.bytesToValue(f64, &bytes) };
                                 },
                                 3 => blk: { // bool
-                                    const b = (try readIntFromFile(file, u8)) != 0;
+                                    const b = (try utils.readInt(file, u8)) != 0;
                                     break :blk MetadataValue{ .bool = b };
                                 },
                                 else => return error.InvalidMetadataValueType,
@@ -1105,12 +1092,12 @@ pub fn HNSW(comptime T: type) type {
 
             // Read edges (v2 only)
             if (version == 2) {
-                const edge_count = try readIntFromFile(file, u64);
+                const edge_count = try utils.readInt(file, u64);
                 for (0..edge_count) |_| {
-                    const src = try readIntFromFile(file, u64);
-                    const dst = try readIntFromFile(file, u64);
+                    const src = try utils.readInt(file, u64);
+                    const dst = try utils.readInt(file, u64);
 
-                    const type_len = try readIntFromFile(file, u64);
+                    const type_len = try utils.readInt(file, u64);
                     const edge_type = try allocator.alloc(u8, type_len);
                     errdefer allocator.free(edge_type);
                     _ = try file.readAll(edge_type);

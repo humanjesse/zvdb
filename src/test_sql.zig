@@ -1081,7 +1081,7 @@ test "WAL: Basic integration with INSERT/DELETE/UPDATE" {
     var select_result = try db.execute("SELECT * FROM users");
     defer select_result.deinit();
     try testing.expect(select_result.rows.items.len == 1);
-    try testing.expect(select_result.rows.items[0].items[3].int == 26); // Updated age
+    try testing.expect(select_result.rows.items[0].items[2].int == 26); // Updated age
 
     // Verify WAL directory was created
     var wal_dir_handle = try std.fs.cwd().openDir(wal_dir, .{});
@@ -1544,9 +1544,9 @@ test "WAL Recovery: UPDATE operations" {
         try testing.expectEqual(@as(usize, 1), select.rows.items.len);
 
         // Verify price was updated to 150
-        // SELECT * returns: id (row_id), id, name, price
-        // So price is at index 3
-        const price_col = select.rows.items[0].items[3];
+        // Table has 3 columns: id, name, price
+        // So price is at index 2
+        const price_col = select.rows.items[0].items[2];
         try testing.expectEqual(@as(i64, 150), price_col.int);
     }
 }
