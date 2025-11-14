@@ -2140,3 +2140,312 @@ test "WAL Crash: Recovery performance with large dataset" {
         try testing.expectEqual(@as(usize, num_records), table.count());
     }
 }
+
+// ============================================================================
+// Phase 1: B-tree Index Tests
+// ============================================================================
+
+test "Index: CREATE INDEX and DROP INDEX" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    // Create table
+    var create_table = try db.execute("CREATE TABLE users (id int, name text, age int)");
+    defer create_table.deinit();
+
+    // Create index
+    var create_index = try db.execute("CREATE INDEX idx_users_age ON users(age)");
+    defer create_index.deinit();
+
+    try testing.expectEqual(@as(usize, 1), db.index_manager.count());
+
+    // Verify index exists
+    const index_info = db.index_manager.getIndex("idx_users_age");
+    try testing.expect(index_info != null);
+
+    // Drop index
+    var drop_index = try db.execute("DROP INDEX idx_users_age");
+    defer drop_index.deinit();
+
+    try testing.expectEqual(@as(usize, 0), db.index_manager.count());
+}
+
+test "Index: Automatic updates on INSERT" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    var create_table = try db.execute("CREATE TABLE products (id int, name text, price int)");
+    defer create_table.deinit();
+
+    var create_index = try db.execute("CREATE INDEX idx_products_price ON products(price)");
+    defer create_index.deinit();
+
+    // Insert data
+    var insert1 = try db.execute("INSERT INTO products VALUES (1, \"Widget\", 100)");
+    defer insert1.deinit();
+
+    var insert2 = try db.execute("INSERT INTO products VALUES (2, \"Gadget\", 200)");
+    defer insert2.deinit();
+
+    // Query index directly
+    const index_info = db.index_manager.getIndex("idx_products_price").?;
+    const results = try index_info.btree.search(ColumnValue{ .int = 100 });
+    defer testing.allocator.free(results);
+
+    try testing.expectEqual(@as(usize, 1), results.len);
+    try testing.expectEqual(@as(u64, 1), results[0]);
+}
+
+test "Index: Automatic updates on DELETE" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    var create_table = try db.execute("CREATE TABLE items (id int, code text)");
+    defer create_table.deinit();
+
+    var insert1 = try db.execute("INSERT INTO items VALUES (1, \"A001\")");
+    defer insert1.deinit();
+
+    var insert2 = try db.execute("INSERT INTO items VALUES (2, \"B002\")");
+    defer insert2.deinit();
+
+    // Create index on existing data
+    var create_index = try db.execute("CREATE INDEX idx_items_code ON items(code)");
+    defer create_index.deinit();
+
+    // Verify both items in index
+    const index_info = db.index_manager.getIndex("idx_items_code").?;
+    try testing.expectEqual(@as(usize, 2), index_info.btree.getSize());
+
+    // Delete one item
+    var delete_stmt = try db.execute("DELETE FROM items WHERE id = 1");
+    defer delete_stmt.deinit();
+
+    // Verify index was updated
+    try testing.expectEqual(@as(usize, 1), index_info.btree.getSize());
+}
+
+test "Index: Automatic updates on UPDATE" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    var create_table = try db.execute("CREATE TABLE inventory (id int, qty int)");
+    defer create_table.deinit();
+
+    var insert1 = try db.execute("INSERT INTO inventory VALUES (1, 50)");
+    defer insert1.deinit();
+
+    var create_index = try db.execute("CREATE INDEX idx_inventory_qty ON inventory(qty)");
+    defer create_index.deinit();
+
+    const index_info = db.index_manager.getIndex("idx_inventory_qty").?;
+
+    // Verify old value in index
+    var results_old = try index_info.btree.search(ColumnValue{ .int = 50 });
+    defer testing.allocator.free(results_old);
+    try testing.expectEqual(@as(usize, 1), results_old.len);
+
+    // Update the qty
+    var update_stmt = try db.execute("UPDATE inventory SET qty = 75 WHERE id = 1");
+    defer update_stmt.deinit();
+
+    // Verify old value removed from index
+    var results_old2 = try index_info.btree.search(ColumnValue{ .int = 50 });
+    defer testing.allocator.free(results_old2);
+    try testing.expectEqual(@as(usize, 0), results_old2.len);
+
+    // Verify new value in index
+    var results_new = try index_info.btree.search(ColumnValue{ .int = 75 });
+    defer testing.allocator.free(results_new);
+    try testing.expectEqual(@as(usize, 1), results_new.len);
+}
+
+test "Index: Query optimizer uses index for WHERE clause" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    var create_table = try db.execute("CREATE TABLE users (id int, email text, age int)");
+    defer create_table.deinit();
+
+    // Insert test data
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        var buf: [200]u8 = undefined;
+        const query = try std.fmt.bufPrint(
+            &buf,
+            "INSERT INTO users VALUES ({d}, \"user{d}@test.com\", {d})",
+            .{ i, i, 20 + (i % 50) },
+        );
+        var result = try db.execute(query);
+        defer result.deinit();
+    }
+
+    // Create index on age
+    var create_index = try db.execute("CREATE INDEX idx_users_age ON users(age)");
+    defer create_index.deinit();
+
+    // Query with WHERE clause should use index
+    var select = try db.execute("SELECT * FROM users WHERE age = 30");
+    defer select.deinit();
+
+    // Should find users with age = 30 (indices 10, 60)
+    try testing.expectEqual(@as(usize, 2), select.rows.items.len);
+}
+
+test "Index: Performance comparison - WITH vs WITHOUT index" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    var create_table = try db.execute("CREATE TABLE records (id int, value int)");
+    defer create_table.deinit();
+
+    // Insert 1000 records
+    const num_records = 1000;
+    var i: usize = 0;
+    while (i < num_records) : (i += 1) {
+        var buf: [100]u8 = undefined;
+        const query = try std.fmt.bufPrint(&buf, "INSERT INTO records VALUES ({d}, {d})", .{ i, i % 100 });
+        var result = try db.execute(query);
+        defer result.deinit();
+    }
+
+    // Benchmark WITHOUT index
+    var timer_no_index = try std.time.Timer.start();
+    var select_no_index = try db.execute("SELECT * FROM records WHERE value = 50");
+    const time_no_index = timer_no_index.read();
+    defer select_no_index.deinit();
+
+    // Create index
+    var create_index = try db.execute("CREATE INDEX idx_records_value ON records(value)");
+    defer create_index.deinit();
+
+    // Benchmark WITH index
+    var timer_with_index = try std.time.Timer.start();
+    var select_with_index = try db.execute("SELECT * FROM records WHERE value = 50");
+    const time_with_index = timer_with_index.read();
+    defer select_with_index.deinit();
+
+    // Print results
+    std.debug.print("\nIndex Performance Comparison ({d} records):\n", .{num_records});
+    std.debug.print("  Without index: {d} ns\n", .{time_no_index});
+    std.debug.print("  With index:    {d} ns\n", .{time_with_index});
+
+    if (time_no_index > time_with_index) {
+        const speedup = @as(f64, @floatFromInt(time_no_index)) / @as(f64, @floatFromInt(time_with_index));
+        std.debug.print("  Speedup:       {d:.1}x faster\n", .{speedup});
+    }
+
+    // Both should return same results
+    try testing.expectEqual(select_no_index.rows.items.len, select_with_index.rows.items.len);
+}
+
+test "Index: Text column index" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    var create_table = try db.execute("CREATE TABLE emails (id int, address text)");
+    defer create_table.deinit();
+
+    var insert1 = try db.execute("INSERT INTO emails VALUES (1, \"alice@example.com\")");
+    defer insert1.deinit();
+
+    var insert2 = try db.execute("INSERT INTO emails VALUES (2, \"bob@example.com\")");
+    defer insert2.deinit();
+
+    var create_index = try db.execute("CREATE INDEX idx_emails_address ON emails(address)");
+    defer create_index.deinit();
+
+    // Query by email
+    var select = try db.execute("SELECT * FROM emails WHERE address = \"alice@example.com\"");
+    defer select.deinit();
+
+    try testing.expectEqual(@as(usize, 1), select.rows.items.len);
+    try testing.expectEqual(@as(i64, 1), select.rows.items[0].items[0].int);
+}
+
+test "Index: Multiple indexes on same table" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    var create_table = try db.execute("CREATE TABLE users (id int, name text, age int, email text)");
+    defer create_table.deinit();
+
+    var insert1 = try db.execute("INSERT INTO users VALUES (1, \"Alice\", 25, \"alice@example.com\")");
+    defer insert1.deinit();
+
+    // Create multiple indexes
+    var create_index1 = try db.execute("CREATE INDEX idx_users_age ON users(age)");
+    defer create_index1.deinit();
+
+    var create_index2 = try db.execute("CREATE INDEX idx_users_email ON users(email)");
+    defer create_index2.deinit();
+
+    try testing.expectEqual(@as(usize, 2), db.index_manager.count());
+
+    // Query using first index
+    var select1 = try db.execute("SELECT * FROM users WHERE age = 25");
+    defer select1.deinit();
+    try testing.expectEqual(@as(usize, 1), select1.rows.items.len);
+
+    // Query using second index
+    var select2 = try db.execute("SELECT * FROM users WHERE email = \"alice@example.com\"");
+    defer select2.deinit();
+    try testing.expectEqual(@as(usize, 1), select2.rows.items.len);
+}
+
+test "Index: Index on empty table" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    var create_table = try db.execute("CREATE TABLE empty_table (id int, value int)");
+    defer create_table.deinit();
+
+    // Create index on empty table
+    var create_index = try db.execute("CREATE INDEX idx_empty_value ON empty_table(value)");
+    defer create_index.deinit();
+
+    const index_info = db.index_manager.getIndex("idx_empty_value").?;
+    try testing.expectEqual(@as(usize, 0), index_info.btree.getSize());
+
+    // Insert data after index creation
+    var insert1 = try db.execute("INSERT INTO empty_table VALUES (1, 42)");
+    defer insert1.deinit();
+
+    try testing.expectEqual(@as(usize, 1), index_info.btree.getSize());
+}
+
+test "Index: Correctness - all results match table scan" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    var create_table = try db.execute("CREATE TABLE data (id int, category int)");
+    defer create_table.deinit();
+
+    // Insert diverse data
+    var i: usize = 0;
+    while (i < 50) : (i += 1) {
+        var buf: [100]u8 = undefined;
+        const query = try std.fmt.bufPrint(&buf, "INSERT INTO data VALUES ({d}, {d})", .{ i, i % 5 });
+        var result = try db.execute(query);
+        defer result.deinit();
+    }
+
+    // Query without index (baseline)
+    var select_baseline = try db.execute("SELECT * FROM data WHERE category = 2");
+    defer select_baseline.deinit();
+    const baseline_count = select_baseline.rows.items.len;
+
+    // Create index
+    var create_index = try db.execute("CREATE INDEX idx_data_category ON data(category)");
+    defer create_index.deinit();
+
+    // Query with index
+    var select_indexed = try db.execute("SELECT * FROM data WHERE category = 2");
+    defer select_indexed.deinit();
+
+    // Results should be identical
+    try testing.expectEqual(baseline_count, select_indexed.rows.items.len);
+
+    // Expected: records 2, 7, 12, 17, 22, 27, 32, 37, 42, 47 (10 records)
+    try testing.expectEqual(@as(usize, 10), select_indexed.rows.items.len);
+}

@@ -653,6 +653,10 @@ pub const Database = struct {
             }
         }
 
+        // Phase 1: Update B-tree indexes automatically
+        const row = table.get(row_id).?;
+        try self.index_manager.onInsert(cmd.table_name, row_id, row);
+
         var result = QueryResult.init(self.allocator);
         try result.addColumn("row_id");
         var row = ArrayList(ColumnValue).init(self.allocator);
@@ -683,8 +687,23 @@ pub const Database = struct {
         var row_ids: []u64 = undefined;
         const should_free_ids = true;
 
+        // Phase 1: Query Optimizer - Check if we can use an index
+        // If there's a WHERE clause with equality (column = value), try to use an index
+        const use_index = if (cmd.where_column) |where_col| blk: {
+            if (cmd.where_value) |where_val| {
+                // Look for an index on this column
+                if (self.index_manager.findIndexForColumn(cmd.table_name, where_col)) |index_info| {
+                    // Found an index! Use it instead of table scan
+                    row_ids = try index_info.btree.search(where_val);
+                    // Note: row_ids will be freed at the end
+                    break :blk true;
+                }
+            }
+            break :blk false;
+        } else false;
+
         // Handle ORDER BY SIMILARITY TO "text"
-        if (cmd.order_by_similarity) |similarity_text| {
+        if (!use_index and cmd.order_by_similarity) |similarity_text| {
             if (self.hnsw == null) return sql.SqlError.InvalidSyntax;
 
             // For semantic search, we need to generate an embedding from the text
@@ -706,7 +725,7 @@ pub const Database = struct {
             for (search_results, 0..) |res, i| {
                 row_ids[i] = res.external_id;
             }
-        } else if (cmd.order_by_vibes) {
+        } else if (!use_index and cmd.order_by_vibes) {
             // Fun parody feature: random order!
             row_ids = try table.getAllRows(self.allocator);
             var prng = std.Random.DefaultPrng.init(@intCast(std.time.timestamp()));
@@ -719,7 +738,8 @@ pub const Database = struct {
                 row_ids[i] = row_ids[j];
                 row_ids[j] = temp;
             }
-        } else {
+        } else if (!use_index) {
+            // Fallback to full table scan (no index available)
             row_ids = try table.getAllRows(self.allocator);
         }
 
@@ -735,8 +755,8 @@ pub const Database = struct {
 
             const row = table.get(row_id) orelse continue;
 
-            // Apply WHERE filter
-            if (cmd.where_column) |where_col| {
+            // Apply WHERE filter (skip if we already used an index to filter)
+            if (!use_index and cmd.where_column) |where_col| {
                 if (cmd.where_value) |where_val| {
                     const row_val = row.get(where_col) orelse continue;
                     if (!valuesEqual(row_val, where_val)) continue;
@@ -817,6 +837,9 @@ pub const Database = struct {
                     _ = try self.writeWalRecord(WalRecordType.delete_row, cmd.table_name, row_id, serialized_row);
                 }
 
+                // Phase 1: Update B-tree indexes before deletion (need row data)
+                try self.index_manager.onDelete(cmd.table_name, row_id, row);
+
                 _ = table.delete(row_id);
                 deleted_count += 1;
             }
@@ -885,6 +908,16 @@ pub const Database = struct {
             }
 
             if (!should_update) continue;
+
+            // Phase 1: Save old row state for index updates
+            var old_row_for_index = Row.init(self.allocator, row_id);
+            defer old_row_for_index.deinit(self.allocator);
+
+            // Clone old row values
+            var old_it = row.values.iterator();
+            while (old_it.next()) |entry| {
+                try old_row_for_index.set(self.allocator, entry.key_ptr.*, entry.value_ptr.*);
+            }
 
             // Track if embedding column is being updated
             var old_embedding: ?[]const f32 = null;
@@ -1014,6 +1047,9 @@ pub const Database = struct {
             for (cmd.assignments.items) |assignment| {
                 try row.set(self.allocator, assignment.column, assignment.value);
             }
+
+            // Phase 1: Update B-tree indexes after row mutation
+            try self.index_manager.onUpdate(cmd.table_name, row_id, &old_row_for_index, row);
 
             updated_count += 1;
         }
