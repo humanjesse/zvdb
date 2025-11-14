@@ -12,6 +12,9 @@ const sql = @import("../sql.zig");
 const StringHashMap = std.StringHashMap;
 const ArrayList = std.array_list.Managed;
 const WalRecordType = @import("../wal.zig").WalRecordType;
+const Transaction = @import("../transaction.zig");
+const Operation = Transaction.Operation;
+const TxRow = Transaction.Row;
 
 /// Execute a SQL command
 pub fn execute(db: *Database, query: []const u8) !QueryResult {
@@ -26,6 +29,9 @@ pub fn execute(db: *Database, query: []const u8) !QueryResult {
         .select => |select| try executeSelect(db, select),
         .delete => |delete| try executeDelete(db, delete),
         .update => |update| try executeUpdate(db, update),
+        .begin => try executeBegin(db),
+        .commit => try executeCommit(db),
+        .rollback => try executeRollback(db),
     };
 }
 
@@ -169,6 +175,18 @@ fn executeInsert(db: *Database, cmd: sql.InsertCmd) !QueryResult {
     // Phase 1: Update B-tree indexes automatically
     const inserted_row = table.get(final_row_id).?;
     try db.index_manager.onInsert(cmd.table_name, final_row_id, inserted_row);
+
+    // Track operation in transaction if one is active
+    if (db.tx_manager.getCurrentTx()) |tx| {
+        const table_name_owned = try db.allocator.dupe(u8, cmd.table_name);
+        const op = Operation{
+            .insert = .{
+                .table_name = table_name_owned,
+                .row_id = final_row_id,
+            },
+        };
+        try tx.addOperation(op);
+    }
 
     var result = QueryResult.init(db.allocator);
     try result.addColumn("row_id");
@@ -363,6 +381,19 @@ fn executeDelete(db: *Database, cmd: sql.DeleteCmd) !QueryResult {
         }
 
         if (should_delete) {
+            // Save row data for transaction rollback if needed
+            var saved_row: ?TxRow = null;
+            if (db.tx_manager.getCurrentTx()) |_| {
+                saved_row = TxRow.init(db.allocator);
+                var it = row.values.iterator();
+                while (it.next()) |entry| {
+                    const key = try db.allocator.dupe(u8, entry.key_ptr.*);
+                    const value = try entry.value_ptr.clone(db.allocator);
+                    try saved_row.?.values.put(key, value);
+                }
+            }
+            errdefer if (saved_row) |*sr| sr.deinit();
+
             // WAL-Ahead Protocol: Write to WAL BEFORE deleting
             if (db.wal != null) {
                 // Serialize the row being deleted (for potential recovery/undo)
@@ -378,6 +409,19 @@ fn executeDelete(db: *Database, cmd: sql.DeleteCmd) !QueryResult {
 
             _ = table.delete(row_id);
             deleted_count += 1;
+
+            // Track operation in transaction if one is active
+            if (db.tx_manager.getCurrentTx()) |tx| {
+                const table_name_owned = try db.allocator.dupe(u8, cmd.table_name);
+                const op = Operation{
+                    .delete = .{
+                        .table_name = table_name_owned,
+                        .row_id = row_id,
+                        .saved_row = saved_row.?,
+                    },
+                };
+                try tx.addOperation(op);
+            }
         }
     }
 
@@ -568,6 +612,19 @@ fn executeUpdate(db: *Database, cmd: sql.UpdateCmd) !QueryResult {
             }
         }
 
+        // Save old row values for transaction tracking if needed
+        var tx_old_values: ?TxRow = null;
+        if (db.tx_manager.getCurrentTx()) |_| {
+            tx_old_values = TxRow.init(db.allocator);
+            var tx_it = row.values.iterator();
+            while (tx_it.next()) |entry| {
+                const key = try db.allocator.dupe(u8, entry.key_ptr.*);
+                const value = try entry.value_ptr.clone(db.allocator);
+                try tx_old_values.?.values.put(key, value);
+            }
+        }
+        errdefer if (tx_old_values) |*tov| tov.deinit();
+
         // Now apply all SET assignments to the row
         for (cmd.assignments.items) |assignment| {
             try row.set(db.allocator, assignment.column, assignment.value);
@@ -575,6 +632,19 @@ fn executeUpdate(db: *Database, cmd: sql.UpdateCmd) !QueryResult {
 
         // Phase 1: Update B-tree indexes after row mutation
         try db.index_manager.onUpdate(cmd.table_name, row_id, &old_row_for_index, row);
+
+        // Track operation in transaction if one is active
+        if (db.tx_manager.getCurrentTx()) |tx| {
+            const table_name_owned = try db.allocator.dupe(u8, cmd.table_name);
+            const op = Operation{
+                .update = .{
+                    .table_name = table_name_owned,
+                    .row_id = row_id,
+                    .old_values = tx_old_values.?,
+                },
+            };
+            try tx.addOperation(op);
+        }
 
         updated_count += 1;
     }
@@ -586,4 +656,170 @@ fn executeUpdate(db: *Database, cmd: sql.UpdateCmd) !QueryResult {
     try result.addRow(row);
 
     return result;
+}
+
+// ============================================================================
+// Transaction Commands
+// ============================================================================
+
+/// Execute BEGIN command
+fn executeBegin(db: *Database) !QueryResult {
+    const tx_id = try db.tx_manager.begin();
+
+    // Write BEGIN to WAL if enabled
+    if (db.wal) |w| {
+        _ = try w.writeRecord(.{
+            .record_type = WalRecordType.begin_tx,
+            .tx_id = tx_id,
+            .lsn = 0, // Will be assigned by writeRecord
+            .table_name = "",
+            .row_id = 0,
+            .data = &[_]u8{},
+            .checksum = 0, // Will be calculated during serialization
+        });
+        try w.flush();
+    }
+
+    var result = QueryResult.init(db.allocator);
+    try result.addColumn("status");
+    var row = ArrayList(ColumnValue).init(db.allocator);
+    const msg = try std.fmt.allocPrint(db.allocator, "Transaction {d} started", .{tx_id});
+    try row.append(ColumnValue{ .text = msg });
+    try result.addRow(row);
+
+    return result;
+}
+
+/// Execute COMMIT command
+fn executeCommit(db: *Database) !QueryResult {
+    const tx = db.tx_manager.getCurrentTx() orelse return error.NoActiveTransaction;
+    const tx_id = tx.id;
+
+    // Write COMMIT to WAL if enabled
+    if (db.wal) |w| {
+        _ = try w.writeRecord(.{
+            .record_type = WalRecordType.commit_tx,
+            .tx_id = tx_id,
+            .lsn = 0, // Will be assigned by writeRecord
+            .table_name = "",
+            .row_id = 0,
+            .data = &[_]u8{},
+            .checksum = 0, // Will be calculated during serialization
+        });
+        try w.flush(); // Ensure durable
+    }
+
+    // Mark transaction as committed
+    try db.tx_manager.commit(tx_id);
+
+    var result = QueryResult.init(db.allocator);
+    try result.addColumn("status");
+    var row = ArrayList(ColumnValue).init(db.allocator);
+    const msg = try std.fmt.allocPrint(db.allocator, "Transaction {d} committed", .{tx_id});
+    try row.append(ColumnValue{ .text = msg });
+    try result.addRow(row);
+
+    return result;
+}
+
+/// Execute ROLLBACK command
+fn executeRollback(db: *Database) !QueryResult {
+    const tx = db.tx_manager.getCurrentTx() orelse return error.NoActiveTransaction;
+    const tx_id = tx.id;
+
+    // Undo operations in reverse order
+    var i = tx.operations.items.len;
+    while (i > 0) {
+        i -= 1;
+        const op = tx.operations.items[i];
+        try undoOperation(db, op);
+    }
+
+    // Write ROLLBACK to WAL if enabled
+    if (db.wal) |w| {
+        _ = try w.writeRecord(.{
+            .record_type = WalRecordType.rollback_tx,
+            .tx_id = tx_id,
+            .lsn = 0, // Will be assigned by writeRecord
+            .table_name = "",
+            .row_id = 0,
+            .data = &[_]u8{},
+            .checksum = 0, // Will be calculated during serialization
+        });
+        try w.flush();
+    }
+
+    // Mark transaction as aborted
+    try db.tx_manager.rollback(tx_id);
+
+    var result = QueryResult.init(db.allocator);
+    try result.addColumn("status");
+    var row = ArrayList(ColumnValue).init(db.allocator);
+    const msg = try std.fmt.allocPrint(db.allocator, "Transaction {d} rolled back", .{tx_id});
+    try row.append(ColumnValue{ .text = msg });
+    try result.addRow(row);
+
+    return result;
+}
+
+/// Undo a single operation (helper for rollback)
+fn undoOperation(db: *Database, op: Operation) !void {
+    switch (op) {
+        .insert => |ins| {
+            // Undo INSERT: delete the inserted row
+            const table = db.tables.get(ins.table_name) orelse return error.TableNotFound;
+            _ = table.delete(ins.row_id);
+
+            // Update indexes
+            const row = table.get(ins.row_id);
+            if (row) |r| {
+                try db.index_manager.onDelete(ins.table_name, ins.row_id, r);
+            }
+        },
+        .delete => |del| {
+            // Undo DELETE: restore the deleted row
+            const table = db.tables.get(del.table_name) orelse return error.TableNotFound;
+
+            // Convert transaction.Row to table.Row and insert
+            var values_map = StringHashMap(ColumnValue).init(db.allocator);
+            defer values_map.deinit();
+
+            var it = del.saved_row.values.iterator();
+            while (it.next()) |entry| {
+                try values_map.put(entry.key_ptr.*, entry.value_ptr.*);
+            }
+
+            // Insert the row back with its original ID
+            try table.insertWithId(del.row_id, values_map);
+
+            // Update indexes
+            const row = table.get(del.row_id);
+            if (row) |r| {
+                try db.index_manager.onInsert(del.table_name, del.row_id, r);
+            }
+        },
+        .update => |upd| {
+            // Undo UPDATE: restore the old values
+            const table = db.tables.get(upd.table_name) orelse return error.TableNotFound;
+            const row = table.get(upd.row_id) orelse return error.RowNotFound;
+
+            // Save current row state for index update
+            var old_row_for_index = Row.init(db.allocator, upd.row_id);
+            defer old_row_for_index.deinit(db.allocator);
+
+            var old_it = row.values.iterator();
+            while (old_it.next()) |entry| {
+                try old_row_for_index.set(db.allocator, entry.key_ptr.*, entry.value_ptr.*);
+            }
+
+            // Restore old values
+            var it = upd.old_values.values.iterator();
+            while (it.next()) |entry| {
+                try row.set(db.allocator, entry.key_ptr.*, entry.value_ptr.*);
+            }
+
+            // Update indexes
+            try db.index_manager.onUpdate(upd.table_name, upd.row_id, &old_row_for_index, row);
+        },
+    }
 }
