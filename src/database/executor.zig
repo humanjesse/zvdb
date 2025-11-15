@@ -479,7 +479,8 @@ fn evaluateWhereOnJoinedRow(
         }
 
         // Evaluate the expression
-        return sql.evaluateExpr(expr, row_map);
+        // TODO: Pass actual database pointer for subquery support in Phase 2.2
+        return sql.evaluateExpr(expr, row_map, null);
     }
 
     // No WHERE clause - row passes
@@ -1604,7 +1605,8 @@ fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
                 }
             } else if (cmd.where_expr) |expr| {
                 // Evaluate complex WHERE expression
-                if (!sql.evaluateExpr(expr, row.values)) continue;
+                // TODO: Pass actual database pointer for subquery support in Phase 2.2
+                if (!sql.evaluateExpr(expr, row.values, null)) continue;
             }
         }
 
@@ -1714,7 +1716,8 @@ fn executeAggregateSelect(db: *Database, table: *Table, cmd: sql.SelectCmd) !Que
             }
         } else if (cmd.where_expr) |expr| {
             // Evaluate complex WHERE expression
-            if (!sql.evaluateExpr(expr, row.values)) continue;
+            // TODO: Pass actual database pointer for subquery support in Phase 2.2
+            if (!sql.evaluateExpr(expr, row.values, null)) continue;
         }
 
         // Accumulate in all aggregate states
@@ -1821,7 +1824,8 @@ fn executeGroupBySelect(db: *Database, table: *Table, cmd: sql.SelectCmd) !Query
             }
         } else if (cmd.where_expr) |expr| {
             // Evaluate complex WHERE expression
-            if (!sql.evaluateExpr(expr, row.values)) continue;
+            // TODO: Pass actual database pointer for subquery support in Phase 2.2
+            if (!sql.evaluateExpr(expr, row.values, null)) continue;
         }
 
         // Create group key
@@ -2013,7 +2017,8 @@ fn executeUpdate(db: *Database, cmd: sql.UpdateCmd) !QueryResult {
         // Apply WHERE filter using expression evaluator
         var should_update = true;
         if (cmd.where_expr) |expr| {
-            should_update = sql.evaluateExpr(expr, row.values);
+            // TODO: Pass actual database pointer for subquery support in Phase 2.2
+            should_update = sql.evaluateExpr(expr, row.values, null);
         }
 
         if (!should_update) continue;

@@ -1240,7 +1240,8 @@ fn parsePrimaryExpr(allocator: Allocator, tokens: []const Token, idx: *usize) (A
 }
 
 /// Evaluate an expression against a row's values
-pub fn evaluateExpr(expr: Expr, row_values: anytype) bool {
+/// db parameter is optional and required for subquery execution
+pub fn evaluateExpr(expr: Expr, row_values: anytype, db: ?*anyopaque) bool {
     switch (expr) {
         .literal => |val| {
             // A standalone literal is truthy if not null/false
@@ -1271,10 +1272,10 @@ pub fn evaluateExpr(expr: Expr, row_values: anytype) bool {
             return false; // Column not found
         },
         .binary => |bin| {
-            return evaluateBinaryExpr(bin.*, row_values);
+            return evaluateBinaryExpr(bin.*, row_values, db);
         },
         .unary => |un| {
-            return evaluateUnaryExpr(un.*, row_values);
+            return evaluateUnaryExpr(un.*, row_values, db);
         },
         .subquery => {
             // Subqueries should not be evaluated standalone
@@ -1285,45 +1286,46 @@ pub fn evaluateExpr(expr: Expr, row_values: anytype) bool {
     }
 }
 
-fn evaluateBinaryExpr(expr: BinaryExpr, row_values: anytype) bool {
+fn evaluateBinaryExpr(expr: BinaryExpr, row_values: anytype, db: ?*anyopaque) bool {
     switch (expr.op) {
         .and_op => {
-            return evaluateExpr(expr.left, row_values) and evaluateExpr(expr.right, row_values);
+            return evaluateExpr(expr.left, row_values, db) and evaluateExpr(expr.right, row_values, db);
         },
         .or_op => {
-            return evaluateExpr(expr.left, row_values) or evaluateExpr(expr.right, row_values);
+            return evaluateExpr(expr.left, row_values, db) or evaluateExpr(expr.right, row_values, db);
         },
         .eq, .neq, .lt, .gt, .lte, .gte => {
-            const left_val = getExprValue(expr.left, row_values);
-            const right_val = getExprValue(expr.right, row_values);
+            const left_val = getExprValue(expr.left, row_values, db);
+            const right_val = getExprValue(expr.right, row_values, db);
             return compareValues(left_val, right_val, expr.op);
         },
         .in_op, .not_in_op, .exists_op, .not_exists_op => {
             // Subquery operators require database context
-            // Will be implemented in Phase 2 with evaluateExpr refactor
+            // Will be fully implemented in Phase 2.2 and 2.3
             // For now, return false (fail closed)
+            _ = db; // Suppress unused variable warning
             return false;
         },
     }
 }
 
-fn evaluateUnaryExpr(expr: UnaryExpr, row_values: anytype) bool {
+fn evaluateUnaryExpr(expr: UnaryExpr, row_values: anytype, db: ?*anyopaque) bool {
     switch (expr.op) {
         .not => {
-            return !evaluateExpr(expr.expr, row_values);
+            return !evaluateExpr(expr.expr, row_values, db);
         },
         .is_null => {
-            const val = getExprValue(expr.expr, row_values);
+            const val = getExprValue(expr.expr, row_values, db);
             return val == .null_value;
         },
         .is_not_null => {
-            const val = getExprValue(expr.expr, row_values);
+            const val = getExprValue(expr.expr, row_values, db);
             return val != .null_value;
         },
     }
 }
 
-fn getExprValue(expr: Expr, row_values: anytype) ColumnValue {
+fn getExprValue(expr: Expr, row_values: anytype, db: ?*anyopaque) ColumnValue {
     switch (expr) {
         .literal => |val| return val,
         .column => |col| {
@@ -1337,8 +1339,8 @@ fn getExprValue(expr: Expr, row_values: anytype) ColumnValue {
         },
         .binary, .unary, .subquery => {
             // For complex expressions in comparison context, treat as bool
-            // Subquery evaluation will be implemented in Phase 2
-            const result = evaluateExpr(expr, row_values);
+            // Subquery evaluation will be fully implemented in Phase 2.2 and 2.3
+            const result = evaluateExpr(expr, row_values, db);
             return ColumnValue{ .bool = result };
         },
     }
