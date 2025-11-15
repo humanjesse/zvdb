@@ -5,6 +5,8 @@ const QueryResult = core.QueryResult;
 const valuesEqual = core.valuesEqual;
 const recovery = @import("recovery.zig");
 const hash_join = @import("hash_join.zig");
+const column_resolver = @import("column_resolver.zig");
+const ColumnResolver = column_resolver.ColumnResolver;
 const Table = @import("../table.zig").Table;
 const ColumnValue = @import("../table.zig").ColumnValue;
 const ColumnType = @import("../table.zig").ColumnType;
@@ -996,7 +998,7 @@ fn executeMultiTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) 
         const join_table = db.tables.get(join_clause.table_name) orelse return sql.SqlError.TableNotFound;
 
         // Execute this join stage
-        var next_intermediate = try executeJoinStage(
+        const next_intermediate = try executeJoinStage(
             db.allocator,
             &current_intermediate,
             join_table,
@@ -1006,6 +1008,13 @@ fn executeMultiTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) 
         // Clean up previous intermediate and use the new one
         current_intermediate.deinit();
         current_intermediate = next_intermediate;
+    }
+
+    // Apply WHERE clause filter if present
+    if (cmd.where_column != null or cmd.where_expr != null) {
+        const filtered = try applyWhereFilter(db.allocator, &current_intermediate, cmd);
+        current_intermediate.deinit();
+        current_intermediate = filtered;
     }
 
     // Convert final intermediate result to QueryResult
@@ -1031,8 +1040,7 @@ fn executeJoinStage(
         try result.addColumn(join_clause.table_name, col.name);
     }
 
-    // Parse join column names (remove table prefix if present)
-    const left_parts = splitQualifiedColumn(join_clause.left_column);
+    // Parse right join column name (remove table prefix if present)
     const right_parts = splitQualifiedColumn(join_clause.right_column);
 
     // Get all rows from right table
@@ -1044,8 +1052,8 @@ fn executeJoinStage(
         .inner => {
             // INNER JOIN: only matching rows
             for (left_intermediate.rows.items) |left_row| {
-                // Get left join key
-                const left_col_idx = left_intermediate.findColumn(left_parts.column) orelse continue;
+                // Get left join key - use full qualified name if available
+                const left_col_idx = left_intermediate.findColumn(join_clause.left_column) orelse continue;
                 if (left_col_idx >= left_row.items.len) continue;
                 const left_val = left_row.items[left_col_idx];
 
@@ -1079,7 +1087,7 @@ fn executeJoinStage(
         .left => {
             // LEFT JOIN: all left rows, NULLs for unmatched
             for (left_intermediate.rows.items) |left_row| {
-                const left_col_idx = left_intermediate.findColumn(left_parts.column);
+                const left_col_idx = left_intermediate.findColumn(join_clause.left_column);
                 var matched = false;
 
                 if (left_col_idx) |idx| {
@@ -1138,7 +1146,7 @@ fn executeJoinStage(
                 if (right_val) |rv| {
                     if (rv != .null_value) {
                         for (left_intermediate.rows.items) |left_row| {
-                            const left_col_idx = left_intermediate.findColumn(left_parts.column) orelse continue;
+                            const left_col_idx = left_intermediate.findColumn(join_clause.left_column) orelse continue;
                             if (left_col_idx >= left_row.items.len) continue;
                             const left_val = left_row.items[left_col_idx];
 
@@ -1188,6 +1196,88 @@ fn executeJoinStage(
     }
 
     return result;
+}
+
+/// Apply WHERE clause filter to intermediate result (post-join filtering)
+fn applyWhereFilter(
+    allocator: Allocator,
+    intermediate: *IntermediateResult,
+    cmd: sql.SelectCmd,
+) !IntermediateResult {
+    var filtered = IntermediateResult.init(allocator);
+    errdefer filtered.deinit();
+
+    // Copy schema from input
+    for (intermediate.schema.items) |col_info| {
+        try filtered.addColumn(col_info.table_name, col_info.column_name);
+    }
+
+    // Filter rows based on WHERE expression or simple WHERE
+    for (intermediate.rows.items) |row| {
+        var matches = false;
+
+        // Check if we have a WHERE expression (complex)
+        if (cmd.where_expr) |expr| {
+            // Build a HashMap with all column values for expression evaluation
+            var row_map = StringHashMap(ColumnValue).init(allocator);
+            defer {
+                var it = row_map.iterator();
+                while (it.next()) |entry| {
+                    allocator.free(entry.key_ptr.*);
+                }
+                row_map.deinit();
+            }
+
+            // Populate map with both qualified and unqualified column names
+            for (intermediate.schema.items, 0..) |col_info, idx| {
+                if (idx >= row.items.len) break;
+
+                const val = row.items[idx];
+
+                // Add qualified name (table.column)
+                const qualified = try std.fmt.allocPrint(
+                    allocator,
+                    "{s}.{s}",
+                    .{ col_info.table_name, col_info.column_name },
+                );
+                try row_map.put(qualified, val);
+
+                // Add unqualified name (column) - last one wins if duplicate
+                const unqualified = try allocator.dupe(u8, col_info.column_name);
+                try row_map.put(unqualified, val);
+            }
+
+            // Evaluate expression
+            matches = sql.evaluateExpr(expr, row_map);
+        }
+        // Fallback to simple WHERE (column = value)
+        else if (cmd.where_column) |where_col| {
+            if (cmd.where_value) |where_val| {
+                // Find the column in the schema
+                const col_idx = intermediate.findColumn(where_col);
+                if (col_idx) |idx| {
+                    if (idx < row.items.len) {
+                        const row_val = row.items[idx];
+                        matches = valuesEqual(row_val, where_val);
+                    }
+                }
+            }
+        } else {
+            // No WHERE clause - include all rows
+            matches = true;
+        }
+
+        // Add row if it matches the filter
+        if (matches) {
+            var filtered_row = ArrayList(ColumnValue).init(allocator);
+            for (row.items) |val| {
+                try filtered_row.append(try val.clone(allocator));
+            }
+            try filtered.addRow(filtered_row);
+        }
+    }
+
+    return filtered;
 }
 
 fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {

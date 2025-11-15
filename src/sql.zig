@@ -121,6 +121,7 @@ pub const SelectCmd = struct {
     joins: ArrayList(JoinClause), // JOIN clauses
     where_column: ?[]const u8,
     where_value: ?ColumnValue,
+    where_expr: ?Expr, // Complex WHERE expressions (for JOINs and advanced filtering)
     similar_to_column: ?[]const u8, // For SIMILAR TO queries
     similar_to_text: ?[]const u8,
     order_by_similarity: ?[]const u8, // ORDER BY SIMILARITY TO "text"
@@ -145,6 +146,10 @@ pub const SelectCmd = struct {
         if (self.where_value) |*val| {
             var v = val.*;
             v.deinit(allocator);
+        }
+        if (self.where_expr) |*expr| {
+            var e = expr.*;
+            e.deinit(allocator);
         }
         if (self.similar_to_column) |col| allocator.free(col);
         if (self.similar_to_text) |text| allocator.free(text);
@@ -861,6 +866,7 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
         .joins = joins,
         .where_column = where_column,
         .where_value = where_value,
+        .where_expr = null, // TODO: Parse complex WHERE expressions
         .similar_to_column = similar_to_column,
         .similar_to_text = similar_to_text,
         .order_by_similarity = order_by_similarity,

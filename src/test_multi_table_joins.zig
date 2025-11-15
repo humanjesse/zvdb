@@ -147,8 +147,8 @@ test "3-table INNER JOIN: SELECT * with all columns" {
 
     try expectEqual(@as(usize, 1), result.rows.items.len);
 
-    // Should have 7 columns total (users: 2, orders: 3, products: 3)
-    try expectEqual(@as(usize, 7), result.columns.items.len);
+    // Should have 8 columns total (users: 2, orders: 3, products: 3)
+    try expectEqual(@as(usize, 8), result.columns.items.len);
 
     // Verify qualified column names
     try expect(std.mem.eql(u8, result.columns.items[0], "users.id"));
@@ -157,7 +157,8 @@ test "3-table INNER JOIN: SELECT * with all columns" {
     try expect(std.mem.eql(u8, result.columns.items[3], "orders.user_id"));
     try expect(std.mem.eql(u8, result.columns.items[4], "orders.total"));
     try expect(std.mem.eql(u8, result.columns.items[5], "products.id"));
-    try expect(std.mem.eql(u8, result.columns.items[6], "products.name"));
+    try expect(std.mem.eql(u8, result.columns.items[6], "products.order_id"));
+    try expect(std.mem.eql(u8, result.columns.items[7], "products.name"));
 }
 
 test "3-table LEFT JOIN: propagates NULLs through chain" {
@@ -667,4 +668,122 @@ test "3-table mixed JOIN: INNER + LEFT combination" {
 
     // Should include all departments
     try expectEqual(@as(usize, 4), result.rows.items.len);
+}
+
+test "3-table JOIN with WHERE clause: filter on base table" {
+    var db = Database.init(std.testing.allocator);
+    defer db.deinit();
+
+    // Create tables
+    {
+        var result = try db.execute("CREATE TABLE users (id int, name text, age int)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("CREATE TABLE orders (id int, user_id int, total float)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("CREATE TABLE products (id int, order_id int, name text)");
+        defer result.deinit();
+    }
+
+    // Insert data
+    {
+        var result = try db.execute("INSERT INTO users VALUES (1, 'Alice', 30)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO users VALUES (2, 'Bob', 25)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO orders VALUES (101, 1, 100.0)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO orders VALUES (102, 2, 200.0)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO products VALUES (1, 101, 'Widget')");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO products VALUES (2, 102, 'Gadget')");
+        defer result.deinit();
+    }
+
+    // Test WHERE on base table column
+    var result = try db.execute(
+        \\SELECT users.name, orders.total, products.name
+        \\FROM users
+        \\INNER JOIN orders ON users.id = orders.user_id
+        \\INNER JOIN products ON orders.id = products.order_id
+        \\WHERE age = 30
+    );
+    defer result.deinit();
+
+    // Should only return Alice (age 30), not Bob (age 25)
+    try expectEqual(@as(usize, 1), result.rows.items.len);
+    try expect(std.mem.eql(u8, result.rows.items[0].items[0].text, "Alice"));
+}
+
+test "3-table JOIN with WHERE clause: filter on joined table" {
+    var db = Database.init(std.testing.allocator);
+    defer db.deinit();
+
+    // Create tables
+    {
+        var result = try db.execute("CREATE TABLE users (id int, name text)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("CREATE TABLE orders (id int, user_id int, total float)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("CREATE TABLE products (id int, order_id int, price float)");
+        defer result.deinit();
+    }
+
+    // Insert data
+    {
+        var result = try db.execute("INSERT INTO users VALUES (1, 'Alice')");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO users VALUES (2, 'Bob')");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO orders VALUES (101, 1, 100.0)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO orders VALUES (102, 2, 200.0)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO products VALUES (1, 101, 50.0)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO products VALUES (2, 102, 150.0)");
+        defer result.deinit();
+    }
+
+    // Test WHERE on joined table column
+    var result = try db.execute(
+        \\SELECT users.name, orders.total, products.price
+        \\FROM users
+        \\INNER JOIN orders ON users.id = orders.user_id
+        \\INNER JOIN products ON orders.id = products.order_id
+        \\WHERE total = 200.0
+    );
+    defer result.deinit();
+
+    // Should only return Bob (total 200.0), not Alice (total 100.0)
+    try expectEqual(@as(usize, 1), result.rows.items.len);
+    try expect(std.mem.eql(u8, result.rows.items[0].items[0].text, "Bob"));
 }
