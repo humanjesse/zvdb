@@ -5,6 +5,8 @@ const QueryResult = core.QueryResult;
 const valuesEqual = core.valuesEqual;
 const recovery = @import("recovery.zig");
 const hash_join = @import("hash_join.zig");
+const column_resolver = @import("column_resolver.zig");
+const ColumnResolver = column_resolver.ColumnResolver;
 const Table = @import("../table.zig").Table;
 const ColumnValue = @import("../table.zig").ColumnValue;
 const ColumnType = @import("../table.zig").ColumnType;
@@ -443,16 +445,191 @@ fn shouldUseHashJoin(base_table_size: usize, join_table_size: usize) bool {
     return hash_cost < nested_cost;
 }
 
-/// Execute a SELECT query with JOINs
-fn executeJoinSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
-    var result = QueryResult.init(db.allocator);
+// ============================================================================
+// Multi-Table Join Support (N-way joins)
+// ============================================================================
 
+/// Column information in an intermediate result
+const IntermediateColumnInfo = struct {
+    /// Qualified name: "table.column"
+    qualified_name: []const u8,
+    /// Original table name
+    table_name: []const u8,
+    /// Column name without table qualifier
+    column_name: []const u8,
+    /// Index in the row array
+    index: usize,
+
+    allocator: Allocator,
+
+    pub fn deinit(self: *IntermediateColumnInfo) void {
+        self.allocator.free(self.qualified_name);
+        self.allocator.free(self.table_name);
+        self.allocator.free(self.column_name);
+    }
+};
+
+/// Intermediate result from a join operation
+/// Used in the pipeline when joining 3+ tables
+const IntermediateResult = struct {
+    /// Schema: column information with table qualifications
+    schema: ArrayList(IntermediateColumnInfo),
+    /// Rows: each row is a flat array of values matching schema order
+    rows: ArrayList(ArrayList(ColumnValue)),
+    /// Allocator for memory management
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator) IntermediateResult {
+        return .{
+            .schema = ArrayList(IntermediateColumnInfo).init(allocator),
+            .rows = ArrayList(ArrayList(ColumnValue)).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *IntermediateResult) void {
+        // Free schema
+        for (self.schema.items) |*col_info| {
+            col_info.deinit();
+        }
+        self.schema.deinit();
+
+        // Free rows
+        for (self.rows.items) |*row| {
+            for (row.items) |*val| {
+                var v = val.*;
+                v.deinit(self.allocator);
+            }
+            row.deinit();
+        }
+        self.rows.deinit();
+    }
+
+    /// Add a column to the schema
+    pub fn addColumn(
+        self: *IntermediateResult,
+        table_name: []const u8,
+        column_name: []const u8,
+    ) !void {
+        const qualified = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}.{s}",
+            .{ table_name, column_name },
+        );
+        errdefer self.allocator.free(qualified);
+
+        const table_owned = try self.allocator.dupe(u8, table_name);
+        errdefer self.allocator.free(table_owned);
+
+        const column_owned = try self.allocator.dupe(u8, column_name);
+        errdefer self.allocator.free(column_owned);
+
+        try self.schema.append(.{
+            .qualified_name = qualified,
+            .table_name = table_owned,
+            .column_name = column_owned,
+            .index = self.schema.items.len,
+            .allocator = self.allocator,
+        });
+    }
+
+    /// Add a row to the result
+    pub fn addRow(self: *IntermediateResult, row: ArrayList(ColumnValue)) !void {
+        try self.rows.append(row);
+    }
+
+    /// Find column index by name (supports both qualified and unqualified)
+    pub fn findColumn(self: *const IntermediateResult, col_name: []const u8) ?usize {
+        // First try exact match on qualified name
+        for (self.schema.items) |col_info| {
+            if (std.mem.eql(u8, col_info.qualified_name, col_name)) {
+                return col_info.index;
+            }
+        }
+
+        // Then try unqualified match
+        for (self.schema.items) |col_info| {
+            if (std.mem.eql(u8, col_info.column_name, col_name)) {
+                return col_info.index;
+            }
+        }
+
+        return null;
+    }
+
+    /// Convert to QueryResult for returning to user
+    pub fn toQueryResult(self: *IntermediateResult, select_all: bool, selected_columns: []const sql.SelectColumn) !QueryResult {
+        var result = QueryResult.init(self.allocator);
+        errdefer result.deinit();
+
+        if (select_all) {
+            // Add all columns
+            for (self.schema.items) |col_info| {
+                try result.addColumn(col_info.qualified_name);
+            }
+
+            // Add all rows
+            for (self.rows.items) |row| {
+                var result_row = ArrayList(ColumnValue).init(self.allocator);
+                for (row.items) |val| {
+                    try result_row.append(try val.clone(self.allocator));
+                }
+                try result.addRow(result_row);
+            }
+        } else {
+            // Add only selected columns
+            for (selected_columns) |col_spec| {
+                switch (col_spec) {
+                    .regular => |col_name| try result.addColumn(col_name),
+                    .aggregate => return error.AggregateNotSupportedInJoin,
+                    .star => try result.addColumn("*"),
+                }
+            }
+
+            // Project rows
+            for (self.rows.items) |row| {
+                var result_row = ArrayList(ColumnValue).init(self.allocator);
+
+                for (selected_columns) |col_spec| {
+                    if (col_spec == .regular) {
+                        const col_name = col_spec.regular;
+                        const idx = self.findColumn(col_name) orelse {
+                            return error.ColumnNotFound;
+                        };
+                        const val = if (idx < row.items.len) row.items[idx] else ColumnValue.null_value;
+                        try result_row.append(try val.clone(self.allocator));
+                    }
+                }
+
+                try result.addRow(result_row);
+            }
+        }
+
+        return result;
+    }
+};
+
+/// Execute a SELECT query with JOINs
+/// Now supports N-table joins using a pipelined approach
+fn executeJoinSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
     // Get base table
     const base_table = db.tables.get(cmd.table_name) orelse return sql.SqlError.TableNotFound;
 
-    // For now, support only single JOIN (multi-join can be added later)
+    // Validate we have at least one join
     if (cmd.joins.items.len == 0) return error.NoJoins;
-    if (cmd.joins.items.len > 1) return error.MultiJoinNotYetSupported;
+
+    // For single join, use the optimized 2-table path
+    if (cmd.joins.items.len == 1) {
+        return executeTwoTableJoin(db, cmd, base_table);
+    }
+
+    // For multiple joins (3+ tables), use the pipeline approach
+    return executeMultiTableJoin(db, cmd, base_table);
+}
+
+/// Optimized path for 2-table joins (base table + 1 join)
+fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !QueryResult {
+    var result = QueryResult.init(db.allocator);
 
     const join = cmd.joins.items[0];
     const join_table = db.tables.get(join.table_name) orelse return sql.SqlError.TableNotFound;
@@ -785,6 +962,322 @@ fn executeJoinSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
     }
 
     return result;
+}
+
+/// Pipeline approach for multi-table joins (3+ tables)
+fn executeMultiTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !QueryResult {
+    const select_all = cmd.columns.items.len == 1 and cmd.columns.items[0] == .star;
+
+    // Start with base table and build intermediate result
+    var current_intermediate = IntermediateResult.init(db.allocator);
+    errdefer current_intermediate.deinit();
+
+    // Build schema from base table
+    for (base_table.columns.items) |col| {
+        try current_intermediate.addColumn(cmd.table_name, col.name);
+    }
+
+    // Get all rows from base table and add to intermediate
+    const base_row_ids = try base_table.getAllRows(db.allocator);
+    defer db.allocator.free(base_row_ids);
+
+    for (base_row_ids) |row_id| {
+        const base_row = base_table.get(row_id) orelse continue;
+        var row_values = ArrayList(ColumnValue).init(db.allocator);
+
+        for (base_table.columns.items) |col| {
+            const val = base_row.get(col.name) orelse ColumnValue.null_value;
+            try row_values.append(try val.clone(db.allocator));
+        }
+
+        try current_intermediate.addRow(row_values);
+    }
+
+    // Process each join sequentially
+    for (cmd.joins.items) |join_clause| {
+        const join_table = db.tables.get(join_clause.table_name) orelse return sql.SqlError.TableNotFound;
+
+        // Execute this join stage
+        const next_intermediate = try executeJoinStage(
+            db.allocator,
+            &current_intermediate,
+            join_table,
+            join_clause,
+        );
+
+        // Clean up previous intermediate and use the new one
+        current_intermediate.deinit();
+        current_intermediate = next_intermediate;
+    }
+
+    // Apply WHERE clause filter if present
+    if (cmd.where_column != null or cmd.where_expr != null) {
+        const filtered = try applyWhereFilter(db.allocator, &current_intermediate, cmd);
+        current_intermediate.deinit();
+        current_intermediate = filtered;
+    }
+
+    // Convert final intermediate result to QueryResult
+    defer current_intermediate.deinit();
+    return try current_intermediate.toQueryResult(select_all, cmd.columns.items);
+}
+
+/// Execute a single join stage in the pipeline
+fn executeJoinStage(
+    allocator: Allocator,
+    left_intermediate: *IntermediateResult,
+    right_table: *Table,
+    join_clause: sql.JoinClause,
+) !IntermediateResult {
+    var result = IntermediateResult.init(allocator);
+    errdefer result.deinit();
+
+    // Build schema: left columns + right columns
+    for (left_intermediate.schema.items) |col_info| {
+        try result.addColumn(col_info.table_name, col_info.column_name);
+    }
+    for (right_table.columns.items) |col| {
+        try result.addColumn(join_clause.table_name, col.name);
+    }
+
+    // Parse right join column name (remove table prefix if present)
+    const right_parts = splitQualifiedColumn(join_clause.right_column);
+
+    // Get all rows from right table
+    const right_row_ids = try right_table.getAllRows(allocator);
+    defer allocator.free(right_row_ids);
+
+    // Execute join based on type
+    switch (join_clause.join_type) {
+        .inner => {
+            // INNER JOIN: only matching rows
+            for (left_intermediate.rows.items) |left_row| {
+                // Get left join key - use full qualified name if available
+                const left_col_idx = left_intermediate.findColumn(join_clause.left_column) orelse continue;
+                if (left_col_idx >= left_row.items.len) continue;
+                const left_val = left_row.items[left_col_idx];
+
+                if (left_val == .null_value) continue; // NULL doesn't match
+
+                // Find matching right rows
+                for (right_row_ids) |right_id| {
+                    const right_row = right_table.get(right_id) orelse continue;
+                    const right_val = right_row.get(right_parts.column) orelse continue;
+
+                    if (valuesEqual(left_val, right_val)) {
+                        // Match! Create combined row
+                        var combined = ArrayList(ColumnValue).init(allocator);
+
+                        // Add left values
+                        for (left_row.items) |val| {
+                            try combined.append(try val.clone(allocator));
+                        }
+
+                        // Add right values
+                        for (right_table.columns.items) |col| {
+                            const val = right_row.get(col.name) orelse ColumnValue.null_value;
+                            try combined.append(try val.clone(allocator));
+                        }
+
+                        try result.addRow(combined);
+                    }
+                }
+            }
+        },
+        .left => {
+            // LEFT JOIN: all left rows, NULLs for unmatched
+            for (left_intermediate.rows.items) |left_row| {
+                const left_col_idx = left_intermediate.findColumn(join_clause.left_column);
+                var matched = false;
+
+                if (left_col_idx) |idx| {
+                    if (idx < left_row.items.len) {
+                        const left_val = left_row.items[idx];
+
+                        if (left_val != .null_value) {
+                            // Try to find matches
+                            for (right_row_ids) |right_id| {
+                                const right_row = right_table.get(right_id) orelse continue;
+                                const right_val = right_row.get(right_parts.column) orelse continue;
+
+                                if (valuesEqual(left_val, right_val)) {
+                                    matched = true;
+
+                                    var combined = ArrayList(ColumnValue).init(allocator);
+                                    for (left_row.items) |val| {
+                                        try combined.append(try val.clone(allocator));
+                                    }
+                                    for (right_table.columns.items) |col| {
+                                        const val = right_row.get(col.name) orelse ColumnValue.null_value;
+                                        try combined.append(try val.clone(allocator));
+                                    }
+                                    try result.addRow(combined);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // No match: emit with NULLs
+                if (!matched) {
+                    var combined = ArrayList(ColumnValue).init(allocator);
+                    for (left_row.items) |val| {
+                        try combined.append(try val.clone(allocator));
+                    }
+                    for (right_table.columns.items) |_| {
+                        try combined.append(ColumnValue.null_value);
+                    }
+                    try result.addRow(combined);
+                }
+            }
+        },
+        .right => {
+            // RIGHT JOIN: all right rows, NULLs for unmatched left
+            // Track which right rows were matched
+            var matched_right = std.AutoHashMap(u64, bool).init(allocator);
+            defer matched_right.deinit();
+
+            // First pass: emit all matches
+            for (right_row_ids) |right_id| {
+                const right_row = right_table.get(right_id) orelse continue;
+                const right_val = right_row.get(right_parts.column);
+                var this_right_matched = false;
+
+                if (right_val) |rv| {
+                    if (rv != .null_value) {
+                        for (left_intermediate.rows.items) |left_row| {
+                            const left_col_idx = left_intermediate.findColumn(join_clause.left_column) orelse continue;
+                            if (left_col_idx >= left_row.items.len) continue;
+                            const left_val = left_row.items[left_col_idx];
+
+                            if (valuesEqual(left_val, rv)) {
+                                this_right_matched = true;
+
+                                var combined = ArrayList(ColumnValue).init(allocator);
+                                for (left_row.items) |val| {
+                                    try combined.append(try val.clone(allocator));
+                                }
+                                for (right_table.columns.items) |col| {
+                                    const val = right_row.get(col.name) orelse ColumnValue.null_value;
+                                    try combined.append(try val.clone(allocator));
+                                }
+                                try result.addRow(combined);
+                            }
+                        }
+                    }
+                }
+
+                if (this_right_matched) {
+                    try matched_right.put(right_id, true);
+                }
+            }
+
+            // Second pass: emit unmatched right rows with NULLs for left
+            for (right_row_ids) |right_id| {
+                if (matched_right.contains(right_id)) continue;
+
+                const right_row = right_table.get(right_id) orelse continue;
+                var combined = ArrayList(ColumnValue).init(allocator);
+
+                // NULLs for all left columns
+                for (left_intermediate.schema.items) |_| {
+                    try combined.append(ColumnValue.null_value);
+                }
+
+                // Values from right table
+                for (right_table.columns.items) |col| {
+                    const val = right_row.get(col.name) orelse ColumnValue.null_value;
+                    try combined.append(try val.clone(allocator));
+                }
+
+                try result.addRow(combined);
+            }
+        },
+    }
+
+    return result;
+}
+
+/// Apply WHERE clause filter to intermediate result (post-join filtering)
+fn applyWhereFilter(
+    allocator: Allocator,
+    intermediate: *IntermediateResult,
+    cmd: sql.SelectCmd,
+) !IntermediateResult {
+    var filtered = IntermediateResult.init(allocator);
+    errdefer filtered.deinit();
+
+    // Copy schema from input
+    for (intermediate.schema.items) |col_info| {
+        try filtered.addColumn(col_info.table_name, col_info.column_name);
+    }
+
+    // Filter rows based on WHERE expression or simple WHERE
+    for (intermediate.rows.items) |row| {
+        var matches = false;
+
+        // Check if we have a WHERE expression (complex)
+        if (cmd.where_expr) |expr| {
+            // Build a HashMap with all column values for expression evaluation
+            var row_map = StringHashMap(ColumnValue).init(allocator);
+            defer {
+                var it = row_map.iterator();
+                while (it.next()) |entry| {
+                    allocator.free(entry.key_ptr.*);
+                }
+                row_map.deinit();
+            }
+
+            // Populate map with both qualified and unqualified column names
+            for (intermediate.schema.items, 0..) |col_info, idx| {
+                if (idx >= row.items.len) break;
+
+                const val = row.items[idx];
+
+                // Add qualified name (table.column)
+                const qualified = try std.fmt.allocPrint(
+                    allocator,
+                    "{s}.{s}",
+                    .{ col_info.table_name, col_info.column_name },
+                );
+                try row_map.put(qualified, val);
+
+                // Add unqualified name (column) - last one wins if duplicate
+                const unqualified = try allocator.dupe(u8, col_info.column_name);
+                try row_map.put(unqualified, val);
+            }
+
+            // Evaluate expression
+            matches = sql.evaluateExpr(expr, row_map);
+        }
+        // Fallback to simple WHERE (column = value)
+        else if (cmd.where_column) |where_col| {
+            if (cmd.where_value) |where_val| {
+                // Find the column in the schema
+                const col_idx = intermediate.findColumn(where_col);
+                if (col_idx) |idx| {
+                    if (idx < row.items.len) {
+                        const row_val = row.items[idx];
+                        matches = valuesEqual(row_val, where_val);
+                    }
+                }
+            }
+        } else {
+            // No WHERE clause - include all rows
+            matches = true;
+        }
+
+        // Add row if it matches the filter
+        if (matches) {
+            var filtered_row = ArrayList(ColumnValue).init(allocator);
+            for (row.items) |val| {
+                try filtered_row.append(try val.clone(allocator));
+            }
+            try filtered.addRow(filtered_row);
+        }
+    }
+
+    return filtered;
 }
 
 fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
