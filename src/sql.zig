@@ -1189,7 +1189,7 @@ fn parseSubquery(allocator: Allocator, tokens: []const Token, idx: *usize) !*Sel
     }
 
     // Parse SELECT from tokens[idx] to tokens[end_idx-1]
-    const subquery_tokens = tokens[idx.*..end_idx - 1];
+    const subquery_tokens = tokens[idx.* .. end_idx - 1];
     const subquery = try allocator.create(SelectCmd);
     errdefer allocator.destroy(subquery);
 
@@ -1303,7 +1303,6 @@ fn evaluateBinaryExpr(expr: BinaryExpr, row_values: anytype, db: ?*anyopaque) bo
             // Subquery operators require database context
             // Will be fully implemented in Phase 2.2 and 2.3
             // For now, return false (fail closed)
-            _ = db; // Suppress unused variable warning
             return false;
         },
     }

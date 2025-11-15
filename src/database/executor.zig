@@ -29,7 +29,6 @@ const Allocator = std.mem.Allocator;
 fn executeSubquery(
     db: *Database,
     subquery: *const sql.SelectCmd,
-    allocator: Allocator,
 ) !QueryResult {
     // Execute the nested SELECT statement
     return executeSelect(db, subquery.*);
@@ -41,11 +40,10 @@ fn evaluateInSubquery(
     db: *Database,
     left_val: ColumnValue,
     subquery: *const sql.SelectCmd,
-    allocator: Allocator,
     negate: bool,
 ) !bool {
     // Execute subquery
-    var result = try executeSubquery(db, subquery, allocator);
+    var result = try executeSubquery(db, subquery);
     defer result.deinit();
 
     // Subquery for IN must return a single column
@@ -71,11 +69,10 @@ fn evaluateInSubquery(
 fn evaluateExistsSubquery(
     db: *Database,
     subquery: *const sql.SelectCmd,
-    allocator: Allocator,
     negate: bool,
 ) !bool {
     // Execute subquery
-    var result = try executeSubquery(db, subquery, allocator);
+    var result = try executeSubquery(db, subquery);
     defer result.deinit();
 
     // EXISTS returns true if result has at least one row
@@ -90,7 +87,7 @@ fn evaluateScalarSubquery(
     subquery: *const sql.SelectCmd,
     allocator: Allocator,
 ) !ColumnValue {
-    var result = try executeSubquery(db, subquery, allocator);
+    var result = try executeSubquery(db, subquery);
     defer result.deinit();
 
     // Scalar subquery must return exactly 1 column
@@ -119,7 +116,7 @@ pub fn evaluateExprWithSubqueries(
     db: *Database,
     expr: sql.Expr,
     row_values: anytype,
-) !bool {
+) anyerror!bool {
     // For non-binary expressions, delegate to sql.evaluateExpr
     if (expr != .binary) {
         return sql.evaluateExpr(expr, row_values, @ptrCast(db));
@@ -146,7 +143,6 @@ pub fn evaluateExprWithSubqueries(
                 db,
                 left_val,
                 bin.right.subquery,
-                db.allocator,
                 false, // not negated
             ) catch false;
         },
@@ -165,7 +161,6 @@ pub fn evaluateExprWithSubqueries(
                 db,
                 left_val,
                 bin.right.subquery,
-                db.allocator,
                 true, // negated
             ) catch false;
         },
@@ -179,7 +174,6 @@ pub fn evaluateExprWithSubqueries(
             return evaluateExistsSubquery(
                 db,
                 bin.right.subquery,
-                db.allocator,
                 false, // not negated
             ) catch false;
         },
@@ -193,7 +187,6 @@ pub fn evaluateExprWithSubqueries(
             return evaluateExistsSubquery(
                 db,
                 bin.right.subquery,
-                db.allocator,
                 true, // negated
             ) catch false;
         },
