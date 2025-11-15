@@ -217,7 +217,7 @@ pub const Database = struct {
 /// Helper function to compare column values for equality
 pub fn valuesEqual(a: ColumnValue, b: ColumnValue) bool {
     return switch (a) {
-        .null_value => b == .null_value,
+        .null_value => false, // SQL Standard: NULL != NULL (NULL never equals anything, not even NULL)
         .int => |ai| b == .int and b.int == ai,
         .float => |af| b == .float and b.float == af,
         .bool => |ab| b == .bool and b.bool == ab,

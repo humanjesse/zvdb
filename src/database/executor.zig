@@ -440,6 +440,7 @@ fn executeJoinSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
                 "{s}.{s}",
                 .{ cmd.table_name, col.name },
             );
+            defer db.allocator.free(qualified);
             try result.addColumn(qualified);
         }
         for (join_table.columns.items) |col| {
@@ -448,6 +449,7 @@ fn executeJoinSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
                 "{s}.{s}",
                 .{ join.table_name, col.name },
             );
+            defer db.allocator.free(qualified);
             try result.addColumn(qualified);
         }
     } else {
