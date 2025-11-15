@@ -118,6 +118,7 @@ pub const InsertCmd = struct {
 pub const SelectCmd = struct {
     table_name: []const u8,
     columns: ArrayList(SelectColumn), // Changed to support aggregates
+    joins: ArrayList(JoinClause), // JOIN clauses
     where_column: ?[]const u8,
     where_value: ?ColumnValue,
     similar_to_column: ?[]const u8, // For SIMILAR TO queries
@@ -133,6 +134,13 @@ pub const SelectCmd = struct {
             col.deinit(allocator);
         }
         self.columns.deinit();
+
+        // Free JOIN clauses
+        for (self.joins.items) |*join| {
+            join.deinit(allocator);
+        }
+        self.joins.deinit();
+
         if (self.where_column) |col| allocator.free(col);
         if (self.where_value) |*val| {
             var v = val.*;
@@ -304,6 +312,28 @@ pub const UpdateCmd = struct {
             var e = expr.*;
             e.deinit(allocator);
         }
+    }
+};
+
+/// JOIN types
+pub const JoinType = enum {
+    inner,
+    left,
+    right,
+    // cross,  // Future: CROSS JOIN
+};
+
+/// JOIN clause for SELECT queries
+pub const JoinClause = struct {
+    join_type: JoinType,
+    table_name: []const u8,
+    left_column: []const u8,   // e.g., "users.id" or "id"
+    right_column: []const u8,  // e.g., "orders.user_id" or "user_id"
+
+    pub fn deinit(self: *JoinClause, allocator: Allocator) void {
+        allocator.free(self.table_name);
+        allocator.free(self.left_column);
+        allocator.free(self.right_column);
     }
 };
 
@@ -649,6 +679,7 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
     const table_name = try allocator.dupe(u8, tokens[i].text);
     i += 1;
 
+    var joins = ArrayList(JoinClause).init(allocator);
     var where_column: ?[]const u8 = null;
     var where_value: ?ColumnValue = null;
     var similar_to_column: ?[]const u8 = null;
@@ -657,6 +688,81 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
     var order_by_vibes = false;
     var group_by = ArrayList([]const u8).init(allocator);
     var limit: ?usize = null;
+
+    // Parse JOINs (before WHERE, GROUP BY, ORDER BY, LIMIT)
+    while (i < tokens.len) {
+        // Check for JOIN keywords
+        var join_type: ?JoinType = null;
+
+        if (eqlIgnoreCase(tokens[i].text, "INNER")) {
+            join_type = .inner;
+            i += 1;
+            if (i >= tokens.len or !eqlIgnoreCase(tokens[i].text, "JOIN")) {
+                return SqlError.InvalidSyntax;
+            }
+        } else if (eqlIgnoreCase(tokens[i].text, "LEFT")) {
+            join_type = .left;
+            i += 1;
+            if (i >= tokens.len or !eqlIgnoreCase(tokens[i].text, "JOIN")) {
+                return SqlError.InvalidSyntax;
+            }
+        } else if (eqlIgnoreCase(tokens[i].text, "RIGHT")) {
+            join_type = .right;
+            i += 1;
+            if (i >= tokens.len or !eqlIgnoreCase(tokens[i].text, "JOIN")) {
+                return SqlError.InvalidSyntax;
+            }
+        } else if (eqlIgnoreCase(tokens[i].text, "JOIN")) {
+            // Default to INNER JOIN
+            join_type = .inner;
+        } else {
+            // No more JOINs, break and continue to WHERE/GROUP BY/etc
+            break;
+        }
+
+        i += 1; // Skip JOIN keyword
+
+        // Parse: table_name ON left_col = right_col
+        if (i >= tokens.len) return SqlError.InvalidSyntax;
+        const join_table = try allocator.dupe(u8, tokens[i].text);
+        i += 1;
+
+        if (i >= tokens.len or !eqlIgnoreCase(tokens[i].text, "ON")) {
+            allocator.free(join_table);
+            return SqlError.InvalidSyntax;
+        }
+        i += 1;
+
+        // Parse: left_column = right_column
+        if (i >= tokens.len) {
+            allocator.free(join_table);
+            return SqlError.InvalidSyntax;
+        }
+        const left_col = try allocator.dupe(u8, tokens[i].text);
+        i += 1;
+
+        if (i >= tokens.len or !std.mem.eql(u8, tokens[i].text, "=")) {
+            allocator.free(join_table);
+            allocator.free(left_col);
+            return SqlError.InvalidSyntax;
+        }
+        i += 1;
+
+        if (i >= tokens.len) {
+            allocator.free(join_table);
+            allocator.free(left_col);
+            return SqlError.InvalidSyntax;
+        }
+        const right_col = try allocator.dupe(u8, tokens[i].text);
+        i += 1;
+
+        try joins.append(JoinClause{
+            .join_type = join_type.?,
+            .table_name = join_table,
+            .left_column = left_col,
+            .right_column = right_col,
+        });
+    }
 
     // Parse WHERE, GROUP BY, ORDER BY, LIMIT
     while (i < tokens.len) {
@@ -752,6 +858,7 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
     return SelectCmd{
         .table_name = table_name,
         .columns = columns,
+        .joins = joins,
         .where_column = where_column,
         .where_value = where_value,
         .similar_to_column = similar_to_column,

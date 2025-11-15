@@ -405,7 +405,346 @@ fn executeInsert(db: *Database, cmd: sql.InsertCmd) !QueryResult {
     return result;
 }
 
+// ============================================================================
+// JOIN Support
+// ============================================================================
+
+/// Split a qualified column name (table.column) into table and column parts
+fn splitQualifiedColumn(col_name: []const u8) struct { table: ?[]const u8, column: []const u8 } {
+    if (std.mem.indexOf(u8, col_name, ".")) |dot_idx| {
+        return .{
+            .table = col_name[0..dot_idx],
+            .column = col_name[dot_idx + 1 ..],
+        };
+    }
+    return .{ .table = null, .column = col_name };
+}
+
+/// Execute a SELECT query with JOINs
+fn executeJoinSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
+    var result = QueryResult.init(db.allocator);
+
+    // Get base table
+    const base_table = db.tables.get(cmd.table_name) orelse return sql.SqlError.TableNotFound;
+
+    // For now, support only single JOIN (multi-join can be added later)
+    if (cmd.joins.items.len == 0) return error.NoJoins;
+    if (cmd.joins.items.len > 1) return error.MultiJoinNotYetSupported;
+
+    const join = cmd.joins.items[0];
+    const join_table = db.tables.get(join.table_name) orelse return sql.SqlError.TableNotFound;
+
+    // Parse join columns
+    const left_parts = splitQualifiedColumn(join.left_column);
+    const right_parts = splitQualifiedColumn(join.right_column);
+
+    // Setup result columns
+    const select_all = cmd.columns.items.len == 1 and cmd.columns.items[0] == .star;
+
+    if (select_all) {
+        // SELECT * includes all columns from both tables with qualified names
+        for (base_table.columns.items) |col| {
+            const qualified = try std.fmt.allocPrint(
+                db.allocator,
+                "{s}.{s}",
+                .{ cmd.table_name, col.name },
+            );
+            try result.addColumn(qualified);
+        }
+        for (join_table.columns.items) |col| {
+            const qualified = try std.fmt.allocPrint(
+                db.allocator,
+                "{s}.{s}",
+                .{ join.table_name, col.name },
+            );
+            try result.addColumn(qualified);
+        }
+    } else {
+        // Add specified columns
+        for (cmd.columns.items) |col_spec| {
+            switch (col_spec) {
+                .regular => |col_name| try result.addColumn(col_name),
+                .aggregate => return error.AggregateNotSupportedInJoin,
+                .star => try result.addColumn("*"),
+            }
+        }
+    }
+
+    // Get all rows from both tables
+    const base_row_ids = try base_table.getAllRows(db.allocator);
+    defer db.allocator.free(base_row_ids);
+
+    const join_row_ids = try join_table.getAllRows(db.allocator);
+    defer db.allocator.free(join_row_ids);
+
+    // Perform nested loop join
+    switch (join.join_type) {
+        .inner => {
+            // INNER JOIN: Only include matching rows
+            for (base_row_ids) |base_id| {
+                const base_row = base_table.get(base_id) orelse continue;
+                const left_val = base_row.get(left_parts.column) orelse continue;
+
+                for (join_row_ids) |join_id| {
+                    const join_row = join_table.get(join_id) orelse continue;
+                    const right_val = join_row.get(right_parts.column) orelse continue;
+
+                    // Check join condition
+                    if (valuesEqual(left_val, right_val)) {
+                        // Match! Create result row
+                        var result_row = ArrayList(ColumnValue).init(db.allocator);
+
+                        if (select_all) {
+                            // Add all columns from base table
+                            for (base_table.columns.items) |col| {
+                                const val = base_row.get(col.name) orelse ColumnValue.null_value;
+                                try result_row.append(try val.clone(db.allocator));
+                            }
+                            // Add all columns from join table
+                            for (join_table.columns.items) |col| {
+                                const val = join_row.get(col.name) orelse ColumnValue.null_value;
+                                try result_row.append(try val.clone(db.allocator));
+                            }
+                        } else {
+                            // Add only selected columns
+                            for (cmd.columns.items) |col_spec| {
+                                if (col_spec == .regular) {
+                                    const col_name = col_spec.regular;
+                                    const parts = splitQualifiedColumn(col_name);
+
+                                    const val = if (parts.table) |tbl| blk: {
+                                        if (std.mem.eql(u8, tbl, cmd.table_name)) {
+                                            break :blk base_row.get(parts.column);
+                                        } else {
+                                            break :blk join_row.get(parts.column);
+                                        }
+                                    } else blk: {
+                                        // Try both tables (unqualified column name)
+                                        break :blk base_row.get(col_name) orelse join_row.get(col_name);
+                                    };
+
+                                    try result_row.append(try (val orelse ColumnValue.null_value).clone(db.allocator));
+                                }
+                            }
+                        }
+
+                        try result.addRow(result_row);
+                    }
+                }
+            }
+        },
+        .left => {
+            // LEFT JOIN: Include all rows from base table, with NULLs for unmatched join table rows
+            for (base_row_ids) |base_id| {
+                const base_row = base_table.get(base_id) orelse continue;
+                const left_val = base_row.get(left_parts.column) orelse {
+                    // Base row has NULL in join column - still include with NULLs
+                    var result_row = ArrayList(ColumnValue).init(db.allocator);
+                    for (base_table.columns.items) |col| {
+                        const val = base_row.get(col.name) orelse ColumnValue.null_value;
+                        try result_row.append(try val.clone(db.allocator));
+                    }
+                    for (join_table.columns.items) |_| {
+                        try result_row.append(ColumnValue.null_value);
+                    }
+                    try result.addRow(result_row);
+                    continue;
+                };
+
+                var matched = false;
+
+                for (join_row_ids) |join_id| {
+                    const join_row = join_table.get(join_id) orelse continue;
+                    const right_val = join_row.get(right_parts.column) orelse continue;
+
+                    if (valuesEqual(left_val, right_val)) {
+                        matched = true;
+                        // Create result row (same as INNER JOIN)
+                        var result_row = ArrayList(ColumnValue).init(db.allocator);
+
+                        if (select_all) {
+                            for (base_table.columns.items) |col| {
+                                const val = base_row.get(col.name) orelse ColumnValue.null_value;
+                                try result_row.append(try val.clone(db.allocator));
+                            }
+                            for (join_table.columns.items) |col| {
+                                const val = join_row.get(col.name) orelse ColumnValue.null_value;
+                                try result_row.append(try val.clone(db.allocator));
+                            }
+                        } else {
+                            for (cmd.columns.items) |col_spec| {
+                                if (col_spec == .regular) {
+                                    const col_name = col_spec.regular;
+                                    const parts = splitQualifiedColumn(col_name);
+
+                                    const val = if (parts.table) |tbl| blk: {
+                                        if (std.mem.eql(u8, tbl, cmd.table_name)) {
+                                            break :blk base_row.get(parts.column);
+                                        } else {
+                                            break :blk join_row.get(parts.column);
+                                        }
+                                    } else blk: {
+                                        break :blk base_row.get(col_name) orelse join_row.get(col_name);
+                                    };
+
+                                    try result_row.append(try (val orelse ColumnValue.null_value).clone(db.allocator));
+                                }
+                            }
+                        }
+
+                        try result.addRow(result_row);
+                    }
+                }
+
+                // LEFT JOIN: If no match, still include base row with NULLs for join table
+                if (!matched) {
+                    var result_row = ArrayList(ColumnValue).init(db.allocator);
+
+                    if (select_all) {
+                        for (base_table.columns.items) |col| {
+                            const val = base_row.get(col.name) orelse ColumnValue.null_value;
+                            try result_row.append(try val.clone(db.allocator));
+                        }
+                        for (join_table.columns.items) |_| {
+                            try result_row.append(ColumnValue.null_value);
+                        }
+                    } else {
+                        for (cmd.columns.items) |col_spec| {
+                            if (col_spec == .regular) {
+                                const col_name = col_spec.regular;
+                                const parts = splitQualifiedColumn(col_name);
+
+                                const val = if (parts.table) |tbl| blk: {
+                                    if (std.mem.eql(u8, tbl, cmd.table_name)) {
+                                        break :blk base_row.get(parts.column);
+                                    } else {
+                                        break :blk null; // NULL for join table columns
+                                    }
+                                } else blk: {
+                                    break :blk base_row.get(col_name);
+                                };
+
+                                try result_row.append(try (val orelse ColumnValue.null_value).clone(db.allocator));
+                            }
+                        }
+                    }
+
+                    try result.addRow(result_row);
+                }
+            }
+        },
+        .right => {
+            // RIGHT JOIN: Include all rows from join table, with NULLs for unmatched base table rows
+            // This is similar to LEFT JOIN but with tables swapped
+            for (join_row_ids) |join_id| {
+                const join_row = join_table.get(join_id) orelse continue;
+                const right_val = join_row.get(right_parts.column) orelse {
+                    // Join row has NULL in join column - still include with NULLs
+                    var result_row = ArrayList(ColumnValue).init(db.allocator);
+                    for (base_table.columns.items) |_| {
+                        try result_row.append(ColumnValue.null_value);
+                    }
+                    for (join_table.columns.items) |col| {
+                        const val = join_row.get(col.name) orelse ColumnValue.null_value;
+                        try result_row.append(try val.clone(db.allocator));
+                    }
+                    try result.addRow(result_row);
+                    continue;
+                };
+
+                var matched = false;
+
+                for (base_row_ids) |base_id| {
+                    const base_row = base_table.get(base_id) orelse continue;
+                    const left_val = base_row.get(left_parts.column) orelse continue;
+
+                    if (valuesEqual(left_val, right_val)) {
+                        matched = true;
+                        // Create result row (same as INNER JOIN)
+                        var result_row = ArrayList(ColumnValue).init(db.allocator);
+
+                        if (select_all) {
+                            for (base_table.columns.items) |col| {
+                                const val = base_row.get(col.name) orelse ColumnValue.null_value;
+                                try result_row.append(try val.clone(db.allocator));
+                            }
+                            for (join_table.columns.items) |col| {
+                                const val = join_row.get(col.name) orelse ColumnValue.null_value;
+                                try result_row.append(try val.clone(db.allocator));
+                            }
+                        } else {
+                            for (cmd.columns.items) |col_spec| {
+                                if (col_spec == .regular) {
+                                    const col_name = col_spec.regular;
+                                    const parts = splitQualifiedColumn(col_name);
+
+                                    const val = if (parts.table) |tbl| blk: {
+                                        if (std.mem.eql(u8, tbl, cmd.table_name)) {
+                                            break :blk base_row.get(parts.column);
+                                        } else {
+                                            break :blk join_row.get(parts.column);
+                                        }
+                                    } else blk: {
+                                        break :blk base_row.get(col_name) orelse join_row.get(col_name);
+                                    };
+
+                                    try result_row.append(try (val orelse ColumnValue.null_value).clone(db.allocator));
+                                }
+                            }
+                        }
+
+                        try result.addRow(result_row);
+                    }
+                }
+
+                // RIGHT JOIN: If no match, still include join row with NULLs for base table
+                if (!matched) {
+                    var result_row = ArrayList(ColumnValue).init(db.allocator);
+
+                    if (select_all) {
+                        for (base_table.columns.items) |_| {
+                            try result_row.append(ColumnValue.null_value);
+                        }
+                        for (join_table.columns.items) |col| {
+                            const val = join_row.get(col.name) orelse ColumnValue.null_value;
+                            try result_row.append(try val.clone(db.allocator));
+                        }
+                    } else {
+                        for (cmd.columns.items) |col_spec| {
+                            if (col_spec == .regular) {
+                                const col_name = col_spec.regular;
+                                const parts = splitQualifiedColumn(col_name);
+
+                                const val = if (parts.table) |tbl| blk: {
+                                    if (std.mem.eql(u8, tbl, cmd.table_name)) {
+                                        break :blk null; // NULL for base table columns
+                                    } else {
+                                        break :blk join_row.get(parts.column);
+                                    }
+                                } else blk: {
+                                    break :blk join_row.get(col_name);
+                                };
+
+                                try result_row.append(try (val orelse ColumnValue.null_value).clone(db.allocator));
+                            }
+                        }
+                    }
+
+                    try result.addRow(result_row);
+                }
+            }
+        },
+    }
+
+    return result;
+}
+
 fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
+    // Route to JOIN handler if needed
+    if (cmd.joins.items.len > 0) {
+        return executeJoinSelect(db, cmd);
+    }
+
     const table = db.tables.get(cmd.table_name) orelse return sql.SqlError.TableNotFound;
 
     // Check if this is an aggregate query
