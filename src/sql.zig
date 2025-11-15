@@ -232,6 +232,10 @@ pub const BinaryOp = enum {
     gte, // >=
     and_op, // AND
     or_op, // OR
+    in_op, // IN (for subqueries and lists)
+    not_in_op, // NOT IN
+    exists_op, // EXISTS
+    not_exists_op, // NOT EXISTS
 };
 
 /// Unary operators for WHERE expressions
@@ -269,6 +273,7 @@ pub const Expr = union(enum) {
     column: []const u8,
     binary: *BinaryExpr,
     unary: *UnaryExpr,
+    subquery: *SelectCmd, // Nested SELECT statement for subqueries
 
     pub fn deinit(self: *Expr, allocator: Allocator) void {
         switch (self.*) {
@@ -284,6 +289,10 @@ pub const Expr = union(enum) {
             .unary => |un| {
                 un.deinit(allocator);
                 allocator.destroy(un);
+            },
+            .subquery => |sq| {
+                sq.deinit(allocator);
+                allocator.destroy(sq);
             },
         }
     }
@@ -989,12 +998,44 @@ fn parseAndExpr(allocator: Allocator, tokens: []const Token, idx: *usize) (Alloc
     return left;
 }
 
-/// Parse comparison expressions (=, !=, <, >, <=, >=)
+/// Parse comparison expressions (=, !=, <, >, <=, >=, IN, NOT IN)
 fn parseComparisonExpr(allocator: Allocator, tokens: []const Token, idx: *usize) (Allocator.Error || SqlError)!Expr {
     const left = try parseUnaryExpr(allocator, tokens, idx);
 
     if (idx.* < tokens.len) {
         const op_text = tokens[idx.*].text;
+
+        // Check for IN operator
+        if (eqlIgnoreCase(op_text, "IN")) {
+            idx.* += 1;
+            const right = try parseUnaryExpr(allocator, tokens, idx);
+
+            const binary = try allocator.create(BinaryExpr);
+            binary.* = BinaryExpr{
+                .op = .in_op,
+                .left = left,
+                .right = right,
+            };
+            return Expr{ .binary = binary };
+        }
+
+        // Check for NOT IN operator
+        if (eqlIgnoreCase(op_text, "NOT")) {
+            if (idx.* + 1 < tokens.len and eqlIgnoreCase(tokens[idx.* + 1].text, "IN")) {
+                idx.* += 2; // Skip NOT IN
+                const right = try parseUnaryExpr(allocator, tokens, idx);
+
+                const binary = try allocator.create(BinaryExpr);
+                binary.* = BinaryExpr{
+                    .op = .not_in_op,
+                    .left = left,
+                    .right = right,
+                };
+                return Expr{ .binary = binary };
+            }
+        }
+
+        // Regular comparison operators
         const op: ?BinaryOp = if (std.mem.eql(u8, op_text, "="))
             .eq
         else if (std.mem.eql(u8, op_text, "!="))
@@ -1027,12 +1068,55 @@ fn parseComparisonExpr(allocator: Allocator, tokens: []const Token, idx: *usize)
     return left;
 }
 
-/// Parse unary expressions (NOT, IS NULL, IS NOT NULL)
+/// Parse unary expressions (NOT, IS NULL, IS NOT NULL, EXISTS, NOT EXISTS)
 fn parseUnaryExpr(allocator: Allocator, tokens: []const Token, idx: *usize) (Allocator.Error || SqlError)!Expr {
     if (idx.* >= tokens.len) return SqlError.InvalidExpression;
 
-    // NOT expression
+    // EXISTS expression
+    if (eqlIgnoreCase(tokens[idx.*].text, "EXISTS")) {
+        idx.* += 1;
+
+        // EXISTS must be followed by a subquery
+        if (!isSubqueryStart(tokens, idx.*)) {
+            return SqlError.InvalidSyntax;
+        }
+
+        const subquery = try parseSubquery(allocator, tokens, idx);
+
+        // Represent EXISTS as a binary expression with a literal true on the left
+        const binary = try allocator.create(BinaryExpr);
+        binary.* = BinaryExpr{
+            .op = .exists_op,
+            .left = Expr{ .literal = ColumnValue{ .bool = true } },
+            .right = Expr{ .subquery = subquery },
+        };
+        return Expr{ .binary = binary };
+    }
+
+    // NOT expression (could be NOT EXISTS or regular NOT)
     if (eqlIgnoreCase(tokens[idx.*].text, "NOT")) {
+        // Look ahead for EXISTS
+        if (idx.* + 1 < tokens.len and eqlIgnoreCase(tokens[idx.* + 1].text, "EXISTS")) {
+            idx.* += 2; // Skip NOT EXISTS
+
+            // NOT EXISTS must be followed by a subquery
+            if (!isSubqueryStart(tokens, idx.*)) {
+                return SqlError.InvalidSyntax;
+            }
+
+            const subquery = try parseSubquery(allocator, tokens, idx);
+
+            // Represent NOT EXISTS as a binary expression
+            const binary = try allocator.create(BinaryExpr);
+            binary.* = BinaryExpr{
+                .op = .not_exists_op,
+                .left = Expr{ .literal = ColumnValue{ .bool = true } },
+                .right = Expr{ .subquery = subquery },
+            };
+            return Expr{ .binary = binary };
+        }
+
+        // Regular NOT expression
         idx.* += 1;
         const expr = try parseUnaryExpr(allocator, tokens, idx);
         const unary = try allocator.create(UnaryExpr);
@@ -1070,13 +1154,64 @@ fn parseUnaryExpr(allocator: Allocator, tokens: []const Token, idx: *usize) (All
     return expr;
 }
 
+/// Check if token sequence starts a subquery
+fn isSubqueryStart(tokens: []const Token, idx: usize) bool {
+    // Subquery starts with ( SELECT
+    if (idx >= tokens.len) return false;
+    if (!std.mem.eql(u8, tokens[idx].text, "(")) return false;
+    if (idx + 1 >= tokens.len) return false;
+    return eqlIgnoreCase(tokens[idx + 1].text, "SELECT");
+}
+
+/// Parse a subquery: (SELECT ...)
+/// Returns the subquery and advances idx past the closing )
+fn parseSubquery(allocator: Allocator, tokens: []const Token, idx: *usize) !*SelectCmd {
+    // Expect opening (
+    if (idx.* >= tokens.len or !std.mem.eql(u8, tokens[idx.*].text, "(")) {
+        return SqlError.InvalidSyntax;
+    }
+    idx.* += 1; // Skip (
+
+    // Find matching closing parenthesis
+    var depth: usize = 1;
+    var end_idx = idx.*;
+    while (end_idx < tokens.len and depth > 0) {
+        if (std.mem.eql(u8, tokens[end_idx].text, "(")) {
+            depth += 1;
+        } else if (std.mem.eql(u8, tokens[end_idx].text, ")")) {
+            depth -= 1;
+        }
+        end_idx += 1;
+    }
+
+    if (depth != 0) {
+        return SqlError.InvalidSyntax; // Unmatched parentheses
+    }
+
+    // Parse SELECT from tokens[idx] to tokens[end_idx-1]
+    const subquery_tokens = tokens[idx.*..end_idx - 1];
+    const subquery = try allocator.create(SelectCmd);
+    errdefer allocator.destroy(subquery);
+
+    subquery.* = try parseSelect(allocator, subquery_tokens);
+
+    idx.* = end_idx; // Move past closing )
+    return subquery;
+}
+
 /// Parse primary expressions (literals, columns, parentheses)
 fn parsePrimaryExpr(allocator: Allocator, tokens: []const Token, idx: *usize) (Allocator.Error || SqlError)!Expr {
     if (idx.* >= tokens.len) return SqlError.InvalidExpression;
 
     const token_text = tokens[idx.*].text;
 
-    // Parenthesized expression
+    // Check for subquery: ( SELECT ...
+    if (isSubqueryStart(tokens, idx.*)) {
+        const subquery = try parseSubquery(allocator, tokens, idx);
+        return Expr{ .subquery = subquery };
+    }
+
+    // Regular parenthesized expression
     if (std.mem.eql(u8, token_text, "(")) {
         idx.* += 1;
         const expr = try parseExpr(allocator, tokens, idx);
@@ -1141,6 +1276,12 @@ pub fn evaluateExpr(expr: Expr, row_values: anytype) bool {
         .unary => |un| {
             return evaluateUnaryExpr(un.*, row_values);
         },
+        .subquery => {
+            // Subqueries should not be evaluated standalone
+            // They must be part of a binary expression (IN, EXISTS, etc.)
+            // This will be properly handled in Phase 2
+            return false;
+        },
     }
 }
 
@@ -1156,6 +1297,12 @@ fn evaluateBinaryExpr(expr: BinaryExpr, row_values: anytype) bool {
             const left_val = getExprValue(expr.left, row_values);
             const right_val = getExprValue(expr.right, row_values);
             return compareValues(left_val, right_val, expr.op);
+        },
+        .in_op, .not_in_op, .exists_op, .not_exists_op => {
+            // Subquery operators require database context
+            // Will be implemented in Phase 2 with evaluateExpr refactor
+            // For now, return false (fail closed)
+            return false;
         },
     }
 }
@@ -1188,8 +1335,9 @@ fn getExprValue(expr: Expr, row_values: anytype) ColumnValue {
             }
             return ColumnValue.null_value;
         },
-        .binary, .unary => {
+        .binary, .unary, .subquery => {
             // For complex expressions in comparison context, treat as bool
+            // Subquery evaluation will be implemented in Phase 2
             const result = evaluateExpr(expr, row_values);
             return ColumnValue{ .bool = result };
         },
