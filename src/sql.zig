@@ -370,7 +370,7 @@ fn tokenize(allocator: Allocator, sql: []const u8) !ArrayList(Token) {
         }
         // Identifier or keyword
         else if (std.ascii.isAlphabetic(sql[i]) or sql[i] == '_') {
-            while (i < sql.len and (std.ascii.isAlphanumeric(sql[i]) or sql[i] == '_')) : (i += 1) {}
+            while (i < sql.len and (std.ascii.isAlphanumeric(sql[i]) or sql[i] == '_' or sql[i] == '.')) : (i += 1) {}
             try tokens.append(.{ .text = sql[start..i], .start = start });
         }
         // Special characters and operators

@@ -1960,10 +1960,10 @@ test "WAL Crash: Large transaction recovery" {
         const table = db.tables.get("bulk_data").?;
         try testing.expectEqual(@as(usize, num_records), table.count());
 
-        // Verify some random records
-        try testing.expect(table.get(0) != null);
-        try testing.expect(table.get(num_records / 2) != null);
-        try testing.expect(table.get(num_records - 1) != null);
+        // Verify some random records (row_ids start at 1, so records are 1-1000)
+        try testing.expect(table.get(1) != null);
+        try testing.expect(table.get(num_records / 2 + 1) != null);
+        try testing.expect(table.get(num_records) != null);
     }
 }
 

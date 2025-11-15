@@ -330,16 +330,9 @@ fn executeInsert(db: *Database, cmd: sql.InsertCmd) !QueryResult {
         }
     }
 
-    // Check if an explicit ID is provided (must be non-negative)
-    var explicit_id: ?u64 = null;
-    if (values_map.get("id")) |id_value| {
-        if (id_value == .int and id_value.int >= 0) {
-            explicit_id = @intCast(id_value.int);
-        }
-    }
-
-    // Determine the row_id that will be used
-    const row_id = explicit_id orelse table.next_id;
+    // Always auto-generate the row_id (don't use user's "id" column as row_id)
+    // This allows multiple rows with the same "id" column value, which is SQL compliant
+    const row_id = table.next_id;
 
     // WAL-Ahead Protocol: Write to WAL BEFORE modifying data
     if (db.wal != null) {
@@ -361,11 +354,9 @@ fn executeInsert(db: *Database, cmd: sql.InsertCmd) !QueryResult {
         _ = try recovery.writeWalRecord(db, WalRecordType.insert_row, cmd.table_name, row_id, serialized_row);
     }
 
-    // Insert the row using appropriate method
-    const final_row_id = if (explicit_id) |id| blk: {
-        try table.insertWithId(id, values_map);
-        break :blk id;
-    } else try table.insert(values_map);
+    // Insert the row using the pre-determined row_id (needed for WAL-Ahead protocol)
+    try table.insertWithId(row_id, values_map);
+    const final_row_id = row_id;
 
     // If there's an embedding column and vector search is enabled, add to index
     if (db.hnsw) |h| {
@@ -514,16 +505,16 @@ fn executeJoinSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
 
                                     const val = if (parts.table) |tbl| blk: {
                                         if (std.mem.eql(u8, tbl, cmd.table_name)) {
-                                            break :blk base_row.get(parts.column);
+                                            break :blk base_row.get(parts.column) orelse ColumnValue.null_value;
                                         } else {
-                                            break :blk join_row.get(parts.column);
+                                            break :blk join_row.get(parts.column) orelse ColumnValue.null_value;
                                         }
                                     } else blk: {
                                         // Try both tables (unqualified column name)
-                                        break :blk base_row.get(col_name) orelse join_row.get(col_name);
+                                        break :blk (base_row.get(col_name) orelse join_row.get(col_name) orelse ColumnValue.null_value);
                                     };
 
-                                    try result_row.append(try (val orelse ColumnValue.null_value).clone(db.allocator));
+                                    try result_row.append(try val.clone(db.allocator));
                                 }
                             }
                         }
@@ -579,15 +570,16 @@ fn executeJoinSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
 
                                     const val = if (parts.table) |tbl| blk: {
                                         if (std.mem.eql(u8, tbl, cmd.table_name)) {
-                                            break :blk base_row.get(parts.column);
+                                            break :blk base_row.get(parts.column) orelse ColumnValue.null_value;
                                         } else {
-                                            break :blk join_row.get(parts.column);
+                                            break :blk join_row.get(parts.column) orelse ColumnValue.null_value;
                                         }
                                     } else blk: {
-                                        break :blk base_row.get(col_name) orelse join_row.get(col_name);
+                                        // Try both tables (unqualified column name)
+                                        break :blk (base_row.get(col_name) orelse join_row.get(col_name) orelse ColumnValue.null_value);
                                     };
 
-                                    try result_row.append(try (val orelse ColumnValue.null_value).clone(db.allocator));
+                                    try result_row.append(try val.clone(db.allocator));
                                 }
                             }
                         }
@@ -616,15 +608,15 @@ fn executeJoinSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
 
                                 const val = if (parts.table) |tbl| blk: {
                                     if (std.mem.eql(u8, tbl, cmd.table_name)) {
-                                        break :blk base_row.get(parts.column);
+                                        break :blk base_row.get(parts.column) orelse ColumnValue.null_value;
                                     } else {
-                                        break :blk null; // NULL for join table columns
+                                        break :blk ColumnValue.null_value; // NULL for join table columns
                                     }
                                 } else blk: {
-                                    break :blk base_row.get(col_name);
+                                    break :blk base_row.get(col_name) orelse ColumnValue.null_value;
                                 };
 
-                                try result_row.append(try (val orelse ColumnValue.null_value).clone(db.allocator));
+                                try result_row.append(try val.clone(db.allocator));
                             }
                         }
                     }
@@ -680,15 +672,16 @@ fn executeJoinSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
 
                                     const val = if (parts.table) |tbl| blk: {
                                         if (std.mem.eql(u8, tbl, cmd.table_name)) {
-                                            break :blk base_row.get(parts.column);
+                                            break :blk base_row.get(parts.column) orelse ColumnValue.null_value;
                                         } else {
-                                            break :blk join_row.get(parts.column);
+                                            break :blk join_row.get(parts.column) orelse ColumnValue.null_value;
                                         }
                                     } else blk: {
-                                        break :blk base_row.get(col_name) orelse join_row.get(col_name);
+                                        // Try both tables (unqualified column name)
+                                        break :blk (base_row.get(col_name) orelse join_row.get(col_name) orelse ColumnValue.null_value);
                                     };
 
-                                    try result_row.append(try (val orelse ColumnValue.null_value).clone(db.allocator));
+                                    try result_row.append(try val.clone(db.allocator));
                                 }
                             }
                         }
@@ -717,15 +710,15 @@ fn executeJoinSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
 
                                 const val = if (parts.table) |tbl| blk: {
                                     if (std.mem.eql(u8, tbl, cmd.table_name)) {
-                                        break :blk null; // NULL for base table columns
+                                        break :blk ColumnValue.null_value; // NULL for base table columns
                                     } else {
-                                        break :blk join_row.get(parts.column);
+                                        break :blk join_row.get(parts.column) orelse ColumnValue.null_value;
                                     }
                                 } else blk: {
-                                    break :blk join_row.get(col_name);
+                                    break :blk join_row.get(col_name) orelse ColumnValue.null_value;
                                 };
 
-                                try result_row.append(try (val orelse ColumnValue.null_value).clone(db.allocator));
+                                try result_row.append(try val.clone(db.allocator));
                             }
                         }
                     }
