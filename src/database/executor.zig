@@ -4,6 +4,7 @@ const Database = core.Database;
 const QueryResult = core.QueryResult;
 const valuesEqual = core.valuesEqual;
 const recovery = @import("recovery.zig");
+const hash_join = @import("hash_join.zig");
 const Table = @import("../table.zig").Table;
 const ColumnValue = @import("../table.zig").ColumnValue;
 const ColumnType = @import("../table.zig").ColumnType;
@@ -411,6 +412,37 @@ fn splitQualifiedColumn(col_name: []const u8) struct { table: ?[]const u8, colum
     return .{ .table = null, .column = col_name };
 }
 
+/// Estimate the number of rows in a table
+fn estimateTableSize(table: *Table, allocator: Allocator) !usize {
+    // Simple estimation: count all rows
+    // In the future, we could track this in table metadata for O(1) access
+    const row_ids = try table.getAllRows(allocator);
+    defer allocator.free(row_ids);
+    return row_ids.len;
+}
+
+/// Cost-based optimizer: decide whether to use hash join or nested loop
+fn shouldUseHashJoin(base_table_size: usize, join_table_size: usize) bool {
+    const total_size = base_table_size + join_table_size;
+
+    // Threshold: below this size, nested loop is comparable or faster
+    // (Hash join has overhead from hash table construction)
+    const MIN_SIZE_FOR_HASH = 100;
+
+    if (total_size < MIN_SIZE_FOR_HASH) {
+        return false; // Use nested loop for small tables
+    }
+
+    // For larger tables, hash join is almost always faster for equi-joins
+    // Nested loop cost: O(n * m) comparisons
+    // Hash join cost: O(n + m) operations with some constant overhead
+
+    const nested_cost = base_table_size * join_table_size;
+    const hash_cost = total_size * 5; // Rough estimate with overhead factor
+
+    return hash_cost < nested_cost;
+}
+
 /// Execute a SELECT query with JOINs
 fn executeJoinSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
     var result = QueryResult.init(db.allocator);
@@ -429,6 +461,27 @@ fn executeJoinSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
     const left_parts = splitQualifiedColumn(join.left_column);
     const right_parts = splitQualifiedColumn(join.right_column);
 
+    // Cost-based optimizer: decide whether to use hash join or nested loop
+    const base_size = try estimateTableSize(base_table, db.allocator);
+    const join_size = try estimateTableSize(join_table, db.allocator);
+
+    if (shouldUseHashJoin(base_size, join_size)) {
+        // Use hash join for better performance on large tables
+        return hash_join.executeHashJoin(
+            db.allocator,
+            base_table,
+            join_table,
+            cmd.table_name,
+            join.table_name,
+            join.join_type,
+            left_parts.column,
+            right_parts.column,
+            cmd.columns.items.len == 1 and cmd.columns.items[0] == .star,
+            cmd.columns.items,
+        );
+    }
+
+    // Fall back to nested loop join for small tables or when hash join is not beneficial
     // Setup result columns
     const select_all = cmd.columns.items.len == 1 and cmd.columns.items[0] == .star;
 
