@@ -19,7 +19,6 @@ const ColumnValue = @import("table.zig").ColumnValue;
 /// - Leaf nodes contain row IDs
 /// - Internal nodes contain child pointers
 /// - All leaves are at the same level (balanced)
-
 /// B-tree order (maximum number of children = ORDER * 2)
 pub const ORDER: usize = 16;
 pub const MAX_KEYS: usize = ORDER * 2 - 1; // 31 keys

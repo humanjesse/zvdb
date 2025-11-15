@@ -209,9 +209,9 @@ pub const AggregateExpr = struct {
 
 /// Column selection with optional aggregation
 pub const SelectColumn = union(enum) {
-    regular: []const u8,      // Regular column: "name"
+    regular: []const u8, // Regular column: "name"
     aggregate: AggregateExpr, // Aggregate: COUNT(*), SUM(balance)
-    star: void,               // SELECT *
+    star: void, // SELECT *
 
     pub fn deinit(self: *SelectColumn, allocator: Allocator) void {
         switch (self.*) {
@@ -224,20 +224,20 @@ pub const SelectColumn = union(enum) {
 
 /// Binary operators for WHERE expressions
 pub const BinaryOp = enum {
-    eq,     // =
-    neq,    // !=
-    lt,     // <
-    gt,     // >
-    lte,    // <=
-    gte,    // >=
+    eq, // =
+    neq, // !=
+    lt, // <
+    gt, // >
+    lte, // <=
+    gte, // >=
     and_op, // AND
-    or_op,  // OR
+    or_op, // OR
 };
 
 /// Unary operators for WHERE expressions
 pub const UnaryOp = enum {
-    not,         // NOT
-    is_null,     // IS NULL
+    not, // NOT
+    is_null, // IS NULL
     is_not_null, // IS NOT NULL
 };
 
@@ -332,8 +332,8 @@ pub const JoinType = enum {
 pub const JoinClause = struct {
     join_type: JoinType,
     table_name: []const u8,
-    left_column: []const u8,   // e.g., "users.id" or "id"
-    right_column: []const u8,  // e.g., "orders.user_id" or "user_id"
+    left_column: []const u8, // e.g., "users.id" or "id"
+    right_column: []const u8, // e.g., "orders.user_id" or "user_id"
 
     pub fn deinit(self: *JoinClause, allocator: Allocator) void {
         allocator.free(self.table_name);
@@ -790,7 +790,7 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
                 i += 1;
             } else {
                 // Parse as expression - find end of WHERE clause
-                var where_end = i - 1;  // Start from the first token after WHERE
+                var where_end = i - 1; // Start from the first token after WHERE
                 while (where_end < tokens.len) {
                     if (eqlIgnoreCase(tokens[where_end].text, "GROUP") or
                         eqlIgnoreCase(tokens[where_end].text, "ORDER") or
@@ -816,7 +816,8 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
             // Parse comma-separated list of columns
             while (i < tokens.len) {
                 if (eqlIgnoreCase(tokens[i].text, "ORDER") or
-                    eqlIgnoreCase(tokens[i].text, "LIMIT")) {
+                    eqlIgnoreCase(tokens[i].text, "LIMIT"))
+                {
                     break;
                 }
 
@@ -1090,7 +1091,8 @@ fn parsePrimaryExpr(allocator: Allocator, tokens: []const Token, idx: *usize) (A
     if (token_text[0] == '"' or token_text[0] == '\'' or
         std.ascii.isDigit(token_text[0]) or token_text[0] == '-' or
         eqlIgnoreCase(token_text, "true") or eqlIgnoreCase(token_text, "false") or
-        eqlIgnoreCase(token_text, "NULL")) {
+        eqlIgnoreCase(token_text, "NULL"))
+    {
         const value = try parseValue(allocator, token_text);
         idx.* += 1;
         return Expr{ .literal = value };

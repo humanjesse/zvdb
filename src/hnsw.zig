@@ -776,7 +776,6 @@ pub fn HNSW(comptime T: type) type {
             return result.toOwnedSlice();
         }
 
-
         /// Save the index to a file
         pub fn save(self: *Self, path: []const u8) !void {
             // Ensure parent directory exists

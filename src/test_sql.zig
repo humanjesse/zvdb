@@ -1532,7 +1532,6 @@ test "WAL Recovery: UPDATE operations" {
         var db = Database.init(testing.allocator);
         defer db.deinit();
 
-
         var create = try db.execute("CREATE TABLE products (id int, name text, price int)");
         defer create.deinit();
 
@@ -1578,7 +1577,6 @@ test "WAL Recovery: Idempotent recovery (running twice)" {
     {
         var db = Database.init(testing.allocator);
         defer db.deinit();
-
 
         var create = try db.execute("CREATE TABLE data (id int, value int)");
         defer create.deinit();
@@ -1649,7 +1647,7 @@ test "WAL Recovery: HNSW index rebuild after recovery" {
 
             std.mem.writeInt(u64, combined_data[0..8], old_serialized.len, .little);
             @memcpy(combined_data[8..][0..old_serialized.len], old_serialized);
-            @memcpy(combined_data[8 + old_serialized.len..][0..new_serialized.len], new_serialized);
+            @memcpy(combined_data[8 + old_serialized.len ..][0..new_serialized.len], new_serialized);
 
             _ = try db.writeWalRecord(.update_row, "docs", i, combined_data);
         }
@@ -1777,7 +1775,6 @@ test "WAL Crash: Mid-transaction crash (no commit)" {
         var db = Database.init(testing.allocator);
         defer db.deinit();
 
-
         var create = try db.execute("CREATE TABLE orders (id int, total int)");
         defer create.deinit();
 
@@ -1827,7 +1824,6 @@ test "WAL Crash: Power failure during fsync" {
     {
         var db = Database.init(testing.allocator);
         defer db.deinit();
-
 
         var create = try db.execute("CREATE TABLE logs (id int, msg text)");
         defer create.deinit();
@@ -1950,7 +1946,6 @@ test "WAL Crash: Large transaction recovery" {
         var db = Database.init(testing.allocator);
         defer db.deinit();
 
-
         var create = try db.execute("CREATE TABLE bulk_data (id int, value int)");
         defer create.deinit();
 
@@ -2014,7 +2009,6 @@ test "WAL Crash: Interleaved INSERT/UPDATE/DELETE" {
     {
         var db = Database.init(testing.allocator);
         defer db.deinit();
-
 
         var create = try db.execute("CREATE TABLE inventory (id int, qty int, status text)");
         defer create.deinit();
@@ -2080,7 +2074,6 @@ test "WAL Crash: Recovery with WAL file rotation" {
         var db = Database.init(testing.allocator);
         defer db.deinit();
 
-
         var create = try db.execute("CREATE TABLE rotated (id int, data text)");
         defer create.deinit();
 
@@ -2123,7 +2116,6 @@ test "WAL Crash: Recovery performance with large dataset" {
     {
         var db = Database.init(testing.allocator);
         defer db.deinit();
-
 
         var create = try db.execute("CREATE TABLE perf_test (id int, name text, score int)");
         defer create.deinit();
