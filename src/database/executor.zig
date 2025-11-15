@@ -22,6 +22,316 @@ const TxRow = Transaction.Row;
 const Allocator = std.mem.Allocator;
 
 // ============================================================================
+// Subquery Execution Support
+// ============================================================================
+
+/// Execute a subquery and return the result
+fn executeSubquery(
+    db: *Database,
+    subquery: *const sql.SelectCmd,
+    allocator: Allocator,
+) !QueryResult {
+    // Execute the nested SELECT statement
+    return executeSelect(db, subquery.*);
+}
+
+/// Evaluate IN operator with subquery
+/// Returns true if left_val is in the subquery result set
+fn evaluateInSubquery(
+    db: *Database,
+    left_val: ColumnValue,
+    subquery: *const sql.SelectCmd,
+    allocator: Allocator,
+    negate: bool,
+) !bool {
+    // Execute subquery
+    var result = try executeSubquery(db, subquery, allocator);
+    defer result.deinit();
+
+    // Subquery for IN must return a single column
+    if (result.columns.items.len != 1) {
+        return error.InvalidSubquery;
+    }
+
+    // Check if left_val is in the result set
+    for (result.rows.items) |row| {
+        if (row.items.len > 0) {
+            const val = row.items[0];
+            if (valuesEqual(left_val, val)) {
+                return !negate; // Found match
+            }
+        }
+    }
+
+    return negate; // No match found
+}
+
+/// Evaluate EXISTS operator
+/// Returns true if subquery returns at least one row
+fn evaluateExistsSubquery(
+    db: *Database,
+    subquery: *const sql.SelectCmd,
+    allocator: Allocator,
+    negate: bool,
+) !bool {
+    // Execute subquery
+    var result = try executeSubquery(db, subquery, allocator);
+    defer result.deinit();
+
+    // EXISTS returns true if result has at least one row
+    const has_rows = result.rows.items.len > 0;
+    return if (negate) !has_rows else has_rows;
+}
+
+/// Evaluate scalar subquery (returns single value)
+/// Used for comparisons like: WHERE price > (SELECT AVG(price) ...)
+fn evaluateScalarSubquery(
+    db: *Database,
+    subquery: *const sql.SelectCmd,
+    allocator: Allocator,
+) !ColumnValue {
+    var result = try executeSubquery(db, subquery, allocator);
+    defer result.deinit();
+
+    // Scalar subquery must return exactly 1 column
+    if (result.columns.items.len != 1) {
+        return error.InvalidSubquery;
+    }
+
+    // Scalar subquery should return 0 or 1 rows
+    if (result.rows.items.len == 0) {
+        // SQL standard: return NULL if no rows
+        return ColumnValue.null_value;
+    }
+
+    if (result.rows.items.len > 1) {
+        // SQL standard: error if more than 1 row
+        return error.SubqueryReturnedMultipleRows;
+    }
+
+    // Return the single value (clone it since result will be deinit'd)
+    return result.rows.items[0].items[0].clone(allocator);
+}
+
+/// Enhanced expression evaluator that handles subqueries
+/// This wraps sql.evaluateExpr and adds subquery execution support
+pub fn evaluateExprWithSubqueries(
+    db: *Database,
+    expr: sql.Expr,
+    row_values: anytype,
+) !bool {
+    // For non-binary expressions, delegate to sql.evaluateExpr
+    if (expr != .binary) {
+        return sql.evaluateExpr(expr, row_values, @ptrCast(db));
+    }
+
+    const bin = expr.binary;
+
+    // Handle subquery operators
+    switch (bin.op) {
+        .in_op => {
+            // IN operator: left_val IN (subquery)
+            if (bin.right != .subquery) {
+                // Not a subquery - fall back to standard evaluation
+                return sql.evaluateExpr(expr, row_values, @ptrCast(db));
+            }
+
+            // Get left value
+            const left_val = getExprValueFromExpr(bin.left, row_values, db) catch {
+                return false;
+            };
+
+            // Evaluate IN subquery
+            return evaluateInSubquery(
+                db,
+                left_val,
+                bin.right.subquery,
+                db.allocator,
+                false, // not negated
+            ) catch false;
+        },
+
+        .not_in_op => {
+            // NOT IN operator
+            if (bin.right != .subquery) {
+                return sql.evaluateExpr(expr, row_values, @ptrCast(db));
+            }
+
+            const left_val = getExprValueFromExpr(bin.left, row_values, db) catch {
+                return false;
+            };
+
+            return evaluateInSubquery(
+                db,
+                left_val,
+                bin.right.subquery,
+                db.allocator,
+                true, // negated
+            ) catch false;
+        },
+
+        .exists_op => {
+            // EXISTS operator
+            if (bin.right != .subquery) {
+                return sql.evaluateExpr(expr, row_values, @ptrCast(db));
+            }
+
+            return evaluateExistsSubquery(
+                db,
+                bin.right.subquery,
+                db.allocator,
+                false, // not negated
+            ) catch false;
+        },
+
+        .not_exists_op => {
+            // NOT EXISTS operator
+            if (bin.right != .subquery) {
+                return sql.evaluateExpr(expr, row_values, @ptrCast(db));
+            }
+
+            return evaluateExistsSubquery(
+                db,
+                bin.right.subquery,
+                db.allocator,
+                true, // negated
+            ) catch false;
+        },
+
+        // For comparison operators, check if right side is a scalar subquery
+        .eq, .neq, .lt, .gt, .lte, .gte => {
+            if (bin.right == .subquery) {
+                // Scalar subquery comparison
+                const left_val = getExprValueFromExpr(bin.left, row_values, db) catch {
+                    return false;
+                };
+
+                const right_val = evaluateScalarSubquery(
+                    db,
+                    bin.right.subquery,
+                    db.allocator,
+                ) catch {
+                    return false;
+                };
+                defer {
+                    var val = right_val;
+                    val.deinit(db.allocator);
+                }
+
+                return compareValuesWithOp(left_val, right_val, bin.op);
+            } else {
+                // Regular comparison - delegate to sql.evaluateExpr
+                return sql.evaluateExpr(expr, row_values, @ptrCast(db));
+            }
+        },
+
+        // For AND/OR, need to recursively evaluate with subquery support
+        .and_op => {
+            const left_result = try evaluateExprWithSubqueries(db, bin.left, row_values);
+            const right_result = try evaluateExprWithSubqueries(db, bin.right, row_values);
+            return left_result and right_result;
+        },
+
+        .or_op => {
+            const left_result = try evaluateExprWithSubqueries(db, bin.left, row_values);
+            const right_result = try evaluateExprWithSubqueries(db, bin.right, row_values);
+            return left_result or right_result;
+        },
+    }
+}
+
+/// Helper to extract value from expression (needed for subquery evaluation)
+fn getExprValueFromExpr(
+    expr: sql.Expr,
+    row_values: anytype,
+    db: *Database,
+) !ColumnValue {
+    switch (expr) {
+        .literal => |val| return val,
+        .column => |col| {
+            var it = row_values.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, col)) {
+                    return entry.value_ptr.*;
+                }
+            }
+            return ColumnValue.null_value;
+        },
+        .subquery => |sq| {
+            // Evaluate as scalar subquery
+            return evaluateScalarSubquery(db, sq, db.allocator);
+        },
+        .binary, .unary => {
+            // Evaluate as boolean and convert
+            const result = try evaluateExprWithSubqueries(db, expr, row_values);
+            return ColumnValue{ .bool = result };
+        },
+    }
+}
+
+/// Helper for comparing values with binary operator
+fn compareValuesWithOp(left: ColumnValue, right: ColumnValue, op: sql.BinaryOp) bool {
+    // Handle NULL comparisons
+    if (left == .null_value or right == .null_value) {
+        return false; // NULL comparisons return false
+    }
+
+    switch (op) {
+        .eq => {
+            return valuesEqual(left, right);
+        },
+        .neq => {
+            return !valuesEqual(left, right);
+        },
+        .lt => {
+            return switch (left) {
+                .int => |li| switch (right) {
+                    .int => |ri| li < ri,
+                    .float => |rf| @as(f64, @floatFromInt(li)) < rf,
+                    else => false,
+                },
+                .float => |lf| switch (right) {
+                    .int => |ri| lf < @as(f64, @floatFromInt(ri)),
+                    .float => |rf| lf < rf,
+                    else => false,
+                },
+                .text => |lt| switch (right) {
+                    .text => |rt| std.mem.order(u8, lt, rt) == .lt,
+                    else => false,
+                },
+                else => false,
+            };
+        },
+        .gt => {
+            return switch (left) {
+                .int => |li| switch (right) {
+                    .int => |ri| li > ri,
+                    .float => |rf| @as(f64, @floatFromInt(li)) > rf,
+                    else => false,
+                },
+                .float => |lf| switch (right) {
+                    .int => |ri| lf > @as(f64, @floatFromInt(ri)),
+                    .float => |rf| lf > rf,
+                    else => false,
+                },
+                .text => |lt| switch (right) {
+                    .text => |rt| std.mem.order(u8, lt, rt) == .gt,
+                    else => false,
+                },
+                else => false,
+            };
+        },
+        .lte => {
+            return compareValuesWithOp(left, right, .lt) or compareValuesWithOp(left, right, .eq);
+        },
+        .gte => {
+            return compareValuesWithOp(left, right, .gt) or compareValuesWithOp(left, right, .eq);
+        },
+        else => return false,
+    }
+}
+
+// ============================================================================
 // Aggregate Functions Support
 // ============================================================================
 
@@ -424,11 +734,12 @@ fn splitQualifiedColumn(col_name: []const u8) struct { table: ?[]const u8, colum
 /// Design: We build a StringHashMap from the row values using column names from the result,
 /// then leverage the existing sql.evaluateExpr infrastructure for complex WHERE expressions
 fn evaluateWhereOnJoinedRow(
-    allocator: Allocator,
+    db: *Database,
     row_values: []const ColumnValue,
     column_names: []const []const u8,
     cmd: sql.SelectCmd,
 ) !bool {
+    const allocator = db.allocator;
     // Simple WHERE: column = value (fast path)
     if (cmd.where_column != null and cmd.where_value != null and cmd.where_expr == null) {
         const where_col = cmd.where_column.?;
@@ -478,9 +789,8 @@ fn evaluateWhereOnJoinedRow(
             }
         }
 
-        // Evaluate the expression
-        // TODO: Pass actual database pointer for subquery support in Phase 2.2
-        return sql.evaluateExpr(expr, row_map, null);
+        // Evaluate the expression with subquery support
+        return evaluateExprWithSubqueries(db, expr, row_map);
     }
 
     // No WHERE clause - row passes
@@ -552,10 +862,11 @@ fn projectToSelectedColumns(
 /// Apply WHERE filter to a QueryResult (for 2-table joins)
 /// Returns a new QueryResult with only rows that pass the WHERE clause
 fn applyWhereToQueryResult(
-    allocator: Allocator,
+    db: *Database,
     result: *QueryResult,
     cmd: sql.SelectCmd,
 ) !QueryResult {
+    const allocator = db.allocator;
     // If no WHERE clause, return original result
     if (cmd.where_column == null and cmd.where_expr == null) {
         // Return a copy of the result
@@ -584,7 +895,7 @@ fn applyWhereToQueryResult(
     // Filter rows
     for (result.rows.items) |row| {
         const matches = try evaluateWhereOnJoinedRow(
-            allocator,
+            db,
             row.items,
             result.columns.items,
             cmd,
@@ -939,7 +1250,7 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
 
         // Apply WHERE clause filter if present
         if (has_where) {
-            var filtered = try applyWhereToQueryResult(db.allocator, &join_result, cmd);
+            var filtered = try applyWhereToQueryResult(db, &join_result, cmd);
             join_result.deinit();
 
             // If we joined with all columns but need specific columns, project now
@@ -1160,7 +1471,7 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
 
     // Apply WHERE clause filter if present
     if (has_where) {
-        var filtered = try applyWhereToQueryResult(db.allocator, &result, cmd);
+        var filtered = try applyWhereToQueryResult(db, &result, cmd);
         result.deinit();
 
         // If we included all columns but need specific columns, project now
@@ -1223,7 +1534,7 @@ fn executeMultiTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) 
 
     // Apply WHERE clause filter if present
     if (cmd.where_column != null or cmd.where_expr != null) {
-        const filtered = try applyWhereFilter(db.allocator, &current_intermediate, cmd);
+        const filtered = try applyWhereFilter(db, &current_intermediate, cmd);
         current_intermediate.deinit();
         current_intermediate = filtered;
     }
@@ -1411,10 +1722,11 @@ fn executeJoinStage(
 
 /// Apply WHERE clause filter to intermediate result (post-join filtering)
 fn applyWhereFilter(
-    allocator: Allocator,
+    db: *Database,
     intermediate: *IntermediateResult,
     cmd: sql.SelectCmd,
 ) !IntermediateResult {
+    const allocator = db.allocator;
     var filtered = IntermediateResult.init(allocator);
     errdefer filtered.deinit();
 
@@ -1434,7 +1746,7 @@ fn applyWhereFilter(
     // Filter rows using our shared helper
     for (intermediate.rows.items) |row| {
         const matches = try evaluateWhereOnJoinedRow(
-            allocator,
+            db,
             row.items,
             column_names.items,
             cmd,
@@ -1604,9 +1916,9 @@ fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
                     if (!valuesEqual(row_val, where_val)) continue;
                 }
             } else if (cmd.where_expr) |expr| {
-                // Evaluate complex WHERE expression
-                // TODO: Pass actual database pointer for subquery support in Phase 2.2
-                if (!sql.evaluateExpr(expr, row.values, null)) continue;
+                // Evaluate complex WHERE expression with subquery support
+                const matches = evaluateExprWithSubqueries(db, expr, row.values) catch false;
+                if (!matches) continue;
             }
         }
 
@@ -1715,9 +2027,9 @@ fn executeAggregateSelect(db: *Database, table: *Table, cmd: sql.SelectCmd) !Que
                 if (!valuesEqual(row_val, where_val)) continue;
             }
         } else if (cmd.where_expr) |expr| {
-            // Evaluate complex WHERE expression
-            // TODO: Pass actual database pointer for subquery support in Phase 2.2
-            if (!sql.evaluateExpr(expr, row.values, null)) continue;
+            // Evaluate complex WHERE expression with subquery support
+            const matches = evaluateExprWithSubqueries(db, expr, row.values) catch false;
+            if (!matches) continue;
         }
 
         // Accumulate in all aggregate states
@@ -1823,9 +2135,9 @@ fn executeGroupBySelect(db: *Database, table: *Table, cmd: sql.SelectCmd) !Query
                 if (!valuesEqual(row_val, where_val)) continue;
             }
         } else if (cmd.where_expr) |expr| {
-            // Evaluate complex WHERE expression
-            // TODO: Pass actual database pointer for subquery support in Phase 2.2
-            if (!sql.evaluateExpr(expr, row.values, null)) continue;
+            // Evaluate complex WHERE expression with subquery support
+            const matches = evaluateExprWithSubqueries(db, expr, row.values) catch false;
+            if (!matches) continue;
         }
 
         // Create group key
@@ -2014,11 +2326,10 @@ fn executeUpdate(db: *Database, cmd: sql.UpdateCmd) !QueryResult {
     for (row_ids) |row_id| {
         var row = table.get(row_id) orelse continue;
 
-        // Apply WHERE filter using expression evaluator
+        // Apply WHERE filter using expression evaluator with subquery support
         var should_update = true;
         if (cmd.where_expr) |expr| {
-            // TODO: Pass actual database pointer for subquery support in Phase 2.2
-            should_update = sql.evaluateExpr(expr, row.values, null);
+            should_update = evaluateExprWithSubqueries(db, expr, row.values) catch false;
         }
 
         if (!should_update) continue;
