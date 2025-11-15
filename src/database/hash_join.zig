@@ -8,7 +8,7 @@ const ColumnValue = @import("../table.zig").ColumnValue;
 const Row = @import("../table.zig").Row;
 const sql = @import("../sql.zig");
 const JoinType = sql.JoinType;
-const ColumnSpec = sql.ColumnSpec;
+const SelectColumn = sql.SelectColumn;
 const Allocator = std.mem.Allocator;
 const ArrayList = std.array_list.Managed;
 const AutoHashMap = std.AutoHashMap;
@@ -188,11 +188,11 @@ fn emitJoinedRow(
     base_table: *Table,
     join_table: *Table,
     base_table_name: []const u8,
-    join_table_name: []const u8,
+    _: []const u8,
     base_row: ?*const Row,
     join_row: ?*const Row,
     select_all: bool,
-    columns: []const ColumnSpec,
+    columns: []const SelectColumn,
 ) !void {
     var result_row = ArrayList(ColumnValue).init(allocator);
 
@@ -268,7 +268,7 @@ pub fn executeHashJoin(
     left_column: []const u8,
     right_column: []const u8,
     select_all: bool,
-    columns: []const ColumnSpec,
+    columns: []const SelectColumn,
 ) !QueryResult {
     var result = QueryResult.init(allocator);
 
@@ -368,7 +368,7 @@ fn executeInnerHashJoin(
     left_column: []const u8,
     right_column: []const u8,
     select_all: bool,
-    columns: []const ColumnSpec,
+    columns: []const SelectColumn,
     result: *QueryResult,
 ) !void {
     // Build phase: hash the join table (build table)
@@ -429,7 +429,7 @@ fn executeLeftHashJoin(
     left_column: []const u8,
     right_column: []const u8,
     select_all: bool,
-    columns: []const ColumnSpec,
+    columns: []const SelectColumn,
     result: *QueryResult,
 ) !void {
     // Build phase: hash the join table
@@ -552,7 +552,7 @@ fn executeRightHashJoin(
     left_column: []const u8,
     right_column: []const u8,
     select_all: bool,
-    columns: []const ColumnSpec,
+    columns: []const SelectColumn,
     result: *QueryResult,
 ) !void {
     // Build phase: hash the base table (reversed)

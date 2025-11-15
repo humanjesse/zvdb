@@ -167,7 +167,7 @@ test "buildHashTable: basic functionality" {
 
     // Create a simple table
     var table = try Table.init(allocator, "test_table");
-    defer table.deinit(allocator);
+    defer table.deinit();
 
     try table.addColumn("id", .int);
     try table.addColumn("name", .text);
@@ -206,7 +206,7 @@ test "buildHashTable: NULL keys are skipped" {
     const allocator = testing.allocator;
 
     var table = try Table.init(allocator, "test_table");
-    defer table.deinit(allocator);
+    defer table.deinit();
 
     try table.addColumn("id", .int);
     try table.addColumn("value", .int);
@@ -237,7 +237,7 @@ test "buildHashTable: duplicate join keys" {
     const allocator = testing.allocator;
 
     var table = try Table.init(allocator, "test_table");
-    defer table.deinit(allocator);
+    defer table.deinit();
 
     try table.addColumn("category", .int);
     try table.addColumn("value", .int);
@@ -272,20 +272,27 @@ test "hash join produces same results as nested loop for INNER JOIN" {
 
     // Create users table
     var users = try Table.init(allocator, "users");
-    defer users.deinit(allocator);
+    defer users.deinit();
     try users.addColumn("id", .int);
     try users.addColumn("name", .text);
 
     // Create orders table
     var orders = try Table.init(allocator, "orders");
-    defer orders.deinit(allocator);
+    defer orders.deinit();
     try orders.addColumn("user_id", .int);
     try orders.addColumn("amount", .float);
 
     // Insert users
     for (1..6) |i| {
         var values = std.StringHashMap(ColumnValue).init(allocator);
-        defer values.deinit();
+        defer {
+            var it = values.iterator();
+            while (it.next()) |entry| {
+                var val = entry.value_ptr.*;
+                val.deinit(allocator);
+            }
+            values.deinit();
+        }
         try values.put("id", ColumnValue{ .int = @intCast(i) });
         const name = try std.fmt.allocPrint(allocator, "User{d}", .{i});
         defer allocator.free(name);
@@ -321,7 +328,7 @@ test "hash join produces same results as nested loop for INNER JOIN" {
         "id",
         "user_id",
         true, // SELECT *
-        &[_]sql.ColumnSpec{},
+        &[_]sql.SelectColumn{},
     );
     defer hash_result.deinit();
 
@@ -339,19 +346,26 @@ test "hash join LEFT JOIN includes unmatched rows" {
 
     // Create tables
     var users = try Table.init(allocator, "users");
-    defer users.deinit(allocator);
+    defer users.deinit();
     try users.addColumn("id", .int);
     try users.addColumn("name", .text);
 
     var orders = try Table.init(allocator, "orders");
-    defer orders.deinit(allocator);
+    defer orders.deinit();
     try orders.addColumn("user_id", .int);
     try orders.addColumn("amount", .float);
 
     // Insert 3 users
     for (1..4) |i| {
         var values = std.StringHashMap(ColumnValue).init(allocator);
-        defer values.deinit();
+        defer {
+            var it = values.iterator();
+            while (it.next()) |entry| {
+                var val = entry.value_ptr.*;
+                val.deinit(allocator);
+            }
+            values.deinit();
+        }
         try values.put("id", ColumnValue{ .int = @intCast(i) });
         const name = try std.fmt.allocPrint(allocator, "User{d}", .{i});
         defer allocator.free(name);
@@ -378,7 +392,7 @@ test "hash join LEFT JOIN includes unmatched rows" {
         "id",
         "user_id",
         true,
-        &[_]sql.ColumnSpec{},
+        &[_]sql.SelectColumn{},
     );
     defer result.deinit();
 
@@ -402,18 +416,25 @@ test "hash join RIGHT JOIN includes unmatched rows from right table" {
 
     // Create tables
     var users = try Table.init(allocator, "users");
-    defer users.deinit(allocator);
+    defer users.deinit();
     try users.addColumn("id", .int);
     try users.addColumn("name", .text);
 
     var orders = try Table.init(allocator, "orders");
-    defer orders.deinit(allocator);
+    defer orders.deinit();
     try orders.addColumn("user_id", .int);
     try orders.addColumn("amount", .float);
 
     // Insert 1 user
     var user_values = std.StringHashMap(ColumnValue).init(allocator);
-    defer user_values.deinit();
+    defer {
+        var it = user_values.iterator();
+        while (it.next()) |entry| {
+            var val = entry.value_ptr.*;
+            val.deinit(allocator);
+        }
+        user_values.deinit();
+    }
     try user_values.put("id", ColumnValue{ .int = 1 });
     const name_owned = try allocator.dupe(u8, "Alice");
     try user_values.put("name", ColumnValue{ .text = name_owned });
@@ -445,7 +466,7 @@ test "hash join RIGHT JOIN includes unmatched rows from right table" {
         "id",
         "user_id",
         true,
-        &[_]sql.ColumnSpec{},
+        &[_]sql.SelectColumn{},
     );
     defer result.deinit();
 
@@ -470,11 +491,11 @@ test "hash join handles empty tables" {
     const allocator = testing.allocator;
 
     var table1 = try Table.init(allocator, "table1");
-    defer table1.deinit(allocator);
+    defer table1.deinit();
     try table1.addColumn("id", .int);
 
     var table2 = try Table.init(allocator, "table2");
-    defer table2.deinit(allocator);
+    defer table2.deinit();
     try table2.addColumn("id", .int);
 
     // Both tables empty
@@ -488,7 +509,7 @@ test "hash join handles empty tables" {
         "id",
         "id",
         true,
-        &[_]sql.ColumnSpec{},
+        &[_]sql.SelectColumn{},
     );
     defer result.deinit();
 
@@ -500,24 +521,38 @@ test "hash join with different data types" {
 
     // Test with text join keys
     var table1 = try Table.init(allocator, "table1");
-    defer table1.deinit(allocator);
+    defer table1.deinit();
     try table1.addColumn("code", .text);
     try table1.addColumn("value", .int);
 
     var table2 = try Table.init(allocator, "table2");
-    defer table2.deinit(allocator);
+    defer table2.deinit();
     try table2.addColumn("code", .text);
     try table2.addColumn("description", .text);
 
     // Insert data
     var values1 = std.StringHashMap(ColumnValue).init(allocator);
-    defer values1.deinit();
+    defer {
+        var it = values1.iterator();
+        while (it.next()) |entry| {
+            var val = entry.value_ptr.*;
+            val.deinit(allocator);
+        }
+        values1.deinit();
+    }
     try values1.put("code", ColumnValue{ .text = try allocator.dupe(u8, "ABC") });
     try values1.put("value", ColumnValue{ .int = 100 });
     _ = try table1.insert(values1);
 
     var values2 = std.StringHashMap(ColumnValue).init(allocator);
-    defer values2.deinit();
+    defer {
+        var it = values2.iterator();
+        while (it.next()) |entry| {
+            var val = entry.value_ptr.*;
+            val.deinit(allocator);
+        }
+        values2.deinit();
+    }
     try values2.put("code", ColumnValue{ .text = try allocator.dupe(u8, "ABC") });
     try values2.put("description", ColumnValue{ .text = try allocator.dupe(u8, "Test") });
     _ = try table2.insert(values2);
@@ -533,7 +568,7 @@ test "hash join with different data types" {
         "code",
         "code",
         true,
-        &[_]sql.ColumnSpec{},
+        &[_]sql.SelectColumn{},
     );
     defer result.deinit();
 
