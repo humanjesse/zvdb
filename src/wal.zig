@@ -1055,7 +1055,9 @@ test "WalWriter: init and deinit" {
     const allocator = testing.allocator;
 
     // Create temporary directory for test
-    const test_dir = "test_wal_init";
+    const random_id = std.crypto.random.int(u64);
+    const test_dir = try std.fmt.allocPrint(allocator, "test_wal_init_{x}", .{random_id});
+    defer allocator.free(test_dir);
     defer std.fs.cwd().deleteTree(test_dir) catch {};
 
     var writer = try WalWriter.init(allocator, test_dir);
@@ -1068,7 +1070,9 @@ test "WalWriter: init and deinit" {
 test "WalWriter: write and flush record" {
     const allocator = testing.allocator;
 
-    const test_dir = "test_wal_write";
+    const random_id = std.crypto.random.int(u64);
+    const test_dir = try std.fmt.allocPrint(allocator, "test_wal_write_{x}", .{random_id});
+    defer allocator.free(test_dir);
     defer std.fs.cwd().deleteTree(test_dir) catch {};
 
     var writer = try WalWriter.init(allocator, test_dir);
@@ -1096,7 +1100,9 @@ test "WalWriter: write and flush record" {
 test "WalWriter: multiple records" {
     const allocator = testing.allocator;
 
-    const test_dir = "test_wal_multiple";
+    const random_id = std.crypto.random.int(u64);
+    const test_dir = try std.fmt.allocPrint(allocator, "test_wal_multiple_{x}", .{random_id});
+    defer allocator.free(test_dir);
     defer std.fs.cwd().deleteTree(test_dir) catch {};
 
     var writer = try WalWriter.init(allocator, test_dir);
@@ -1143,7 +1149,9 @@ test "WalWriter: multiple records" {
 test "WalWriter: checkpoint" {
     const allocator = testing.allocator;
 
-    const test_dir = "test_wal_checkpoint";
+    const random_id = std.crypto.random.int(u64);
+    const test_dir = try std.fmt.allocPrint(allocator, "test_wal_checkpoint_{x}", .{random_id});
+    defer allocator.free(test_dir);
     defer std.fs.cwd().deleteTree(test_dir) catch {};
 
     var writer = try WalWriter.init(allocator, test_dir);
@@ -1168,7 +1176,9 @@ test "WalWriter: checkpoint" {
 test "WalReader: read records" {
     const allocator = testing.allocator;
 
-    const test_dir = "test_wal_read";
+    const random_id = std.crypto.random.int(u64);
+    const test_dir = try std.fmt.allocPrint(allocator, "test_wal_read_{x}", .{random_id});
+    defer allocator.free(test_dir);
     defer std.fs.cwd().deleteTree(test_dir) catch {};
 
     // Write some records
@@ -1254,7 +1264,10 @@ test "WalReader: read records" {
 test "WalWriter: file rotation" {
     const allocator = testing.allocator;
 
-    const test_dir = "test_wal_rotation";
+    // Generate unique directory name to avoid race conditions when tests run in parallel
+    const random_id = std.crypto.random.int(u64);
+    const test_dir = try std.fmt.allocPrint(allocator, "test_wal_rotation_{x}", .{random_id});
+    defer allocator.free(test_dir);
     defer std.fs.cwd().deleteTree(test_dir) catch {};
 
     // Create writer with small max file size to trigger rotation
@@ -1289,7 +1302,9 @@ test "WalWriter: file rotation" {
 test "WalWriter and WalReader: round-trip with large data" {
     const allocator = testing.allocator;
 
-    const test_dir = "test_wal_roundtrip";
+    const random_id = std.crypto.random.int(u64);
+    const test_dir = try std.fmt.allocPrint(allocator, "test_wal_roundtrip_{x}", .{random_id});
+    defer allocator.free(test_dir);
     defer std.fs.cwd().deleteTree(test_dir) catch {};
 
     const large_data = try allocator.alloc(u8, 10000);
@@ -1426,7 +1441,9 @@ test "WalReader: rejects dangerous path on init" {
 test "WalWriter: disk quota enforcement" {
     const allocator = testing.allocator;
 
-    const test_dir = "test_wal_quota";
+    const random_id = std.crypto.random.int(u64);
+    const test_dir = try std.fmt.allocPrint(allocator, "test_wal_quota_{x}", .{random_id});
+    defer allocator.free(test_dir);
     defer std.fs.cwd().deleteTree(test_dir) catch {};
 
     // Create writer with very small quota (1KB)
@@ -1477,7 +1494,10 @@ test "WalWriter: disk quota enforcement" {
 test "WalWriter: cleanup old files reduces quota" {
     const allocator = testing.allocator;
 
-    const test_dir = "test_wal_cleanup";
+    // Generate unique directory name to avoid race conditions when tests run in parallel
+    const random_id = std.crypto.random.int(u64);
+    const test_dir = try std.fmt.allocPrint(allocator, "test_wal_cleanup_{x}", .{random_id});
+    defer allocator.free(test_dir);
     defer std.fs.cwd().deleteTree(test_dir) catch {};
 
     var writer = try WalWriter.initWithOptions(allocator, test_dir, .{
@@ -1519,7 +1539,9 @@ test "WalWriter: cleanup old files reduces quota" {
 test "WalWriter: rejects symlink" {
     const allocator = testing.allocator;
 
-    const test_dir = "test_wal_symlink";
+    const random_id = std.crypto.random.int(u64);
+    const test_dir = try std.fmt.allocPrint(allocator, "test_wal_symlink_{x}", .{random_id});
+    defer allocator.free(test_dir);
     defer std.fs.cwd().deleteTree(test_dir) catch {};
 
     // Create directory
@@ -1527,13 +1549,16 @@ test "WalWriter: rejects symlink" {
 
     // Create a regular file
     {
-        const target_file = try std.fs.cwd().createFile(test_dir ++ "/target.txt", .{});
+        const target_file_path = try std.fmt.allocPrint(allocator, "{s}/target.txt", .{test_dir});
+        defer allocator.free(target_file_path);
+        const target_file = try std.fs.cwd().createFile(target_file_path, .{});
         defer target_file.close();
         try target_file.writeAll("target");
     }
 
     // Create symlink to the file (if supported by OS)
-    const symlink_path = test_dir ++ "/wal.000000";
+    const symlink_path = try std.fmt.allocPrint(allocator, "{s}/wal.000000", .{test_dir});
+    defer allocator.free(symlink_path);
     std.posix.symlink("target.txt", symlink_path) catch |err| {
         // Skip test on systems without symlink support or if not permitted
         std.debug.print("Skipping symlink test: {}\n", .{err});
@@ -1550,7 +1575,9 @@ test "WalWriter: rejects symlink" {
 test "WalWriter: total size tracking accurate" {
     const allocator = testing.allocator;
 
-    const test_dir = "test_wal_size_tracking";
+    const random_id = std.crypto.random.int(u64);
+    const test_dir = try std.fmt.allocPrint(allocator, "test_wal_size_tracking_{x}", .{random_id});
+    defer allocator.free(test_dir);
     defer std.fs.cwd().deleteTree(test_dir) catch {};
 
     var writer = try WalWriter.init(allocator, test_dir);
@@ -1580,7 +1607,9 @@ test "WalWriter: total size tracking accurate" {
 test "WalReader: rejects symlink" {
     const allocator = testing.allocator;
 
-    const test_dir = "test_walreader_symlink";
+    const random_id = std.crypto.random.int(u64);
+    const test_dir = try std.fmt.allocPrint(allocator, "test_walreader_symlink_{x}", .{random_id});
+    defer allocator.free(test_dir);
     defer std.fs.cwd().deleteTree(test_dir) catch {};
 
     // Create test directory
@@ -1601,7 +1630,8 @@ test "WalReader: rejects symlink" {
     writer.deinit();
 
     // Create symlink to the WAL file
-    const symlink_path = test_dir ++ "/wal_symlink.000000";
+    const symlink_path = try std.fmt.allocPrint(allocator, "{s}/wal_symlink.000000", .{test_dir});
+    defer allocator.free(symlink_path);
     const target_path = "wal.000000";
     std.posix.symlink(target_path, symlink_path) catch |err| {
         std.debug.print("Skipping symlink test: {}\n", .{err});
@@ -1661,7 +1691,9 @@ test "isSymlink: returns false for non-existent file" {
 test "WalWriter: deleteOldWalFiles rejects deleting current file" {
     const allocator = testing.allocator;
 
-    const test_dir = "test_wal_delete_current";
+    const random_id = std.crypto.random.int(u64);
+    const test_dir = try std.fmt.allocPrint(allocator, "test_wal_delete_current_{x}", .{random_id});
+    defer allocator.free(test_dir);
     defer std.fs.cwd().deleteTree(test_dir) catch {};
 
     var writer = try WalWriter.init(allocator, test_dir);
@@ -1693,7 +1725,9 @@ test "WalWriter: deleteOldWalFiles rejects deleting current file" {
 test "WalWriter: deleteOldWalFiles with sequence 0 is no-op" {
     const allocator = testing.allocator;
 
-    const test_dir = "test_wal_delete_zero";
+    const random_id = std.crypto.random.int(u64);
+    const test_dir = try std.fmt.allocPrint(allocator, "test_wal_delete_zero_{x}", .{random_id});
+    defer allocator.free(test_dir);
     defer std.fs.cwd().deleteTree(test_dir) catch {};
 
     var writer = try WalWriter.init(allocator, test_dir);
@@ -1727,7 +1761,9 @@ test "WalWriter: deleteOldWalFiles with sequence 0 is no-op" {
 test "WalWriter: quota enforcement with very small limit" {
     const allocator = testing.allocator;
 
-    const test_dir = "test_wal_small_quota";
+    const random_id = std.crypto.random.int(u64);
+    const test_dir = try std.fmt.allocPrint(allocator, "test_wal_small_quota_{x}", .{random_id});
+    defer allocator.free(test_dir);
     defer std.fs.cwd().deleteTree(test_dir) catch {};
 
     // Create writer with extremely small quota (100 bytes)
@@ -1765,7 +1801,9 @@ test "WalWriter: quota enforcement with very small limit" {
 test "WalWriter: size tracking across file rotation" {
     const allocator = testing.allocator;
 
-    const test_dir = "test_wal_rotation_size";
+    const random_id = std.crypto.random.int(u64);
+    const test_dir = try std.fmt.allocPrint(allocator, "test_wal_rotation_size_{x}", .{random_id});
+    defer allocator.free(test_dir);
     defer std.fs.cwd().deleteTree(test_dir) catch {};
 
     // Create writer with small max_file_size to force rotation
