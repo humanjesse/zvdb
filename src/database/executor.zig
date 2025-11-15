@@ -414,6 +414,87 @@ fn splitQualifiedColumn(col_name: []const u8) struct { table: ?[]const u8, colum
     return .{ .table = null, .column = col_name };
 }
 
+/// Emit a joined row for nested loop joins
+/// Handles both SELECT * and specific column selection
+/// Accepts optional base_row and join_row (null for unmatched rows in outer joins)
+fn emitNestedLoopJoinRow(
+    result: *QueryResult,
+    allocator: Allocator,
+    base_table: *Table,
+    join_table: *Table,
+    base_table_name: []const u8,
+    _: []const u8, // join_table_name (unused but kept for signature consistency)
+    base_row: ?*const Row,
+    join_row: ?*const Row,
+    select_all: bool,
+    columns: []const sql.SelectColumn,
+) !void {
+    var result_row = ArrayList(ColumnValue).init(allocator);
+    errdefer {
+        for (result_row.items) |*val| {
+            var v = val.*;
+            v.deinit(allocator);
+        }
+        result_row.deinit();
+    }
+
+    if (select_all) {
+        // Add all columns from base table
+        for (base_table.columns.items) |col| {
+            const val = if (base_row) |br|
+                br.get(col.name) orelse ColumnValue.null_value
+            else
+                ColumnValue.null_value;
+            try result_row.append(try val.clone(allocator));
+        }
+        // Add all columns from join table
+        for (join_table.columns.items) |col| {
+            const val = if (join_row) |jr|
+                jr.get(col.name) orelse ColumnValue.null_value
+            else
+                ColumnValue.null_value;
+            try result_row.append(try val.clone(allocator));
+        }
+    } else {
+        // Add only selected columns
+        for (columns) |col_spec| {
+            if (col_spec == .regular) {
+                const col_name = col_spec.regular;
+                const parts = splitQualifiedColumn(col_name);
+
+                const val = if (parts.table) |tbl| blk: {
+                    if (std.mem.eql(u8, tbl, base_table_name)) {
+                        if (base_row) |br| {
+                            break :blk br.get(parts.column) orelse ColumnValue.null_value;
+                        } else {
+                            break :blk ColumnValue.null_value;
+                        }
+                    } else {
+                        if (join_row) |jr| {
+                            break :blk jr.get(parts.column) orelse ColumnValue.null_value;
+                        } else {
+                            break :blk ColumnValue.null_value;
+                        }
+                    }
+                } else blk: {
+                    // Try both tables (unqualified column name)
+                    if (base_row) |br| {
+                        if (br.get(col_name)) |v| break :blk v;
+                    }
+                    if (join_row) |jr| {
+                        if (jr.get(col_name)) |v| break :blk v;
+                    }
+                    break :blk ColumnValue.null_value;
+                };
+
+                try result_row.append(try val.clone(allocator));
+            }
+        }
+    }
+
+    try result.addRow(result_row);
+}
+
 /// Estimate the number of rows in a table
 fn estimateTableSize(table: *Table, allocator: Allocator) !usize {
     // Simple estimation: count all rows
@@ -714,44 +795,19 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
 
                     // Check join condition
                     if (valuesEqual(left_val, right_val)) {
-                        // Match! Create result row
-                        var result_row = ArrayList(ColumnValue).init(db.allocator);
-
-                        if (select_all) {
-                            // Add all columns from base table
-                            for (base_table.columns.items) |col| {
-                                const val = base_row.get(col.name) orelse ColumnValue.null_value;
-                                try result_row.append(try val.clone(db.allocator));
-                            }
-                            // Add all columns from join table
-                            for (join_table.columns.items) |col| {
-                                const val = join_row.get(col.name) orelse ColumnValue.null_value;
-                                try result_row.append(try val.clone(db.allocator));
-                            }
-                        } else {
-                            // Add only selected columns
-                            for (cmd.columns.items) |col_spec| {
-                                if (col_spec == .regular) {
-                                    const col_name = col_spec.regular;
-                                    const parts = splitQualifiedColumn(col_name);
-
-                                    const val = if (parts.table) |tbl| blk: {
-                                        if (std.mem.eql(u8, tbl, cmd.table_name)) {
-                                            break :blk base_row.get(parts.column) orelse ColumnValue.null_value;
-                                        } else {
-                                            break :blk join_row.get(parts.column) orelse ColumnValue.null_value;
-                                        }
-                                    } else blk: {
-                                        // Try both tables (unqualified column name)
-                                        break :blk (base_row.get(col_name) orelse join_row.get(col_name) orelse ColumnValue.null_value);
-                                    };
-
-                                    try result_row.append(try val.clone(db.allocator));
-                                }
-                            }
-                        }
-
-                        try result.addRow(result_row);
+                        // Match! Emit joined row
+                        try emitNestedLoopJoinRow(
+                            &result,
+                            db.allocator,
+                            base_table,
+                            join_table,
+                            cmd.table_name,
+                            join.table_name,
+                            base_row,
+                            join_row,
+                            select_all,
+                            cmd.columns.items,
+                        );
                     }
                 }
             }
@@ -761,16 +817,19 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
             for (base_row_ids) |base_id| {
                 const base_row = base_table.get(base_id) orelse continue;
                 const left_val = base_row.get(left_parts.column) orelse {
-                    // Base row has NULL in join column - still include with NULLs
-                    var result_row = ArrayList(ColumnValue).init(db.allocator);
-                    for (base_table.columns.items) |col| {
-                        const val = base_row.get(col.name) orelse ColumnValue.null_value;
-                        try result_row.append(try val.clone(db.allocator));
-                    }
-                    for (join_table.columns.items) |_| {
-                        try result_row.append(ColumnValue.null_value);
-                    }
-                    try result.addRow(result_row);
+                    // Base row has NULL in join column - still include with NULLs for join table
+                    try emitNestedLoopJoinRow(
+                        &result,
+                        db.allocator,
+                        base_table,
+                        join_table,
+                        cmd.table_name,
+                        join.table_name,
+                        base_row,
+                        null, // No join row (emit NULLs)
+                        select_all,
+                        cmd.columns.items,
+                    );
                     continue;
                 };
 
@@ -782,78 +841,36 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
 
                     if (valuesEqual(left_val, right_val)) {
                         matched = true;
-                        // Create result row (same as INNER JOIN)
-                        var result_row = ArrayList(ColumnValue).init(db.allocator);
-
-                        if (select_all) {
-                            for (base_table.columns.items) |col| {
-                                const val = base_row.get(col.name) orelse ColumnValue.null_value;
-                                try result_row.append(try val.clone(db.allocator));
-                            }
-                            for (join_table.columns.items) |col| {
-                                const val = join_row.get(col.name) orelse ColumnValue.null_value;
-                                try result_row.append(try val.clone(db.allocator));
-                            }
-                        } else {
-                            for (cmd.columns.items) |col_spec| {
-                                if (col_spec == .regular) {
-                                    const col_name = col_spec.regular;
-                                    const parts = splitQualifiedColumn(col_name);
-
-                                    const val = if (parts.table) |tbl| blk: {
-                                        if (std.mem.eql(u8, tbl, cmd.table_name)) {
-                                            break :blk base_row.get(parts.column) orelse ColumnValue.null_value;
-                                        } else {
-                                            break :blk join_row.get(parts.column) orelse ColumnValue.null_value;
-                                        }
-                                    } else blk: {
-                                        // Try both tables (unqualified column name)
-                                        break :blk (base_row.get(col_name) orelse join_row.get(col_name) orelse ColumnValue.null_value);
-                                    };
-
-                                    try result_row.append(try val.clone(db.allocator));
-                                }
-                            }
-                        }
-
-                        try result.addRow(result_row);
+                        // Match! Emit joined row
+                        try emitNestedLoopJoinRow(
+                            &result,
+                            db.allocator,
+                            base_table,
+                            join_table,
+                            cmd.table_name,
+                            join.table_name,
+                            base_row,
+                            join_row,
+                            select_all,
+                            cmd.columns.items,
+                        );
                     }
                 }
 
                 // LEFT JOIN: If no match, still include base row with NULLs for join table
                 if (!matched) {
-                    var result_row = ArrayList(ColumnValue).init(db.allocator);
-
-                    if (select_all) {
-                        for (base_table.columns.items) |col| {
-                            const val = base_row.get(col.name) orelse ColumnValue.null_value;
-                            try result_row.append(try val.clone(db.allocator));
-                        }
-                        for (join_table.columns.items) |_| {
-                            try result_row.append(ColumnValue.null_value);
-                        }
-                    } else {
-                        for (cmd.columns.items) |col_spec| {
-                            if (col_spec == .regular) {
-                                const col_name = col_spec.regular;
-                                const parts = splitQualifiedColumn(col_name);
-
-                                const val = if (parts.table) |tbl| blk: {
-                                    if (std.mem.eql(u8, tbl, cmd.table_name)) {
-                                        break :blk base_row.get(parts.column) orelse ColumnValue.null_value;
-                                    } else {
-                                        break :blk ColumnValue.null_value; // NULL for join table columns
-                                    }
-                                } else blk: {
-                                    break :blk base_row.get(col_name) orelse ColumnValue.null_value;
-                                };
-
-                                try result_row.append(try val.clone(db.allocator));
-                            }
-                        }
-                    }
-
-                    try result.addRow(result_row);
+                    try emitNestedLoopJoinRow(
+                        &result,
+                        db.allocator,
+                        base_table,
+                        join_table,
+                        cmd.table_name,
+                        join.table_name,
+                        base_row,
+                        null, // No join row (emit NULLs)
+                        select_all,
+                        cmd.columns.items,
+                    );
                 }
             }
         },
@@ -863,16 +880,19 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
             for (join_row_ids) |join_id| {
                 const join_row = join_table.get(join_id) orelse continue;
                 const right_val = join_row.get(right_parts.column) orelse {
-                    // Join row has NULL in join column - still include with NULLs
-                    var result_row = ArrayList(ColumnValue).init(db.allocator);
-                    for (base_table.columns.items) |_| {
-                        try result_row.append(ColumnValue.null_value);
-                    }
-                    for (join_table.columns.items) |col| {
-                        const val = join_row.get(col.name) orelse ColumnValue.null_value;
-                        try result_row.append(try val.clone(db.allocator));
-                    }
-                    try result.addRow(result_row);
+                    // Join row has NULL in join column - still include with NULLs for base table
+                    try emitNestedLoopJoinRow(
+                        &result,
+                        db.allocator,
+                        base_table,
+                        join_table,
+                        cmd.table_name,
+                        join.table_name,
+                        null, // No base row (emit NULLs)
+                        join_row,
+                        select_all,
+                        cmd.columns.items,
+                    );
                     continue;
                 };
 
@@ -884,78 +904,36 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
 
                     if (valuesEqual(left_val, right_val)) {
                         matched = true;
-                        // Create result row (same as INNER JOIN)
-                        var result_row = ArrayList(ColumnValue).init(db.allocator);
-
-                        if (select_all) {
-                            for (base_table.columns.items) |col| {
-                                const val = base_row.get(col.name) orelse ColumnValue.null_value;
-                                try result_row.append(try val.clone(db.allocator));
-                            }
-                            for (join_table.columns.items) |col| {
-                                const val = join_row.get(col.name) orelse ColumnValue.null_value;
-                                try result_row.append(try val.clone(db.allocator));
-                            }
-                        } else {
-                            for (cmd.columns.items) |col_spec| {
-                                if (col_spec == .regular) {
-                                    const col_name = col_spec.regular;
-                                    const parts = splitQualifiedColumn(col_name);
-
-                                    const val = if (parts.table) |tbl| blk: {
-                                        if (std.mem.eql(u8, tbl, cmd.table_name)) {
-                                            break :blk base_row.get(parts.column) orelse ColumnValue.null_value;
-                                        } else {
-                                            break :blk join_row.get(parts.column) orelse ColumnValue.null_value;
-                                        }
-                                    } else blk: {
-                                        // Try both tables (unqualified column name)
-                                        break :blk (base_row.get(col_name) orelse join_row.get(col_name) orelse ColumnValue.null_value);
-                                    };
-
-                                    try result_row.append(try val.clone(db.allocator));
-                                }
-                            }
-                        }
-
-                        try result.addRow(result_row);
+                        // Match! Emit joined row
+                        try emitNestedLoopJoinRow(
+                            &result,
+                            db.allocator,
+                            base_table,
+                            join_table,
+                            cmd.table_name,
+                            join.table_name,
+                            base_row,
+                            join_row,
+                            select_all,
+                            cmd.columns.items,
+                        );
                     }
                 }
 
                 // RIGHT JOIN: If no match, still include join row with NULLs for base table
                 if (!matched) {
-                    var result_row = ArrayList(ColumnValue).init(db.allocator);
-
-                    if (select_all) {
-                        for (base_table.columns.items) |_| {
-                            try result_row.append(ColumnValue.null_value);
-                        }
-                        for (join_table.columns.items) |col| {
-                            const val = join_row.get(col.name) orelse ColumnValue.null_value;
-                            try result_row.append(try val.clone(db.allocator));
-                        }
-                    } else {
-                        for (cmd.columns.items) |col_spec| {
-                            if (col_spec == .regular) {
-                                const col_name = col_spec.regular;
-                                const parts = splitQualifiedColumn(col_name);
-
-                                const val = if (parts.table) |tbl| blk: {
-                                    if (std.mem.eql(u8, tbl, cmd.table_name)) {
-                                        break :blk ColumnValue.null_value; // NULL for base table columns
-                                    } else {
-                                        break :blk join_row.get(parts.column) orelse ColumnValue.null_value;
-                                    }
-                                } else blk: {
-                                    break :blk join_row.get(col_name) orelse ColumnValue.null_value;
-                                };
-
-                                try result_row.append(try val.clone(db.allocator));
-                            }
-                        }
-                    }
-
-                    try result.addRow(result_row);
+                    try emitNestedLoopJoinRow(
+                        &result,
+                        db.allocator,
+                        base_table,
+                        join_table,
+                        cmd.table_name,
+                        join.table_name,
+                        null, // No base row (emit NULLs)
+                        join_row,
+                        select_all,
+                        cmd.columns.items,
+                    );
                 }
             }
         },
