@@ -685,8 +685,9 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
     i += 1;
 
     var joins = ArrayList(JoinClause).init(allocator);
-    var where_column: ?[]const u8 = null;
-    var where_value: ?ColumnValue = null;
+    const where_column: ?[]const u8 = null;
+    const where_value: ?ColumnValue = null;
+    var where_expr: ?Expr = null;
     var similar_to_column: ?[]const u8 = null;
     var similar_to_text: ?[]const u8 = null;
     var order_by_similarity: ?[]const u8 = null;
@@ -774,39 +775,36 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
         if (eqlIgnoreCase(tokens[i].text, "WHERE")) {
             i += 1;
             if (i >= tokens.len) return SqlError.InvalidSyntax;
-            where_column = try allocator.dupe(u8, tokens[i].text);
+
+            // Check for SIMILAR TO special case
+            const where_start = i;
+            const first_token = tokens[i].text;
             i += 1;
 
-            // Check for SIMILAR TO
             if (i + 1 < tokens.len and eqlIgnoreCase(tokens[i].text, "SIMILAR") and eqlIgnoreCase(tokens[i + 1].text, "TO")) {
-                similar_to_column = where_column;
-                where_column = null;
+                similar_to_column = try allocator.dupe(u8, first_token);
                 i += 2;
                 if (i >= tokens.len) return SqlError.InvalidSyntax;
                 const text = parseString(tokens[i].text);
                 similar_to_text = try allocator.dupe(u8, text);
                 i += 1;
-            } else if (i + 1 < tokens.len and std.mem.eql(u8, tokens[i].text, "=")) {
-                i += 1;
-                const token_text = tokens[i].text;
-                if (token_text[0] == '"' or token_text[0] == '\'') {
-                    const str = parseString(token_text);
-                    const owned = try allocator.dupe(u8, str);
-                    where_value = ColumnValue{ .text = owned };
-                } else if (std.mem.indexOf(u8, token_text, ".")) |_| {
-                    const f = try std.fmt.parseFloat(f64, token_text);
-                    where_value = ColumnValue{ .float = f };
-                } else if (eqlIgnoreCase(token_text, "true")) {
-                    where_value = ColumnValue{ .bool = true };
-                } else if (eqlIgnoreCase(token_text, "false")) {
-                    where_value = ColumnValue{ .bool = false };
-                } else if (eqlIgnoreCase(token_text, "NULL")) {
-                    where_value = ColumnValue.null_value;
-                } else {
-                    const num = try std.fmt.parseInt(i64, token_text, 10);
-                    where_value = ColumnValue{ .int = num };
+            } else {
+                // Parse as expression - find end of WHERE clause
+                var where_end = i - 1;  // Start from the first token after WHERE
+                while (where_end < tokens.len) {
+                    if (eqlIgnoreCase(tokens[where_end].text, "GROUP") or
+                        eqlIgnoreCase(tokens[where_end].text, "ORDER") or
+                        eqlIgnoreCase(tokens[where_end].text, "LIMIT"))
+                    {
+                        break;
+                    }
+                    where_end += 1;
                 }
-                i += 1;
+
+                // Parse the WHERE expression
+                var expr_idx = where_start;
+                where_expr = try parseExpr(allocator, tokens[0..where_end], &expr_idx);
+                i = where_end;
             }
         } else if (eqlIgnoreCase(tokens[i].text, "GROUP")) {
             i += 1;
@@ -866,7 +864,7 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
         .joins = joins,
         .where_column = where_column,
         .where_value = where_value,
-        .where_expr = null, // TODO: Parse complex WHERE expressions
+        .where_expr = where_expr,
         .similar_to_column = similar_to_column,
         .similar_to_text = similar_to_text,
         .order_by_similarity = order_by_similarity,

@@ -486,6 +486,68 @@ fn evaluateWhereOnJoinedRow(
     return true;
 }
 
+/// Project a QueryResult to selected columns
+/// Used after WHERE filtering when we joined with all columns
+fn projectToSelectedColumns(
+    allocator: Allocator,
+    result: *QueryResult,
+    selected_columns: []const sql.SelectColumn,
+) !QueryResult {
+    var projected = QueryResult.init(allocator);
+    errdefer projected.deinit();
+
+    // Add selected column names to result schema
+    for (selected_columns) |col_spec| {
+        switch (col_spec) {
+            .regular => |col_name| try projected.addColumn(col_name),
+            .star => {
+                // Copy all columns
+                for (result.columns.items) |col| {
+                    try projected.addColumn(col);
+                }
+            },
+            .aggregate => return error.AggregateNotSupportedInJoin,
+        }
+    }
+
+    // Project each row
+    for (result.rows.items) |row| {
+        var projected_row = ArrayList(ColumnValue).init(allocator);
+
+        for (selected_columns) |col_spec| {
+            if (col_spec == .regular) {
+                const col_name = col_spec.regular;
+
+                // Find this column in the result
+                var found = false;
+                for (result.columns.items, 0..) |result_col, idx| {
+                    if (std.mem.eql(u8, result_col, col_name)) {
+                        if (idx < row.items.len) {
+                            try projected_row.append(try row.items[idx].clone(allocator));
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (!found) {
+                    // Column not found - add NULL
+                    try projected_row.append(ColumnValue.null_value);
+                }
+            } else if (col_spec == .star) {
+                // Copy all values
+                for (row.items) |val| {
+                    try projected_row.append(try val.clone(allocator));
+                }
+            }
+        }
+
+        try projected.addRow(projected_row);
+    }
+
+    return projected;
+}
+
 /// Apply WHERE filter to a QueryResult (for 2-table joins)
 /// Returns a new QueryResult with only rows that pass the WHERE clause
 fn applyWhereToQueryResult(
@@ -854,6 +916,13 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
 
     if (shouldUseHashJoin(base_size, join_size)) {
         // Use hash join for better performance on large tables
+        const select_all = cmd.columns.items.len == 1 and cmd.columns.items[0] == .star;
+        const has_where = cmd.where_column != null or cmd.where_expr != null;
+
+        // If we have a WHERE clause and not SELECT *, we need to join with all columns first,
+        // then filter, then project to the selected columns
+        const join_with_all_columns = has_where and !select_all;
+
         var join_result = try hash_join.executeHashJoin(
             db.allocator,
             base_table,
@@ -863,14 +932,22 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
             join.join_type,
             left_parts.column,
             right_parts.column,
-            cmd.columns.items.len == 1 and cmd.columns.items[0] == .star,
-            cmd.columns.items,
+            join_with_all_columns or select_all, // Include all columns if WHERE needs them
+            if (join_with_all_columns) &[_]sql.SelectColumn{} else cmd.columns.items,
         );
 
         // Apply WHERE clause filter if present
-        if (cmd.where_column != null or cmd.where_expr != null) {
-            defer join_result.deinit();
-            return applyWhereToQueryResult(db.allocator, &join_result, cmd);
+        if (has_where) {
+            var filtered = try applyWhereToQueryResult(db.allocator, &join_result, cmd);
+            join_result.deinit();
+
+            // If we joined with all columns but need specific columns, project now
+            if (join_with_all_columns) {
+                defer filtered.deinit();
+                return projectToSelectedColumns(db.allocator, &filtered, cmd.columns.items);
+            }
+
+            return filtered;
         }
 
         return join_result;
@@ -879,9 +956,13 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
     // Fall back to nested loop join for small tables or when hash join is not beneficial
     // Setup result columns
     const select_all = cmd.columns.items.len == 1 and cmd.columns.items[0] == .star;
+    const has_where = cmd.where_column != null or cmd.where_expr != null;
 
-    if (select_all) {
-        // SELECT * includes all columns from both tables with qualified names
+    // If we have WHERE and not SELECT *, include all columns for filtering, then project later
+    const include_all_columns = select_all or (has_where and !select_all);
+
+    if (include_all_columns) {
+        // Include all columns from both tables with qualified names
         for (base_table.columns.items) |col| {
             const qualified = try std.fmt.allocPrint(
                 db.allocator,
@@ -942,7 +1023,7 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
                             join.table_name,
                             base_row,
                             join_row,
-                            select_all,
+                            include_all_columns,
                             cmd.columns.items,
                         );
                     }
@@ -964,7 +1045,7 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
                         join.table_name,
                         base_row,
                         null, // No join row (emit NULLs)
-                        select_all,
+                        include_all_columns,
                         cmd.columns.items,
                     );
                     continue;
@@ -988,7 +1069,7 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
                             join.table_name,
                             base_row,
                             join_row,
-                            select_all,
+                            include_all_columns,
                             cmd.columns.items,
                         );
                     }
@@ -1005,7 +1086,7 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
                         join.table_name,
                         base_row,
                         null, // No join row (emit NULLs)
-                        select_all,
+                        include_all_columns,
                         cmd.columns.items,
                     );
                 }
@@ -1027,7 +1108,7 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
                         join.table_name,
                         null, // No base row (emit NULLs)
                         join_row,
-                        select_all,
+                        include_all_columns,
                         cmd.columns.items,
                     );
                     continue;
@@ -1051,7 +1132,7 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
                             join.table_name,
                             base_row,
                             join_row,
-                            select_all,
+                            include_all_columns,
                             cmd.columns.items,
                         );
                     }
@@ -1068,7 +1149,7 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
                         join.table_name,
                         null, // No base row (emit NULLs)
                         join_row,
-                        select_all,
+                        include_all_columns,
                         cmd.columns.items,
                     );
                 }
@@ -1077,9 +1158,17 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
     }
 
     // Apply WHERE clause filter if present
-    if (cmd.where_column != null or cmd.where_expr != null) {
-        defer result.deinit();
-        return applyWhereToQueryResult(db.allocator, &result, cmd);
+    if (has_where) {
+        var filtered = try applyWhereToQueryResult(db.allocator, &result, cmd);
+        result.deinit();
+
+        // If we included all columns but need specific columns, project now
+        if (include_all_columns and !select_all) {
+            defer filtered.deinit();
+            return projectToSelectedColumns(db.allocator, &filtered, cmd.columns.items);
+        }
+
+        return filtered;
     }
 
     return result;
@@ -1507,11 +1596,15 @@ fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
 
         // Apply WHERE filter (skip if we already used an index to filter)
         if (!use_index) {
+            // Try simple WHERE first (for backward compatibility and optimization)
             if (cmd.where_column) |where_col| {
                 if (cmd.where_value) |where_val| {
                     const row_val = row.get(where_col) orelse continue;
                     if (!valuesEqual(row_val, where_val)) continue;
                 }
+            } else if (cmd.where_expr) |expr| {
+                // Evaluate complex WHERE expression
+                if (!sql.evaluateExpr(expr, row.values)) continue;
             }
         }
 
@@ -1619,6 +1712,9 @@ fn executeAggregateSelect(db: *Database, table: *Table, cmd: sql.SelectCmd) !Que
                 const row_val = row.get(where_col) orelse continue;
                 if (!valuesEqual(row_val, where_val)) continue;
             }
+        } else if (cmd.where_expr) |expr| {
+            // Evaluate complex WHERE expression
+            if (!sql.evaluateExpr(expr, row.values)) continue;
         }
 
         // Accumulate in all aggregate states
@@ -1723,6 +1819,9 @@ fn executeGroupBySelect(db: *Database, table: *Table, cmd: sql.SelectCmd) !Query
                 const row_val = row.get(where_col) orelse continue;
                 if (!valuesEqual(row_val, where_val)) continue;
             }
+        } else if (cmd.where_expr) |expr| {
+            // Evaluate complex WHERE expression
+            if (!sql.evaluateExpr(expr, row.values)) continue;
         }
 
         // Create group key
