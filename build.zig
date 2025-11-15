@@ -110,6 +110,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_multi_table_join_tests = b.addRunArtifact(multi_table_join_tests);
 
+    const join_where_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_join_where.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_join_where_tests = b.addRunArtifact(join_where_tests);
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_hnsw_tests.step);
     test_step.dependOn(&run_sql_tests.step);
@@ -121,6 +130,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_sql_standards_tests.step);
     test_step.dependOn(&run_hash_join_tests.step);
     test_step.dependOn(&run_multi_table_join_tests.step);
+    test_step.dependOn(&run_join_where_tests.step);
 
     // Add unit tests
     // const unit_tests = b.addTest(.{

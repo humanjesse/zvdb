@@ -414,6 +414,135 @@ fn splitQualifiedColumn(col_name: []const u8) struct { table: ?[]const u8, colum
     return .{ .table = null, .column = col_name };
 }
 
+// ============================================================================
+// WHERE Clause Evaluation for JOINs
+// ============================================================================
+
+/// Evaluate WHERE clause on a joined row
+/// Works with QueryResult rows where columns are in a specific order
+///
+/// Design: We build a StringHashMap from the row values using column names from the result,
+/// then leverage the existing sql.evaluateExpr infrastructure for complex WHERE expressions
+fn evaluateWhereOnJoinedRow(
+    allocator: Allocator,
+    row_values: []const ColumnValue,
+    column_names: []const []const u8,
+    cmd: sql.SelectCmd,
+) !bool {
+    // Simple WHERE: column = value (fast path)
+    if (cmd.where_column != null and cmd.where_value != null and cmd.where_expr == null) {
+        const where_col = cmd.where_column.?;
+        const where_val = cmd.where_value.?;
+
+        // Find the column in the result schema
+        for (column_names, 0..) |col_name, idx| {
+            // Match both qualified (table.column) and unqualified (column) names
+            const matches = std.mem.eql(u8, col_name, where_col) or blk: {
+                // Try matching unqualified part of qualified name
+                if (std.mem.indexOf(u8, col_name, ".")) |dot_idx| {
+                    const unqualified = col_name[dot_idx + 1 ..];
+                    break :blk std.mem.eql(u8, unqualified, where_col);
+                }
+                break :blk false;
+            };
+
+            if (matches) {
+                const row_val = if (idx < row_values.len) row_values[idx] else ColumnValue.null_value;
+                return valuesEqual(row_val, where_val);
+            }
+        }
+
+        // Column not found - row doesn't pass filter
+        return false;
+    }
+
+    // Complex WHERE: use expression evaluator
+    if (cmd.where_expr) |expr| {
+        // Build a StringHashMap for the expression evaluator
+        var row_map = StringHashMap(ColumnValue).init(allocator);
+        defer row_map.deinit();
+
+        // Populate map with all column values
+        for (column_names, 0..) |col_name, idx| {
+            if (idx < row_values.len) {
+                try row_map.put(col_name, row_values[idx]);
+
+                // Also add unqualified version if it's a qualified name
+                if (std.mem.indexOf(u8, col_name, ".")) |dot_idx| {
+                    const unqualified = col_name[dot_idx + 1 ..];
+                    // Only add if not already present (avoid ambiguous column conflicts)
+                    if (!row_map.contains(unqualified)) {
+                        try row_map.put(unqualified, row_values[idx]);
+                    }
+                }
+            }
+        }
+
+        // Evaluate the expression
+        return sql.evaluateExpr(expr, row_map);
+    }
+
+    // No WHERE clause - row passes
+    return true;
+}
+
+/// Apply WHERE filter to a QueryResult (for 2-table joins)
+/// Returns a new QueryResult with only rows that pass the WHERE clause
+fn applyWhereToQueryResult(
+    allocator: Allocator,
+    result: *QueryResult,
+    cmd: sql.SelectCmd,
+) !QueryResult {
+    // If no WHERE clause, return original result
+    if (cmd.where_column == null and cmd.where_expr == null) {
+        // Return a copy of the result
+        var filtered = QueryResult.init(allocator);
+        for (result.columns.items) |col| {
+            try filtered.addColumn(col);
+        }
+        for (result.rows.items) |row| {
+            var filtered_row = ArrayList(ColumnValue).init(allocator);
+            for (row.items) |val| {
+                try filtered_row.append(try val.clone(allocator));
+            }
+            try filtered.addRow(filtered_row);
+        }
+        return filtered;
+    }
+
+    // Create filtered result with same schema
+    var filtered = QueryResult.init(allocator);
+    errdefer filtered.deinit();
+
+    for (result.columns.items) |col| {
+        try filtered.addColumn(col);
+    }
+
+    // Filter rows
+    for (result.rows.items) |row| {
+        const matches = try evaluateWhereOnJoinedRow(
+            allocator,
+            row.items,
+            result.columns.items,
+            cmd,
+        );
+
+        if (matches) {
+            var filtered_row = ArrayList(ColumnValue).init(allocator);
+            for (row.items) |val| {
+                try filtered_row.append(try val.clone(allocator));
+            }
+            try filtered.addRow(filtered_row);
+        }
+    }
+
+    return filtered;
+}
+
+// ============================================================================
+// Row Emission for JOINs
+// ============================================================================
+
 /// Emit a joined row for nested loop joins
 /// Handles both SELECT * and specific column selection
 /// Accepts optional base_row and join_row (null for unmatched rows in outer joins)
@@ -725,7 +854,7 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
 
     if (shouldUseHashJoin(base_size, join_size)) {
         // Use hash join for better performance on large tables
-        return hash_join.executeHashJoin(
+        var join_result = try hash_join.executeHashJoin(
             db.allocator,
             base_table,
             join_table,
@@ -737,6 +866,14 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
             cmd.columns.items.len == 1 and cmd.columns.items[0] == .star,
             cmd.columns.items,
         );
+
+        // Apply WHERE clause filter if present
+        if (cmd.where_column != null or cmd.where_expr != null) {
+            defer join_result.deinit();
+            return applyWhereToQueryResult(db.allocator, &join_result, cmd);
+        }
+
+        return join_result;
     }
 
     // Fall back to nested loop join for small tables or when hash join is not beneficial
@@ -937,6 +1074,12 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
                 }
             }
         },
+    }
+
+    // Apply WHERE clause filter if present
+    if (cmd.where_column != null or cmd.where_expr != null) {
+        defer result.deinit();
+        return applyWhereToQueryResult(db.allocator, &result, cmd);
     }
 
     return result;
@@ -1190,62 +1333,23 @@ fn applyWhereFilter(
         try filtered.addColumn(col_info.table_name, col_info.column_name);
     }
 
-    // Filter rows based on WHERE expression or simple WHERE
+    // Build column names array for evaluateWhereOnJoinedRow
+    var column_names = ArrayList([]const u8).init(allocator);
+    defer column_names.deinit();
+
+    for (intermediate.schema.items) |col_info| {
+        try column_names.append(col_info.qualified_name);
+    }
+
+    // Filter rows using our shared helper
     for (intermediate.rows.items) |row| {
-        var matches = false;
+        const matches = try evaluateWhereOnJoinedRow(
+            allocator,
+            row.items,
+            column_names.items,
+            cmd,
+        );
 
-        // Check if we have a WHERE expression (complex)
-        if (cmd.where_expr) |expr| {
-            // Build a HashMap with all column values for expression evaluation
-            var row_map = StringHashMap(ColumnValue).init(allocator);
-            defer {
-                var it = row_map.iterator();
-                while (it.next()) |entry| {
-                    allocator.free(entry.key_ptr.*);
-                }
-                row_map.deinit();
-            }
-
-            // Populate map with both qualified and unqualified column names
-            for (intermediate.schema.items, 0..) |col_info, idx| {
-                if (idx >= row.items.len) break;
-
-                const val = row.items[idx];
-
-                // Add qualified name (table.column)
-                const qualified = try std.fmt.allocPrint(
-                    allocator,
-                    "{s}.{s}",
-                    .{ col_info.table_name, col_info.column_name },
-                );
-                try row_map.put(qualified, val);
-
-                // Add unqualified name (column) - last one wins if duplicate
-                const unqualified = try allocator.dupe(u8, col_info.column_name);
-                try row_map.put(unqualified, val);
-            }
-
-            // Evaluate expression
-            matches = sql.evaluateExpr(expr, row_map);
-        }
-        // Fallback to simple WHERE (column = value)
-        else if (cmd.where_column) |where_col| {
-            if (cmd.where_value) |where_val| {
-                // Find the column in the schema
-                const col_idx = intermediate.findColumn(where_col);
-                if (col_idx) |idx| {
-                    if (idx < row.items.len) {
-                        const row_val = row.items[idx];
-                        matches = valuesEqual(row_val, where_val);
-                    }
-                }
-            }
-        } else {
-            // No WHERE clause - include all rows
-            matches = true;
-        }
-
-        // Add row if it matches the filter
         if (matches) {
             var filtered_row = ArrayList(ColumnValue).init(allocator);
             for (row.items) |val| {
