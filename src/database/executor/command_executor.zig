@@ -246,9 +246,13 @@ pub fn executeInsert(db: *Database, cmd: sql.InsertCmd) !QueryResult {
     try table.insertWithId(row_id, values_map, tx_id);
     const final_row_id = row_id;
 
+    // Phase 3: Get MVCC context to retrieve the row we just inserted
+    // With the visibility fix, transactions can now see their own changes
+    const snapshot = db.getCurrentSnapshot();
+    const clog = db.getClog();
+
     // If there's an embedding column, add to the appropriate dimension-specific HNSW index
-    // Use null snapshot/clog to bypass MVCC and get the row we just inserted
-    const row = table.get(final_row_id, null, null).?;
+    const row = table.get(final_row_id, snapshot, clog).?;
     var it = row.values.iterator();
     while (it.next()) |entry| {
         if (entry.value_ptr.* == .embedding) {

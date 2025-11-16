@@ -412,7 +412,9 @@ pub const RowVersion = struct {
     /// This is the CORE visibility logic for MVCC
     pub fn isVisible(self: *const RowVersion, snapshot: *const Snapshot, clog: *CommitLog) bool {
         // Version created by a transaction that started after our snapshot?
-        if (self.xmin >= snapshot.txid) return false;
+        // Note: We use > not >= because a transaction can see its own changes
+        // (xmin == snapshot.txid means this is our own transaction)
+        if (self.xmin > snapshot.txid) return false;
 
         // Version created by a transaction that was active when we took snapshot?
         if (snapshot.wasActive(self.xmin)) return false;
@@ -561,6 +563,14 @@ pub const Table = struct {
     pub fn delete(self: *Table, id: u64, tx_id: u64) !void {
         const chain_head = self.version_chains.get(id) orelse return error.RowNotFound;
 
+        // Phase 3: Write-write conflict detection
+        // Check if another transaction is already updating/deleting this row
+        if (chain_head.xmax != 0 and chain_head.xmax != tx_id) {
+            // Another transaction has locked this row for update/delete
+            // This is a write-write conflict - abort with serialization error
+            return error.SerializationFailure;
+        }
+
         // Mark the current version as deleted
         // Use maxInt as sentinel for immediate deletion (backward compatibility)
         chain_head.xmax = if (tx_id == 0) std.math.maxInt(u64) else tx_id;
@@ -617,6 +627,16 @@ pub const Table = struct {
     /// Creates a new version with the updated value and chains it to the old version
     pub fn update(self: *Table, row_id: u64, column: []const u8, new_value: ColumnValue, tx_id: u64) !void {
         const old_version = self.version_chains.get(row_id) orelse return error.RowNotFound;
+
+        // Phase 3: Write-write conflict detection
+        // Check if another transaction is already updating/deleting this row
+        if (old_version.xmax != 0 and old_version.xmax != tx_id) {
+            // Another transaction has locked this row for update/delete
+            // This is a write-write conflict - abort with serialization error
+            // In a full implementation, we could check if that transaction committed/aborted
+            // and decide whether to wait or abort, but for now we abort immediately
+            return error.SerializationFailure;
+        }
 
         // Mark old version as superseded by this transaction
         old_version.xmax = tx_id;
