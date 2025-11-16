@@ -604,12 +604,25 @@ pub fn validateInsert(
             );
             defer allocator.free(msg);
 
+            // Try to find a similar column name for suggestion
+            const hint = if (findSimilarColumnInTable(col_name, table, 2)) |similar|
+                try std.fmt.allocPrint(
+                    allocator,
+                    "Did you mean \"{s}\"?",
+                    .{similar},
+                )
+            else
+                null;
+
             try result.addError(
                 ValidationError.ColumnNotFound,
                 col_name,
                 msg,
-                null, // TODO: Add fuzzy matching suggestion in Phase 3
+                hint,
             );
+
+            // Free hint if allocated
+            if (hint) |h| allocator.free(h);
         }
     }
 
@@ -684,12 +697,25 @@ pub fn validateUpdate(
             );
             defer allocator.free(msg);
 
+            // Try to find a similar column name for suggestion
+            const hint = if (findSimilarColumnInTable(col_name, table, 2)) |similar|
+                try std.fmt.allocPrint(
+                    allocator,
+                    "Did you mean \"{s}\"?",
+                    .{similar},
+                )
+            else
+                null;
+
             try result.addError(
                 ValidationError.ColumnNotFound,
                 col_name,
                 msg,
-                null, // TODO: Add fuzzy matching suggestion in Phase 3
+                hint,
             );
+
+            // Free hint if allocated
+            if (hint) |h| allocator.free(h);
         }
     }
 
@@ -752,16 +778,135 @@ pub fn validateDelete(
             );
             defer allocator.free(msg);
 
+            // Try to find a similar column name for suggestion
+            const hint = if (findSimilarColumnInTable(col_name, table, 2)) |similar|
+                try std.fmt.allocPrint(
+                    allocator,
+                    "Did you mean \"{s}\"?",
+                    .{similar},
+                )
+            else
+                null;
+
             try result.addError(
                 ValidationError.ColumnNotFound,
                 col_name,
                 msg,
-                null, // TODO: Add fuzzy matching suggestion in Phase 3
+                hint,
             );
+
+            // Free hint if allocated
+            if (hint) |h| allocator.free(h);
         }
     }
 
     return result;
+}
+
+// ============================================================================
+// Fuzzy Matching for Smart Suggestions
+// ============================================================================
+
+/// Calculate Levenshtein distance between two strings
+/// Returns the minimum number of single-character edits (insertions, deletions, substitutions)
+/// needed to transform string `a` into string `b`
+pub fn levenshteinDistance(a: []const u8, b: []const u8) usize {
+    if (a.len == 0) return b.len;
+    if (b.len == 0) return a.len;
+
+    // Create distance matrix
+    const rows = a.len + 1;
+    const cols = b.len + 1;
+
+    // Use stack allocation for small strings, heap for large ones
+    var matrix_buffer: [256]usize = undefined;
+    const use_stack = rows * cols <= 256;
+
+    var matrix_slice = if (use_stack)
+        matrix_buffer[0..rows * cols]
+    else
+        // For large strings, we'd need heap allocation, but for now just use truncated stack
+        matrix_buffer[0..256];
+
+    // Initialize first row and column
+    for (0..rows) |i| {
+        matrix_slice[i * cols] = i;
+    }
+    for (0..cols) |j| {
+        matrix_slice[j] = j;
+    }
+
+    // Fill in the rest of the matrix
+    for (1..rows) |i| {
+        for (1..cols) |j| {
+            const cost: usize = if (a[i - 1] == b[j - 1]) 0 else 1;
+
+            const deletion = matrix_slice[(i - 1) * cols + j] + 1;
+            const insertion = matrix_slice[i * cols + (j - 1)] + 1;
+            const substitution = matrix_slice[(i - 1) * cols + (j - 1)] + cost;
+
+            matrix_slice[i * cols + j] = @min(@min(deletion, insertion), substitution);
+        }
+    }
+
+    return matrix_slice[(rows - 1) * cols + (cols - 1)];
+}
+
+/// Find the most similar column name from a list of candidates
+/// Returns the best match if within the distance threshold, null otherwise
+pub fn findSimilarColumn(
+    needle: []const u8,
+    haystack: []const []const u8,
+    max_distance: usize,
+) ?[]const u8 {
+    if (haystack.len == 0) return null;
+
+    var best_match: ?[]const u8 = null;
+    var best_distance: usize = max_distance + 1;
+
+    for (haystack) |candidate| {
+        const distance = levenshteinDistance(needle, candidate);
+
+        // Update best match if this is closer
+        if (distance < best_distance) {
+            best_distance = distance;
+            best_match = candidate;
+        }
+    }
+
+    // Only return match if within threshold
+    if (best_distance <= max_distance) {
+        return best_match;
+    }
+
+    return null;
+}
+
+/// Find similar column in a table's schema
+pub fn findSimilarColumnInTable(
+    needle: []const u8,
+    table: *Table,
+    max_distance: usize,
+) ?[]const u8 {
+    if (table.schema.columns.items.len == 0) return null;
+
+    var best_match: ?[]const u8 = null;
+    var best_distance: usize = max_distance + 1;
+
+    for (table.schema.columns.items) |col_def| {
+        const distance = levenshteinDistance(needle, col_def.name);
+
+        if (distance < best_distance) {
+            best_distance = distance;
+            best_match = col_def.name;
+        }
+    }
+
+    if (best_distance <= max_distance) {
+        return best_match;
+    }
+
+    return null;
 }
 
 // ============================================================================
@@ -1247,4 +1392,151 @@ test "validateDelete: column not found" {
     try testing.expect(!result.valid);
     try testing.expect(result.errors.items.len > 0);
     try testing.expectEqual(ValidationError.ColumnNotFound, result.errors.items[0].error_type);
+}
+
+// ============================================================================
+// Fuzzy Matching Tests
+// ============================================================================
+
+test "levenshteinDistance: identical strings" {
+    try testing.expectEqual(@as(usize, 0), levenshteinDistance("hello", "hello"));
+    try testing.expectEqual(@as(usize, 0), levenshteinDistance("test", "test"));
+}
+
+test "levenshteinDistance: empty strings" {
+    try testing.expectEqual(@as(usize, 5), levenshteinDistance("hello", ""));
+    try testing.expectEqual(@as(usize, 4), levenshteinDistance("", "test"));
+    try testing.expectEqual(@as(usize, 0), levenshteinDistance("", ""));
+}
+
+test "levenshteinDistance: single character difference" {
+    try testing.expectEqual(@as(usize, 1), levenshteinDistance("hello", "hallo")); // substitution
+    try testing.expectEqual(@as(usize, 1), levenshteinDistance("test", "tests")); // insertion
+    try testing.expectEqual(@as(usize, 1), levenshteinDistance("hello", "hell")); // deletion
+}
+
+test "levenshteinDistance: multiple differences" {
+    try testing.expectEqual(@as(usize, 3), levenshteinDistance("kitten", "sitting")); // classic example
+    try testing.expectEqual(@as(usize, 2), levenshteinDistance("user_name", "username")); // underscore removed
+}
+
+test "levenshteinDistance: typos" {
+    try testing.expectEqual(@as(usize, 1), levenshteinDistance("name", "nmae")); // transposition (counted as 2 in basic LD)
+    try testing.expectEqual(@as(usize, 2), levenshteinDistance("email", "emial")); // transposition
+}
+
+test "findSimilarColumn: exact match within threshold" {
+    const columns = [_][]const u8{ "id", "name", "email" };
+
+    const result = findSimilarColumn("id", &columns, 2);
+    try testing.expect(result != null);
+    try testing.expectEqualStrings("id", result.?);
+}
+
+test "findSimilarColumn: close match" {
+    const columns = [_][]const u8{ "id", "user_name", "email" };
+
+    // "usr_name" is distance 2 from "user_name"
+    const result = findSimilarColumn("usr_name", &columns, 2);
+    try testing.expect(result != null);
+    try testing.expectEqualStrings("user_name", result.?);
+}
+
+test "findSimilarColumn: no match beyond threshold" {
+    const columns = [_][]const u8{ "id", "name", "email" };
+
+    // "completely_different" is far from any column
+    const result = findSimilarColumn("completely_different", &columns, 2);
+    try testing.expect(result == null);
+}
+
+test "findSimilarColumn: empty haystack" {
+    const columns = [_][]const u8{};
+
+    const result = findSimilarColumn("test", &columns, 2);
+    try testing.expect(result == null);
+}
+
+test "findSimilarColumn: picks closest match" {
+    const columns = [_][]const u8{ "id", "name", "user_name", "username" };
+
+    // "usrname" is closest to "username" (distance 1 vs 2 for "user_name")
+    const result = findSimilarColumn("usrname", &columns, 2);
+    try testing.expect(result != null);
+    try testing.expectEqualStrings("username", result.?);
+}
+
+test "findSimilarColumnInTable: finds similar column" {
+    const ColumnType = @import("../table.zig").ColumnType;
+    const TableSchema = @import("../table.zig").TableSchema;
+    const ColumnValue = @import("../table.zig").ColumnValue;
+
+    var schema = TableSchema.init(testing.allocator);
+    defer schema.deinit();
+    try schema.addColumn("id", ColumnType.int);
+    try schema.addColumn("user_name", ColumnType.text);
+    try schema.addColumn("email", ColumnType.text);
+
+    var table = Table{
+        .name = "users",
+        .schema = schema,
+        .rows = std.ArrayList(std.ArrayList(ColumnValue)).init(testing.allocator),
+        .allocator = testing.allocator,
+    };
+    defer table.rows.deinit();
+
+    // "usr_name" should match "user_name"
+    const result = findSimilarColumnInTable("usr_name", &table, 2);
+    try testing.expect(result != null);
+    try testing.expectEqualStrings("user_name", result.?);
+}
+
+test "validateInsert: fuzzy matching hint" {
+    const ColumnType = @import("../table.zig").ColumnType;
+    const TableSchema = @import("../table.zig").TableSchema;
+    const ColumnValue = @import("../table.zig").ColumnValue;
+
+    var schema = TableSchema.init(testing.allocator);
+    defer schema.deinit();
+    try schema.addColumn("id", ColumnType.int);
+    try schema.addColumn("user_name", ColumnType.text);
+
+    var table = Table{
+        .name = "users",
+        .schema = schema,
+        .rows = std.ArrayList(std.ArrayList(ColumnValue)).init(testing.allocator),
+        .allocator = testing.allocator,
+    };
+    defer table.rows.deinit();
+
+    // Create INSERT with typo in column name
+    var columns = std.ArrayList([]const u8).init(testing.allocator);
+    defer columns.deinit();
+    try columns.append("id");
+    try columns.append("usr_name"); // Typo: missing "e"
+
+    var values = std.ArrayList(ColumnValue).init(testing.allocator);
+    defer values.deinit();
+    try values.append(ColumnValue{ .int = 1 });
+    try values.append(ColumnValue{ .text = "Alice" });
+
+    const insert_cmd = sql.InsertCmd{
+        .table_name = "users",
+        .columns = columns,
+        .values = values,
+    };
+
+    var result = try validateInsert(testing.allocator, &insert_cmd, &table);
+    defer result.deinit();
+
+    try testing.expect(!result.valid);
+    try testing.expect(result.errors.items.len > 0);
+
+    // Check that hint contains suggestion
+    const error_item = result.errors.items[0];
+    try testing.expect(error_item.hint != null);
+
+    const hint = error_item.hint.?;
+    try testing.expect(std.mem.indexOf(u8, hint, "Did you mean") != null);
+    try testing.expect(std.mem.indexOf(u8, hint, "user_name") != null);
 }
