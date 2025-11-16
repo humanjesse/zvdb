@@ -137,6 +137,51 @@ pub fn build(b: *std.Build) void {
     });
     const run_mvcc_phase1_tests = b.addRunArtifact(mvcc_phase1_tests);
 
+    const mvcc_storage_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_mvcc_storage.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_mvcc_storage_tests = b.addRunArtifact(mvcc_storage_tests);
+
+    const transaction_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_transactions.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_transaction_tests = b.addRunArtifact(transaction_tests);
+
+    const subquery_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_subqueries.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_subquery_tests = b.addRunArtifact(subquery_tests);
+
+    const column_matching_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_column_matching.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_column_matching_tests = b.addRunArtifact(column_matching_tests);
+
+    const validator_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_validator.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_validator_tests = b.addRunArtifact(validator_tests);
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_hnsw_tests.step);
     test_step.dependOn(&run_sql_tests.step);
@@ -151,6 +196,11 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_join_where_tests.step);
     test_step.dependOn(&run_order_by_tests.step);
     test_step.dependOn(&run_mvcc_phase1_tests.step);
+    test_step.dependOn(&run_mvcc_storage_tests.step);
+    test_step.dependOn(&run_transaction_tests.step);
+    test_step.dependOn(&run_subquery_tests.step);
+    test_step.dependOn(&run_column_matching_tests.step);
+    test_step.dependOn(&run_validator_tests.step);
 
     // Add unit tests
     // const unit_tests = b.addTest(.{

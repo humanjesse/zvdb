@@ -10,27 +10,33 @@ const ColumnValue = @import("table.zig").ColumnValue;
 // Test Fixtures - Reusable test data setup
 // ============================================================================
 
+/// Helper to execute and cleanup query results that we don't need to inspect
+fn executeAndCleanup(db: *Database, query: []const u8) !void {
+    var result = try db.execute(query);
+    result.deinit();
+}
+
 /// Setup basic users and orders tables for subquery tests
 fn setupBasicTables(db: *Database) !void {
     // Users table
-    _ = try db.execute("CREATE TABLE users (id int, name text, age int)");
-    _ = try db.execute("INSERT INTO users VALUES (1, 'Alice', 25)");
-    _ = try db.execute("INSERT INTO users VALUES (2, 'Bob', 30)");
-    _ = try db.execute("INSERT INTO users VALUES (3, 'Charlie', 35)");
+    try executeAndCleanup(db, "CREATE TABLE users (id int, name text, age int)");
+    try executeAndCleanup(db, "INSERT INTO users VALUES (1, 'Alice', 25)");
+    try executeAndCleanup(db, "INSERT INTO users VALUES (2, 'Bob', 30)");
+    try executeAndCleanup(db, "INSERT INTO users VALUES (3, 'Charlie', 35)");
 
     // Orders table
-    _ = try db.execute("CREATE TABLE orders (id int, user_id int, total float)");
-    _ = try db.execute("INSERT INTO orders VALUES (1, 1, 100.0)");
-    _ = try db.execute("INSERT INTO orders VALUES (2, 1, 200.0)");
-    _ = try db.execute("INSERT INTO orders VALUES (3, 2, 50.0)");
+    try executeAndCleanup(db, "CREATE TABLE orders (id int, user_id int, total float)");
+    try executeAndCleanup(db, "INSERT INTO orders VALUES (1, 1, 100.0)");
+    try executeAndCleanup(db, "INSERT INTO orders VALUES (2, 1, 200.0)");
+    try executeAndCleanup(db, "INSERT INTO orders VALUES (3, 2, 50.0)");
 }
 
 /// Setup products table for scalar subquery tests
 fn setupProductTables(db: *Database) !void {
-    _ = try db.execute("CREATE TABLE products (id int, name text, price float, category text)");
-    _ = try db.execute("INSERT INTO products VALUES (1, 'Widget', 10.0, 'tools')");
-    _ = try db.execute("INSERT INTO products VALUES (2, 'Gadget', 20.0, 'electronics')");
-    _ = try db.execute("INSERT INTO products VALUES (3, 'Doohickey', 30.0, 'tools')");
+    try executeAndCleanup(db, "CREATE TABLE products (id int, name text, price float, category text)");
+    try executeAndCleanup(db, "INSERT INTO products VALUES (1, 'Widget', 10.0, 'tools')");
+    try executeAndCleanup(db, "INSERT INTO products VALUES (2, 'Gadget', 20.0, 'electronics')");
+    try executeAndCleanup(db, "INSERT INTO products VALUES (3, 'Doohickey', 30.0, 'tools')");
 }
 
 // ============================================================================
@@ -154,13 +160,13 @@ test "subquery: IN operator - no matches" {
     defer db.deinit();
 
     // Setup users who DON'T have orders
-    _ = try db.execute("CREATE TABLE users (id int, name text)");
-    _ = try db.execute("INSERT INTO users VALUES (4, 'David')");
-    _ = try db.execute("INSERT INTO users VALUES (5, 'Eve')");
+    try executeAndCleanup(&db, "CREATE TABLE users (id int, name text)");
+    try executeAndCleanup(&db, "INSERT INTO users VALUES (4, 'David')");
+    try executeAndCleanup(&db, "INSERT INTO users VALUES (5, 'Eve')");
 
-    _ = try db.execute("CREATE TABLE orders (id int, user_id int)");
-    _ = try db.execute("INSERT INTO orders VALUES (1, 1)");
-    _ = try db.execute("INSERT INTO orders VALUES (2, 2)");
+    try executeAndCleanup(&db, "CREATE TABLE orders (id int, user_id int)");
+    try executeAndCleanup(&db, "INSERT INTO orders VALUES (1, 1)");
+    try executeAndCleanup(&db, "INSERT INTO orders VALUES (2, 2)");
 
     // Query: Should return 0 rows
     var result = try db.execute("SELECT * FROM users WHERE id IN (SELECT user_id FROM orders)");
@@ -173,15 +179,15 @@ test "subquery: IN operator - all match" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE users (id int, name text)");
-    _ = try db.execute("INSERT INTO users VALUES (1, 'Alice')");
-    _ = try db.execute("INSERT INTO users VALUES (2, 'Bob')");
+    try executeAndCleanup(&db, "CREATE TABLE users (id int, name text)");
+    try executeAndCleanup(&db, "INSERT INTO users VALUES (1, 'Alice')");
+    try executeAndCleanup(&db, "INSERT INTO users VALUES (2, 'Bob')");
 
-    _ = try db.execute("CREATE TABLE orders (id int, user_id int)");
-    _ = try db.execute("INSERT INTO orders VALUES (1, 1)");
-    _ = try db.execute("INSERT INTO orders VALUES (2, 2)");
-    _ = try db.execute("INSERT INTO orders VALUES (3, 3)");
-    _ = try db.execute("INSERT INTO orders VALUES (4, 4)");
+    try executeAndCleanup(&db, "CREATE TABLE orders (id int, user_id int)");
+    try executeAndCleanup(&db, "INSERT INTO orders VALUES (1, 1)");
+    try executeAndCleanup(&db, "INSERT INTO orders VALUES (2, 2)");
+    try executeAndCleanup(&db, "INSERT INTO orders VALUES (3, 3)");
+    try executeAndCleanup(&db, "INSERT INTO orders VALUES (4, 4)");
 
     // Query: All users have orders
     var result = try db.execute("SELECT * FROM users WHERE id IN (SELECT user_id FROM orders)");
@@ -209,12 +215,12 @@ test "subquery: IN operator - empty subquery result" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE users (id int, name text)");
-    _ = try db.execute("INSERT INTO users VALUES (1, 'Alice')");
-    _ = try db.execute("INSERT INTO users VALUES (2, 'Bob')");
+    try executeAndCleanup(&db, "CREATE TABLE users (id int, name text)");
+    try executeAndCleanup(&db, "INSERT INTO users VALUES (1, 'Alice')");
+    try executeAndCleanup(&db, "INSERT INTO users VALUES (2, 'Bob')");
 
     // Empty orders table
-    _ = try db.execute("CREATE TABLE orders (id int, user_id int)");
+    try executeAndCleanup(&db, "CREATE TABLE orders (id int, user_id int)");
 
     // Query: Should return 0 rows (no orders exist)
     var result = try db.execute("SELECT * FROM users WHERE id IN (SELECT user_id FROM orders)");
@@ -227,14 +233,14 @@ test "subquery: IN operator - with text columns" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE customers (id int, name text)");
-    _ = try db.execute("INSERT INTO customers VALUES (1, 'Alice')");
-    _ = try db.execute("INSERT INTO customers VALUES (2, 'Bob')");
-    _ = try db.execute("INSERT INTO customers VALUES (3, 'Charlie')");
+    try executeAndCleanup(&db, "CREATE TABLE customers (id int, name text)");
+    try executeAndCleanup(&db, "INSERT INTO customers VALUES (1, 'Alice')");
+    try executeAndCleanup(&db, "INSERT INTO customers VALUES (2, 'Bob')");
+    try executeAndCleanup(&db, "INSERT INTO customers VALUES (3, 'Charlie')");
 
-    _ = try db.execute("CREATE TABLE vip_customers (customer_name text)");
-    _ = try db.execute("INSERT INTO vip_customers VALUES ('Alice')");
-    _ = try db.execute("INSERT INTO vip_customers VALUES ('Charlie')");
+    try executeAndCleanup(&db, "CREATE TABLE vip_customers (customer_name text)");
+    try executeAndCleanup(&db, "INSERT INTO vip_customers VALUES ('Alice')");
+    try executeAndCleanup(&db, "INSERT INTO vip_customers VALUES ('Charlie')");
 
     // Query: Find customers who are VIPs
     var result = try db.execute("SELECT * FROM customers WHERE name IN (SELECT customer_name FROM vip_customers)");
@@ -267,13 +273,13 @@ test "subquery: NOT IN operator - all excluded" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE users (id int, name text)");
-    _ = try db.execute("INSERT INTO users VALUES (1, 'Alice')");
-    _ = try db.execute("INSERT INTO users VALUES (2, 'Bob')");
+    try executeAndCleanup(&db, "CREATE TABLE users (id int, name text)");
+    try executeAndCleanup(&db, "INSERT INTO users VALUES (1, 'Alice')");
+    try executeAndCleanup(&db, "INSERT INTO users VALUES (2, 'Bob')");
 
-    _ = try db.execute("CREATE TABLE orders (id int, user_id int)");
-    _ = try db.execute("INSERT INTO orders VALUES (1, 1)");
-    _ = try db.execute("INSERT INTO orders VALUES (2, 2)");
+    try executeAndCleanup(&db, "CREATE TABLE orders (id int, user_id int)");
+    try executeAndCleanup(&db, "INSERT INTO orders VALUES (1, 1)");
+    try executeAndCleanup(&db, "INSERT INTO orders VALUES (2, 2)");
 
     // Query: All users have orders, so NOT IN returns nothing
     var result = try db.execute("SELECT * FROM users WHERE id NOT IN (SELECT user_id FROM orders)");
@@ -286,12 +292,12 @@ test "subquery: NOT IN operator - none excluded" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE users (id int, name text)");
-    _ = try db.execute("INSERT INTO users VALUES (1, 'Alice')");
-    _ = try db.execute("INSERT INTO users VALUES (2, 'Bob')");
+    try executeAndCleanup(&db, "CREATE TABLE users (id int, name text)");
+    try executeAndCleanup(&db, "INSERT INTO users VALUES (1, 'Alice')");
+    try executeAndCleanup(&db, "INSERT INTO users VALUES (2, 'Bob')");
 
     // Empty orders table
-    _ = try db.execute("CREATE TABLE orders (id int, user_id int)");
+    try executeAndCleanup(&db, "CREATE TABLE orders (id int, user_id int)");
 
     // Query: No users have orders, so NOT IN returns all
     var result = try db.execute("SELECT * FROM users WHERE id NOT IN (SELECT user_id FROM orders)");
@@ -340,12 +346,12 @@ test "subquery: EXISTS - none exist" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE users (id int, name text)");
-    _ = try db.execute("INSERT INTO users VALUES (1, 'Alice')");
-    _ = try db.execute("INSERT INTO users VALUES (2, 'Bob')");
+    try executeAndCleanup(&db, "CREATE TABLE users (id int, name text)");
+    try executeAndCleanup(&db, "INSERT INTO users VALUES (1, 'Alice')");
+    try executeAndCleanup(&db, "INSERT INTO users VALUES (2, 'Bob')");
 
     // Empty orders table
-    _ = try db.execute("CREATE TABLE orders (id int, user_id int)");
+    try executeAndCleanup(&db, "CREATE TABLE orders (id int, user_id int)");
 
     // Query: EXISTS with empty table
     var result = try db.execute("SELECT * FROM users WHERE EXISTS (SELECT 1 FROM orders)");
@@ -373,11 +379,11 @@ test "subquery: NOT EXISTS - basic" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE users (id int, name text)");
-    _ = try db.execute("INSERT INTO users VALUES (1, 'Alice')");
+    try executeAndCleanup(&db, "CREATE TABLE users (id int, name text)");
+    try executeAndCleanup(&db, "INSERT INTO users VALUES (1, 'Alice')");
 
     // Empty orders table
-    _ = try db.execute("CREATE TABLE orders (id int, user_id int)");
+    try executeAndCleanup(&db, "CREATE TABLE orders (id int, user_id int)");
 
     // Query: NOT EXISTS with empty table
     var result = try db.execute("SELECT * FROM users WHERE NOT EXISTS (SELECT 1 FROM orders)");
@@ -439,11 +445,11 @@ test "subquery: scalar subquery - empty result returns NULL" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE items (id int, price float)");
-    _ = try db.execute("INSERT INTO items VALUES (1, 15.0)");
+    try executeAndCleanup(&db, "CREATE TABLE items (id int, price float)");
+    try executeAndCleanup(&db, "INSERT INTO items VALUES (1, 15.0)");
 
     // Empty products table
-    _ = try db.execute("CREATE TABLE products (id int, price float)");
+    try executeAndCleanup(&db, "CREATE TABLE products (id int, price float)");
 
     // Query: Compare with AVG of empty table (returns NULL)
     var result = try db.execute("SELECT * FROM items WHERE price > (SELECT AVG(price) FROM products)");
@@ -476,18 +482,18 @@ test "subquery: duplicate values in subquery result" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE users (id int, name text)");
-    _ = try db.execute("INSERT INTO users VALUES (1, 'Alice')");
-    _ = try db.execute("INSERT INTO users VALUES (2, 'Bob')");
-    _ = try db.execute("INSERT INTO users VALUES (3, 'Charlie')");
+    try executeAndCleanup(&db, "CREATE TABLE users (id int, name text)");
+    try executeAndCleanup(&db, "INSERT INTO users VALUES (1, 'Alice')");
+    try executeAndCleanup(&db, "INSERT INTO users VALUES (2, 'Bob')");
+    try executeAndCleanup(&db, "INSERT INTO users VALUES (3, 'Charlie')");
 
     // Orders with duplicate user_ids
-    _ = try db.execute("CREATE TABLE orders (id int, user_id int)");
-    _ = try db.execute("INSERT INTO orders VALUES (1, 1)");
-    _ = try db.execute("INSERT INTO orders VALUES (2, 1)");
-    _ = try db.execute("INSERT INTO orders VALUES (3, 2)");
-    _ = try db.execute("INSERT INTO orders VALUES (4, 2)");
-    _ = try db.execute("INSERT INTO orders VALUES (5, 3)");
+    try executeAndCleanup(&db, "CREATE TABLE orders (id int, user_id int)");
+    try executeAndCleanup(&db, "INSERT INTO orders VALUES (1, 1)");
+    try executeAndCleanup(&db, "INSERT INTO orders VALUES (2, 1)");
+    try executeAndCleanup(&db, "INSERT INTO orders VALUES (3, 2)");
+    try executeAndCleanup(&db, "INSERT INTO orders VALUES (4, 2)");
+    try executeAndCleanup(&db, "INSERT INTO orders VALUES (5, 3)");
 
     // Query: Duplicates shouldn't affect IN matching
     var result = try db.execute("SELECT * FROM users WHERE id IN (SELECT user_id FROM orders)");
@@ -529,10 +535,10 @@ test "subquery: empty outer table with subquery" {
     defer db.deinit();
 
     // Empty users table
-    _ = try db.execute("CREATE TABLE users (id int, name text)");
+    try executeAndCleanup(&db, "CREATE TABLE users (id int, name text)");
 
-    _ = try db.execute("CREATE TABLE orders (id int, user_id int)");
-    _ = try db.execute("INSERT INTO orders VALUES (1, 1)");
+    try executeAndCleanup(&db, "CREATE TABLE orders (id int, user_id int)");
+    try executeAndCleanup(&db, "INSERT INTO orders VALUES (1, 1)");
 
     // Query: Empty outer table
     var result = try db.execute("SELECT * FROM users WHERE id IN (SELECT user_id FROM orders)");
@@ -545,16 +551,16 @@ test "subquery: IN with multiple matching values" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE users (id int, name text)");
-    _ = try db.execute("INSERT INTO users VALUES (1, 'Alice')");
-    _ = try db.execute("INSERT INTO users VALUES (2, 'Bob')");
-    _ = try db.execute("INSERT INTO users VALUES (3, 'Charlie')");
-    _ = try db.execute("INSERT INTO users VALUES (4, 'David')");
+    try executeAndCleanup(&db, "CREATE TABLE users (id int, name text)");
+    try executeAndCleanup(&db, "INSERT INTO users VALUES (1, 'Alice')");
+    try executeAndCleanup(&db, "INSERT INTO users VALUES (2, 'Bob')");
+    try executeAndCleanup(&db, "INSERT INTO users VALUES (3, 'Charlie')");
+    try executeAndCleanup(&db, "INSERT INTO users VALUES (4, 'David')");
 
-    _ = try db.execute("CREATE TABLE selected (id int)");
-    _ = try db.execute("INSERT INTO selected VALUES (2)");
-    _ = try db.execute("INSERT INTO selected VALUES (3)");
-    _ = try db.execute("INSERT INTO selected VALUES (4)");
+    try executeAndCleanup(&db, "CREATE TABLE selected (id int)");
+    try executeAndCleanup(&db, "INSERT INTO selected VALUES (2)");
+    try executeAndCleanup(&db, "INSERT INTO selected VALUES (3)");
+    try executeAndCleanup(&db, "INSERT INTO selected VALUES (4)");
 
     // Query: Multiple matches
     var result = try db.execute("SELECT * FROM users WHERE id IN (SELECT id FROM selected)");
@@ -567,14 +573,14 @@ test "subquery: scalar subquery with different data types" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE stats (value int)");
-    _ = try db.execute("INSERT INTO stats VALUES (5)");
-    _ = try db.execute("INSERT INTO stats VALUES (10)");
-    _ = try db.execute("INSERT INTO stats VALUES (15)");
+    try executeAndCleanup(&db, "CREATE TABLE stats (value int)");
+    try executeAndCleanup(&db, "INSERT INTO stats VALUES (5)");
+    try executeAndCleanup(&db, "INSERT INTO stats VALUES (10)");
+    try executeAndCleanup(&db, "INSERT INTO stats VALUES (15)");
 
-    _ = try db.execute("CREATE TABLE items (id int, quantity int)");
-    _ = try db.execute("INSERT INTO items VALUES (1, 8)");
-    _ = try db.execute("INSERT INTO items VALUES (2, 12)");
+    try executeAndCleanup(&db, "CREATE TABLE items (id int, quantity int)");
+    try executeAndCleanup(&db, "INSERT INTO items VALUES (1, 8)");
+    try executeAndCleanup(&db, "INSERT INTO items VALUES (2, 12)");
 
     // Query: Compare int column with AVG (returns float but should work)
     var result = try db.execute("SELECT * FROM items WHERE quantity > (SELECT AVG(value) FROM stats)");
@@ -592,11 +598,11 @@ test "subquery: with aggregate functions in outer query" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE employees (id int, name text, dept text, salary int)");
-    _ = try db.execute("INSERT INTO employees VALUES (1, 'Alice', 'Engineering', 80000)");
-    _ = try db.execute("INSERT INTO employees VALUES (2, 'Bob', 'Engineering', 90000)");
-    _ = try db.execute("INSERT INTO employees VALUES (3, 'Charlie', 'Sales', 70000)");
-    _ = try db.execute("INSERT INTO employees VALUES (4, 'David', 'Sales', 75000)");
+    try executeAndCleanup(&db, "CREATE TABLE employees (id int, name text, dept text, salary int)");
+    try executeAndCleanup(&db, "INSERT INTO employees VALUES (1, 'Alice', 'Engineering', 80000)");
+    try executeAndCleanup(&db, "INSERT INTO employees VALUES (2, 'Bob', 'Engineering', 90000)");
+    try executeAndCleanup(&db, "INSERT INTO employees VALUES (3, 'Charlie', 'Sales', 70000)");
+    try executeAndCleanup(&db, "INSERT INTO employees VALUES (4, 'David', 'Sales', 75000)");
 
     // Query: Count employees above average salary, grouped by dept
     var result = try db.execute("SELECT dept, COUNT(*) FROM employees WHERE salary > (SELECT AVG(salary) FROM employees) GROUP BY dept");
@@ -612,17 +618,17 @@ test "subquery: with JOIN in outer query" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE users (id int, name text)");
-    _ = try db.execute("INSERT INTO users VALUES (1, 'Alice')");
-    _ = try db.execute("INSERT INTO users VALUES (2, 'Bob')");
-    _ = try db.execute("INSERT INTO users VALUES (3, 'Charlie')");
+    try executeAndCleanup(&db, "CREATE TABLE users (id int, name text)");
+    try executeAndCleanup(&db, "INSERT INTO users VALUES (1, 'Alice')");
+    try executeAndCleanup(&db, "INSERT INTO users VALUES (2, 'Bob')");
+    try executeAndCleanup(&db, "INSERT INTO users VALUES (3, 'Charlie')");
 
-    _ = try db.execute("CREATE TABLE orders (id int, user_id int, total float)");
-    _ = try db.execute("INSERT INTO orders VALUES (1, 1, 100.0)");
-    _ = try db.execute("INSERT INTO orders VALUES (2, 2, 50.0)");
+    try executeAndCleanup(&db, "CREATE TABLE orders (id int, user_id int, total float)");
+    try executeAndCleanup(&db, "INSERT INTO orders VALUES (1, 1, 100.0)");
+    try executeAndCleanup(&db, "INSERT INTO orders VALUES (2, 2, 50.0)");
 
-    _ = try db.execute("CREATE TABLE vip_list (user_id int)");
-    _ = try db.execute("INSERT INTO vip_list VALUES (1)");
+    try executeAndCleanup(&db, "CREATE TABLE vip_list (user_id int)");
+    try executeAndCleanup(&db, "INSERT INTO vip_list VALUES (1)");
 
     // Query: JOIN with subquery filter
     var result = try db.execute("SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id IN (SELECT user_id FROM vip_list)");
@@ -637,17 +643,17 @@ test "subquery: multiple subqueries in WHERE" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE users (id int, name text, age int)");
-    _ = try db.execute("INSERT INTO users VALUES (1, 'Alice', 25)");
-    _ = try db.execute("INSERT INTO users VALUES (2, 'Bob', 30)");
-    _ = try db.execute("INSERT INTO users VALUES (3, 'Charlie', 35)");
+    try executeAndCleanup(&db, "CREATE TABLE users (id int, name text, age int)");
+    try executeAndCleanup(&db, "INSERT INTO users VALUES (1, 'Alice', 25)");
+    try executeAndCleanup(&db, "INSERT INTO users VALUES (2, 'Bob', 30)");
+    try executeAndCleanup(&db, "INSERT INTO users VALUES (3, 'Charlie', 35)");
 
-    _ = try db.execute("CREATE TABLE orders (id int, user_id int)");
-    _ = try db.execute("INSERT INTO orders VALUES (1, 1)");
-    _ = try db.execute("INSERT INTO orders VALUES (2, 2)");
+    try executeAndCleanup(&db, "CREATE TABLE orders (id int, user_id int)");
+    try executeAndCleanup(&db, "INSERT INTO orders VALUES (1, 1)");
+    try executeAndCleanup(&db, "INSERT INTO orders VALUES (2, 2)");
 
-    _ = try db.execute("CREATE TABLE age_stats (avg_age int)");
-    _ = try db.execute("INSERT INTO age_stats VALUES (28)");
+    try executeAndCleanup(&db, "CREATE TABLE age_stats (avg_age int)");
+    try executeAndCleanup(&db, "INSERT INTO age_stats VALUES (28)");
 
     // Query: Multiple subqueries with AND
     var result = try db.execute("SELECT * FROM users WHERE id IN (SELECT user_id FROM orders) AND age > (SELECT avg_age FROM age_stats)");
@@ -662,11 +668,11 @@ test "subquery: with GROUP BY and aggregates" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE sales (id int, product text, amount float, region text)");
-    _ = try db.execute("INSERT INTO sales VALUES (1, 'Widget', 100.0, 'North')");
-    _ = try db.execute("INSERT INTO sales VALUES (2, 'Widget', 150.0, 'South')");
-    _ = try db.execute("INSERT INTO sales VALUES (3, 'Gadget', 200.0, 'North')");
-    _ = try db.execute("INSERT INTO sales VALUES (4, 'Gadget', 180.0, 'South')");
+    try executeAndCleanup(&db, "CREATE TABLE sales (id int, product text, amount float, region text)");
+    try executeAndCleanup(&db, "INSERT INTO sales VALUES (1, 'Widget', 100.0, 'North')");
+    try executeAndCleanup(&db, "INSERT INTO sales VALUES (2, 'Widget', 150.0, 'South')");
+    try executeAndCleanup(&db, "INSERT INTO sales VALUES (3, 'Gadget', 200.0, 'North')");
+    try executeAndCleanup(&db, "INSERT INTO sales VALUES (4, 'Gadget', 180.0, 'South')");
 
     // Query: Group by region, filter by above-average amount
     var result = try db.execute("SELECT region, COUNT(*) FROM sales WHERE amount > (SELECT AVG(amount) FROM sales) GROUP BY region");
@@ -681,17 +687,17 @@ test "subquery: in UPDATE statement" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE users (id int, name text, status text)");
-    _ = try db.execute("INSERT INTO users VALUES (1, 'Alice', 'regular')");
-    _ = try db.execute("INSERT INTO users VALUES (2, 'Bob', 'regular')");
-    _ = try db.execute("INSERT INTO users VALUES (3, 'Charlie', 'regular')");
+    try executeAndCleanup(&db, "CREATE TABLE users (id int, name text, status text)");
+    try executeAndCleanup(&db, "INSERT INTO users VALUES (1, 'Alice', 'regular')");
+    try executeAndCleanup(&db, "INSERT INTO users VALUES (2, 'Bob', 'regular')");
+    try executeAndCleanup(&db, "INSERT INTO users VALUES (3, 'Charlie', 'regular')");
 
-    _ = try db.execute("CREATE TABLE high_value_orders (user_id int)");
-    _ = try db.execute("INSERT INTO high_value_orders VALUES (1)");
-    _ = try db.execute("INSERT INTO high_value_orders VALUES (2)");
+    try executeAndCleanup(&db, "CREATE TABLE high_value_orders (user_id int)");
+    try executeAndCleanup(&db, "INSERT INTO high_value_orders VALUES (1)");
+    try executeAndCleanup(&db, "INSERT INTO high_value_orders VALUES (2)");
 
     // Update users to premium if they have high value orders
-    _ = try db.execute("UPDATE users SET status = 'premium' WHERE id IN (SELECT user_id FROM high_value_orders)");
+    try executeAndCleanup(&db, "UPDATE users SET status = 'premium' WHERE id IN (SELECT user_id FROM high_value_orders)");
 
     // Verify the update
     var result = try db.execute("SELECT * FROM users WHERE status = 'premium'");
@@ -708,17 +714,17 @@ test "subquery: nested IN subqueries - 2 levels" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE a (a_id int)");
-    _ = try db.execute("INSERT INTO a VALUES (1)");
-    _ = try db.execute("INSERT INTO a VALUES (2)");
-    _ = try db.execute("INSERT INTO a VALUES (3)");
+    try executeAndCleanup(&db, "CREATE TABLE a (a_id int)");
+    try executeAndCleanup(&db, "INSERT INTO a VALUES (1)");
+    try executeAndCleanup(&db, "INSERT INTO a VALUES (2)");
+    try executeAndCleanup(&db, "INSERT INTO a VALUES (3)");
 
-    _ = try db.execute("CREATE TABLE b (b_id int)");
-    _ = try db.execute("INSERT INTO b VALUES (1)");
-    _ = try db.execute("INSERT INTO b VALUES (2)");
+    try executeAndCleanup(&db, "CREATE TABLE b (b_id int)");
+    try executeAndCleanup(&db, "INSERT INTO b VALUES (1)");
+    try executeAndCleanup(&db, "INSERT INTO b VALUES (2)");
 
-    _ = try db.execute("CREATE TABLE c (c_id int)");
-    _ = try db.execute("INSERT INTO c VALUES (1)");
+    try executeAndCleanup(&db, "CREATE TABLE c (c_id int)");
+    try executeAndCleanup(&db, "INSERT INTO c VALUES (1)");
 
     // Query: Nested IN - a_id IN (b_id IN c_id)
     var result = try db.execute("SELECT * FROM a WHERE a_id IN (SELECT b_id FROM b WHERE b_id IN (SELECT c_id FROM c))");
@@ -733,18 +739,18 @@ test "subquery: nested IN subqueries - 3 levels" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE t1 (id int)");
-    _ = try db.execute("INSERT INTO t1 VALUES (1)");
-    _ = try db.execute("INSERT INTO t1 VALUES (2)");
+    try executeAndCleanup(&db, "CREATE TABLE t1 (id int)");
+    try executeAndCleanup(&db, "INSERT INTO t1 VALUES (1)");
+    try executeAndCleanup(&db, "INSERT INTO t1 VALUES (2)");
 
-    _ = try db.execute("CREATE TABLE t2 (id int)");
-    _ = try db.execute("INSERT INTO t2 VALUES (1)");
+    try executeAndCleanup(&db, "CREATE TABLE t2 (id int)");
+    try executeAndCleanup(&db, "INSERT INTO t2 VALUES (1)");
 
-    _ = try db.execute("CREATE TABLE t3 (id int)");
-    _ = try db.execute("INSERT INTO t3 VALUES (1)");
+    try executeAndCleanup(&db, "CREATE TABLE t3 (id int)");
+    try executeAndCleanup(&db, "INSERT INTO t3 VALUES (1)");
 
-    _ = try db.execute("CREATE TABLE t4 (id int)");
-    _ = try db.execute("INSERT INTO t4 VALUES (1)");
+    try executeAndCleanup(&db, "CREATE TABLE t4 (id int)");
+    try executeAndCleanup(&db, "INSERT INTO t4 VALUES (1)");
 
     // Query: 3-level nested IN
     var result = try db.execute("SELECT * FROM t1 WHERE id IN (SELECT id FROM t2 WHERE id IN (SELECT id FROM t3 WHERE id IN (SELECT id FROM t4)))");
@@ -758,13 +764,13 @@ test "subquery: scalar subquery containing subquery" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE products (id int, name text, price float, category_id int)");
-    _ = try db.execute("INSERT INTO products VALUES (1, 'Widget', 10.0, 1)");
-    _ = try db.execute("INSERT INTO products VALUES (2, 'Gadget', 20.0, 2)");
-    _ = try db.execute("INSERT INTO products VALUES (3, 'Premium Widget', 100.0, 1)");
+    try executeAndCleanup(&db, "CREATE TABLE products (id int, name text, price float, category_id int)");
+    try executeAndCleanup(&db, "INSERT INTO products VALUES (1, 'Widget', 10.0, 1)");
+    try executeAndCleanup(&db, "INSERT INTO products VALUES (2, 'Gadget', 20.0, 2)");
+    try executeAndCleanup(&db, "INSERT INTO products VALUES (3, 'Premium Widget', 100.0, 1)");
 
-    _ = try db.execute("CREATE TABLE premium_categories (id int)");
-    _ = try db.execute("INSERT INTO premium_categories VALUES (1)");
+    try executeAndCleanup(&db, "CREATE TABLE premium_categories (id int)");
+    try executeAndCleanup(&db, "INSERT INTO premium_categories VALUES (1)");
 
     // Query: Scalar subquery with nested IN
     var result = try db.execute("SELECT * FROM products WHERE price > (SELECT AVG(price) FROM products WHERE category_id IN (SELECT id FROM premium_categories))");
@@ -780,14 +786,14 @@ test "subquery: EXISTS with nested subquery" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE users (id int, name text)");
-    _ = try db.execute("INSERT INTO users VALUES (1, 'Alice')");
+    try executeAndCleanup(&db, "CREATE TABLE users (id int, name text)");
+    try executeAndCleanup(&db, "INSERT INTO users VALUES (1, 'Alice')");
 
-    _ = try db.execute("CREATE TABLE orders (id int, user_id int)");
-    _ = try db.execute("INSERT INTO orders VALUES (1, 1)");
+    try executeAndCleanup(&db, "CREATE TABLE orders (id int, user_id int)");
+    try executeAndCleanup(&db, "INSERT INTO orders VALUES (1, 1)");
 
-    _ = try db.execute("CREATE TABLE shipped_orders (order_id int)");
-    _ = try db.execute("INSERT INTO shipped_orders VALUES (1)");
+    try executeAndCleanup(&db, "CREATE TABLE shipped_orders (order_id int)");
+    try executeAndCleanup(&db, "INSERT INTO shipped_orders VALUES (1)");
 
     // Query: EXISTS with nested IN
     var result = try db.execute("SELECT * FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE user_id = 1 AND id IN (SELECT order_id FROM shipped_orders))");
@@ -818,8 +824,8 @@ test "subquery: error - table not found in subquery" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE users (id int, name text)");
-    _ = try db.execute("INSERT INTO users VALUES (1, 'Alice')");
+    try executeAndCleanup(&db, "CREATE TABLE users (id int, name text)");
+    try executeAndCleanup(&db, "INSERT INTO users VALUES (1, 'Alice')");
 
     // Query: Subquery references non-existent table
     const result = db.execute("SELECT * FROM users WHERE id IN (SELECT user_id FROM nonexistent_table)");
@@ -831,11 +837,11 @@ test "subquery: error - column not found in subquery" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE users (id int, name text)");
-    _ = try db.execute("INSERT INTO users VALUES (1, 'Alice')");
+    try executeAndCleanup(&db, "CREATE TABLE users (id int, name text)");
+    try executeAndCleanup(&db, "INSERT INTO users VALUES (1, 'Alice')");
 
-    _ = try db.execute("CREATE TABLE orders (id int, user_id int)");
-    _ = try db.execute("INSERT INTO orders VALUES (1, 1)");
+    try executeAndCleanup(&db, "CREATE TABLE orders (id int, user_id int)");
+    try executeAndCleanup(&db, "INSERT INTO orders VALUES (1, 1)");
 
     // Query: Subquery references non-existent column
     const result = db.execute("SELECT * FROM users WHERE id IN (SELECT nonexistent_column FROM orders)");
@@ -847,7 +853,7 @@ test "subquery: error - invalid syntax" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE users (id int, name text)");
+    try executeAndCleanup(&db, "CREATE TABLE users (id int, name text)");
 
     // Query: Missing closing parenthesis
     const result = db.execute("SELECT * FROM users WHERE id IN (SELECT id FROM users");

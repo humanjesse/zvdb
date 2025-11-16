@@ -687,6 +687,12 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
     if (tokens.len < 4) return SqlError.InvalidSyntax;
 
     var columns = ArrayList(SelectColumn).init(allocator);
+    errdefer {
+        for (columns.items) |*col| {
+            col.deinit(allocator);
+        }
+        columns.deinit();
+    }
     var i: usize = 1;
 
     // Parse columns
@@ -738,19 +744,46 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
     i += 1; // Skip FROM
 
     const table_name = try allocator.dupe(u8, tokens[i].text);
+    errdefer allocator.free(table_name);
     i += 1;
 
     var joins = ArrayList(JoinClause).init(allocator);
+    errdefer {
+        for (joins.items) |*join| {
+            join.deinit(allocator);
+        }
+        joins.deinit();
+    }
     const where_column: ?[]const u8 = null;
     const where_value: ?ColumnValue = null;
     var where_expr: ?Expr = null;
+    errdefer if (where_expr) |*expr| {
+        var e = expr.*;
+        e.deinit(allocator);
+    };
     var similar_to_column: ?[]const u8 = null;
+    errdefer if (similar_to_column) |col| allocator.free(col);
     var similar_to_text: ?[]const u8 = null;
+    errdefer if (similar_to_text) |text| allocator.free(text);
     var order_by_similarity: ?[]const u8 = null;
+    errdefer if (order_by_similarity) |text| allocator.free(text);
     var order_by_vibes = false;
     var order_by: ?OrderByClause = null;
+    errdefer if (order_by) |*ob| {
+        ob.deinit(allocator);
+    };
     var group_by = ArrayList([]const u8).init(allocator);
+    errdefer {
+        for (group_by.items) |col| {
+            allocator.free(col);
+        }
+        group_by.deinit();
+    }
     var having_expr: ?Expr = null;
+    errdefer if (having_expr) |*expr| {
+        var e = expr.*;
+        e.deinit(allocator);
+    };
     var limit: ?usize = null;
 
     // Parse JOINs (before WHERE, GROUP BY, ORDER BY, LIMIT)
@@ -848,13 +881,22 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
                 i += 1;
             } else {
                 // Parse as expression - find end of WHERE clause
+                // Need to track parentheses depth to avoid breaking on keywords inside subqueries
                 var where_end = i - 1; // Start from the first token after WHERE
+                var paren_depth: usize = 0;
                 while (where_end < tokens.len) {
-                    if (eqlIgnoreCase(tokens[where_end].text, "GROUP") or
-                        eqlIgnoreCase(tokens[where_end].text, "ORDER") or
-                        eqlIgnoreCase(tokens[where_end].text, "LIMIT"))
-                    {
-                        break;
+                    if (std.mem.eql(u8, tokens[where_end].text, "(")) {
+                        paren_depth += 1;
+                    } else if (std.mem.eql(u8, tokens[where_end].text, ")")) {
+                        paren_depth -= 1;
+                    } else if (paren_depth == 0) {
+                        // Only check for clause-ending keywords when not inside parentheses
+                        if (eqlIgnoreCase(tokens[where_end].text, "GROUP") or
+                            eqlIgnoreCase(tokens[where_end].text, "ORDER") or
+                            eqlIgnoreCase(tokens[where_end].text, "LIMIT"))
+                        {
+                            break;
+                        }
                     }
                     where_end += 1;
                 }
@@ -1031,10 +1073,12 @@ fn parseExpr(allocator: Allocator, tokens: []const Token, start_idx: *usize) (Al
 /// Parse OR expressions (lowest precedence)
 fn parseOrExpr(allocator: Allocator, tokens: []const Token, idx: *usize) (Allocator.Error || SqlError)!Expr {
     var left = try parseAndExpr(allocator, tokens, idx);
+    errdefer left.deinit(allocator);
 
     while (idx.* < tokens.len and eqlIgnoreCase(tokens[idx.*].text, "OR")) {
         idx.* += 1;
-        const right = try parseAndExpr(allocator, tokens, idx);
+        var right = try parseAndExpr(allocator, tokens, idx);
+        errdefer right.deinit(allocator);
 
         const binary = try allocator.create(BinaryExpr);
         binary.* = BinaryExpr{
@@ -1051,10 +1095,12 @@ fn parseOrExpr(allocator: Allocator, tokens: []const Token, idx: *usize) (Alloca
 /// Parse AND expressions
 fn parseAndExpr(allocator: Allocator, tokens: []const Token, idx: *usize) (Allocator.Error || SqlError)!Expr {
     var left = try parseComparisonExpr(allocator, tokens, idx);
+    errdefer left.deinit(allocator);
 
     while (idx.* < tokens.len and eqlIgnoreCase(tokens[idx.*].text, "AND")) {
         idx.* += 1;
-        const right = try parseComparisonExpr(allocator, tokens, idx);
+        var right = try parseComparisonExpr(allocator, tokens, idx);
+        errdefer right.deinit(allocator);
 
         const binary = try allocator.create(BinaryExpr);
         binary.* = BinaryExpr{
@@ -1070,7 +1116,8 @@ fn parseAndExpr(allocator: Allocator, tokens: []const Token, idx: *usize) (Alloc
 
 /// Parse comparison expressions (=, !=, <, >, <=, >=, IN, NOT IN)
 fn parseComparisonExpr(allocator: Allocator, tokens: []const Token, idx: *usize) (Allocator.Error || SqlError)!Expr {
-    const left = try parseUnaryExpr(allocator, tokens, idx);
+    var left = try parseUnaryExpr(allocator, tokens, idx);
+    errdefer left.deinit(allocator);
 
     if (idx.* < tokens.len) {
         const op_text = tokens[idx.*].text;
@@ -1078,7 +1125,8 @@ fn parseComparisonExpr(allocator: Allocator, tokens: []const Token, idx: *usize)
         // Check for IN operator
         if (eqlIgnoreCase(op_text, "IN")) {
             idx.* += 1;
-            const right = try parseUnaryExpr(allocator, tokens, idx);
+            var right = try parseUnaryExpr(allocator, tokens, idx);
+            errdefer right.deinit(allocator);
 
             const binary = try allocator.create(BinaryExpr);
             binary.* = BinaryExpr{
@@ -1093,7 +1141,8 @@ fn parseComparisonExpr(allocator: Allocator, tokens: []const Token, idx: *usize)
         if (eqlIgnoreCase(op_text, "NOT")) {
             if (idx.* + 1 < tokens.len and eqlIgnoreCase(tokens[idx.* + 1].text, "IN")) {
                 idx.* += 2; // Skip NOT IN
-                const right = try parseUnaryExpr(allocator, tokens, idx);
+                var right = try parseUnaryExpr(allocator, tokens, idx);
+                errdefer right.deinit(allocator);
 
                 const binary = try allocator.create(BinaryExpr);
                 binary.* = BinaryExpr{
@@ -1123,7 +1172,8 @@ fn parseComparisonExpr(allocator: Allocator, tokens: []const Token, idx: *usize)
 
         if (op) |o| {
             idx.* += 1;
-            const right = try parseUnaryExpr(allocator, tokens, idx);
+            var right = try parseUnaryExpr(allocator, tokens, idx);
+            errdefer right.deinit(allocator);
 
             const binary = try allocator.create(BinaryExpr);
             binary.* = BinaryExpr{
@@ -1152,6 +1202,10 @@ fn parseUnaryExpr(allocator: Allocator, tokens: []const Token, idx: *usize) (All
         }
 
         const subquery = try parseSubquery(allocator, tokens, idx);
+        errdefer {
+            subquery.deinit(allocator);
+            allocator.destroy(subquery);
+        }
 
         // Represent EXISTS as a binary expression with a literal true on the left
         const binary = try allocator.create(BinaryExpr);
@@ -1175,6 +1229,10 @@ fn parseUnaryExpr(allocator: Allocator, tokens: []const Token, idx: *usize) (All
             }
 
             const subquery = try parseSubquery(allocator, tokens, idx);
+            errdefer {
+                subquery.deinit(allocator);
+                allocator.destroy(subquery);
+            }
 
             // Represent NOT EXISTS as a binary expression
             const binary = try allocator.create(BinaryExpr);
@@ -1188,7 +1246,9 @@ fn parseUnaryExpr(allocator: Allocator, tokens: []const Token, idx: *usize) (All
 
         // Regular NOT expression
         idx.* += 1;
-        const expr = try parseUnaryExpr(allocator, tokens, idx);
+        var expr = try parseUnaryExpr(allocator, tokens, idx);
+        errdefer expr.deinit(allocator);
+
         const unary = try allocator.create(UnaryExpr);
         unary.* = UnaryExpr{
             .op = .not,
@@ -1197,7 +1257,8 @@ fn parseUnaryExpr(allocator: Allocator, tokens: []const Token, idx: *usize) (All
         return Expr{ .unary = unary };
     }
 
-    const expr = try parsePrimaryExpr(allocator, tokens, idx);
+    var expr = try parsePrimaryExpr(allocator, tokens, idx);
+    errdefer expr.deinit(allocator);
 
     // IS NULL / IS NOT NULL
     if (idx.* < tokens.len and eqlIgnoreCase(tokens[idx.*].text, "IS")) {
@@ -1284,7 +1345,8 @@ fn parsePrimaryExpr(allocator: Allocator, tokens: []const Token, idx: *usize) (A
     // Regular parenthesized expression
     if (std.mem.eql(u8, token_text, "(")) {
         idx.* += 1;
-        const expr = try parseExpr(allocator, tokens, idx);
+        var expr = try parseExpr(allocator, tokens, idx);
+        errdefer expr.deinit(allocator);
         if (idx.* >= tokens.len or !std.mem.eql(u8, tokens[idx.*].text, ")")) {
             return SqlError.InvalidExpression;
         }
@@ -1767,12 +1829,21 @@ fn parseHaving(allocator: Allocator, tokens: []const Token, start_idx: usize) !s
     idx += 1;
 
     // Find end of HAVING clause (before ORDER BY or LIMIT)
+    // Need to track parentheses depth to avoid breaking on keywords inside subqueries
     var having_end = idx;
+    var paren_depth: usize = 0;
     while (having_end < tokens.len) {
-        if (eqlIgnoreCase(tokens[having_end].text, "ORDER") or
-            eqlIgnoreCase(tokens[having_end].text, "LIMIT"))
-        {
-            break;
+        if (std.mem.eql(u8, tokens[having_end].text, "(")) {
+            paren_depth += 1;
+        } else if (std.mem.eql(u8, tokens[having_end].text, ")")) {
+            paren_depth -= 1;
+        } else if (paren_depth == 0) {
+            // Only check for clause-ending keywords when not inside parentheses
+            if (eqlIgnoreCase(tokens[having_end].text, "ORDER") or
+                eqlIgnoreCase(tokens[having_end].text, "LIMIT"))
+            {
+                break;
+            }
         }
         having_end += 1;
     }

@@ -186,7 +186,7 @@ test "buildHashTable: basic functionality" {
     _ = try table.insert(values2);
 
     // Build hash table on "id" column
-    var hash_table = try hash_join.buildHashTable(allocator, &table, "id");
+    var hash_table = try hash_join.buildHashTable(allocator, &table, "id", null, null);
     defer hash_table.deinit();
 
     // Verify we can probe for both keys
@@ -226,7 +226,7 @@ test "buildHashTable: NULL keys are skipped" {
     _ = try table.insert(values2);
 
     // Build hash table
-    var hash_table = try hash_join.buildHashTable(allocator, &table, "id");
+    var hash_table = try hash_join.buildHashTable(allocator, &table, "id", null, null);
     defer hash_table.deinit();
 
     // Should only have one row (NULL was skipped)
@@ -252,7 +252,7 @@ test "buildHashTable: duplicate join keys" {
     }
 
     // Build hash table
-    var hash_table = try hash_join.buildHashTable(allocator, &table, "category");
+    var hash_table = try hash_join.buildHashTable(allocator, &table, "category", null, null);
     defer hash_table.deinit();
 
     // Should have all 3 rows under the same hash
@@ -329,6 +329,8 @@ test "hash join produces same results as nested loop for INNER JOIN" {
         "user_id",
         true, // SELECT *
         &[_]sql.SelectColumn{},
+        null, // snapshot
+        null, // clog
     );
     defer hash_result.deinit();
 
@@ -393,6 +395,8 @@ test "hash join LEFT JOIN includes unmatched rows" {
         "user_id",
         true,
         &[_]sql.SelectColumn{},
+        null, // snapshot
+        null, // clog
     );
     defer result.deinit();
 
@@ -467,6 +471,8 @@ test "hash join RIGHT JOIN includes unmatched rows from right table" {
         "user_id",
         true,
         &[_]sql.SelectColumn{},
+        null, // snapshot
+        null, // clog
     );
     defer result.deinit();
 
@@ -510,6 +516,8 @@ test "hash join handles empty tables" {
         "id",
         true,
         &[_]sql.SelectColumn{},
+        null, // snapshot
+        null, // clog
     );
     defer result.deinit();
 
@@ -569,6 +577,8 @@ test "hash join with different data types" {
         "code",
         true,
         &[_]sql.SelectColumn{},
+        null, // snapshot
+        null, // clog
     );
     defer result.deinit();
 

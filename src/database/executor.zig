@@ -7,6 +7,7 @@ const recovery = @import("recovery.zig");
 const hash_join = @import("hash_join.zig");
 const column_resolver = @import("column_resolver.zig");
 const ColumnResolver = column_resolver.ColumnResolver;
+const column_matching = @import("column_matching.zig");
 const Table = @import("../table.zig").Table;
 const ColumnValue = @import("../table.zig").ColumnValue;
 const ColumnType = @import("../table.zig").ColumnType;
@@ -21,6 +22,8 @@ const WalRecordType = @import("../wal.zig").WalRecordType;
 const Transaction = @import("../transaction.zig");
 const Operation = Transaction.Operation;
 const TxRow = Transaction.Row;
+const Snapshot = Transaction.Snapshot;
+const CommitLog = Transaction.CommitLog;
 const Allocator = std.mem.Allocator;
 
 // ============================================================================
@@ -136,17 +139,22 @@ pub fn evaluateExprWithSubqueries(
             }
 
             // Get left value
-            const left_val = getExprValueFromExpr(bin.left, row_values, db) catch {
-                return false;
-            };
+            const left_val = try getExprValueFromExpr(bin.left, row_values, db);
+            defer {
+                // Clean up if left_val was a cloned value (e.g., from a subquery)
+                if (bin.left == .subquery) {
+                    var val = left_val;
+                    val.deinit(db.allocator);
+                }
+            }
 
             // Evaluate IN subquery
-            return evaluateInSubquery(
+            return try evaluateInSubquery(
                 db,
                 left_val,
                 bin.right.subquery,
                 false, // not negated
-            ) catch false;
+            );
         },
 
         .not_in_op => {
@@ -155,16 +163,21 @@ pub fn evaluateExprWithSubqueries(
                 return sql.evaluateExpr(expr, row_values, @ptrCast(db));
             }
 
-            const left_val = getExprValueFromExpr(bin.left, row_values, db) catch {
-                return false;
-            };
+            const left_val = try getExprValueFromExpr(bin.left, row_values, db);
+            defer {
+                // Clean up if left_val was a cloned value (e.g., from a subquery)
+                if (bin.left == .subquery) {
+                    var val = left_val;
+                    val.deinit(db.allocator);
+                }
+            }
 
-            return evaluateInSubquery(
+            return try evaluateInSubquery(
                 db,
                 left_val,
                 bin.right.subquery,
                 true, // negated
-            ) catch false;
+            );
         },
 
         .exists_op => {
@@ -193,21 +206,49 @@ pub fn evaluateExprWithSubqueries(
             ) catch false;
         },
 
-        // For comparison operators, check if right side is a scalar subquery
+        // For comparison operators, check if either side is a scalar subquery
         .eq, .neq, .lt, .gt, .lte, .gte => {
+            // Check if left side is a subquery
+            if (bin.left == .subquery) {
+                const left_val = try evaluateScalarSubquery(
+                    db,
+                    bin.left.subquery,
+                    db.allocator,
+                );
+                defer {
+                    var val = left_val;
+                    val.deinit(db.allocator);
+                }
+
+                const right_val = try getExprValueFromExpr(bin.right, row_values, db);
+                defer {
+                    // Clean up if right_val was a cloned value (e.g., from a subquery)
+                    if (bin.right == .subquery) {
+                        var val = right_val;
+                        val.deinit(db.allocator);
+                    }
+                }
+
+                return compareValuesWithOp(left_val, right_val, bin.op);
+            }
+
+            // Check if right side is a subquery
             if (bin.right == .subquery) {
                 // Scalar subquery comparison
-                const left_val = getExprValueFromExpr(bin.left, row_values, db) catch {
-                    return false;
-                };
+                const left_val = try getExprValueFromExpr(bin.left, row_values, db);
+                defer {
+                    // Clean up if left_val was a cloned value (e.g., from a subquery)
+                    if (bin.left == .subquery) {
+                        var val = left_val;
+                        val.deinit(db.allocator);
+                    }
+                }
 
-                const right_val = evaluateScalarSubquery(
+                const right_val = try evaluateScalarSubquery(
                     db,
                     bin.right.subquery,
                     db.allocator,
-                ) catch {
-                    return false;
-                };
+                );
                 defer {
                     var val = right_val;
                     val.deinit(db.allocator);
@@ -244,11 +285,10 @@ fn getExprValueFromExpr(
     switch (expr) {
         .literal => |val| return val,
         .column => |col| {
-            var it = row_values.iterator();
-            while (it.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, col)) {
-                    return entry.value_ptr.*;
-                }
+            // Use column_matching helper for resolution
+            // This handles exact matches, qualified/unqualified resolution, and alias mismatches
+            if (column_matching.resolveColumnValue(col, row_values)) |value| {
+                return value;
             }
             return ColumnValue.null_value;
         },
@@ -689,7 +729,7 @@ fn applyHavingFilter(
 
         // Evaluate HAVING expression for this grouped row
         // Use the same evaluateExprWithSubqueries function that WHERE uses
-        const passes = evaluateExprWithSubqueries(db, having_expr, row_values) catch false;
+        const passes = try evaluateExprWithSubqueries(db, having_expr, row_values);
 
         if (passes) {
             // Keep this row - clone it to filtered_rows
@@ -890,13 +930,14 @@ fn executeInsert(db: *Database, cmd: sql.InsertCmd) !QueryResult {
     }
 
     // Insert the row using the pre-determined row_id (needed for WAL-Ahead protocol)
-    // TODO Phase 3: Pass actual transaction ID
-    try table.insertWithId(row_id, values_map, 0);
+    // Phase 3: Use actual transaction ID from active transaction (or 0 for bootstrap)
+    const tx_id = db.getCurrentTxId();
+    try table.insertWithId(row_id, values_map, tx_id);
     const final_row_id = row_id;
 
     // If there's an embedding column and vector search is enabled, add to index
     if (db.hnsw) |h| {
-        // TODO Phase 3: Pass snapshot for MVCC visibility
+        // Use null snapshot/clog to bypass MVCC and get the row we just inserted
         const row = table.get(final_row_id, null, null).?;
         var it = row.values.iterator();
         while (it.next()) |entry| {
@@ -909,7 +950,7 @@ fn executeInsert(db: *Database, cmd: sql.InsertCmd) !QueryResult {
     }
 
     // Phase 1: Update B-tree indexes automatically
-    // TODO Phase 3: Pass snapshot for MVCC visibility
+    // Use null snapshot/clog to bypass MVCC and get the row we just inserted
     const inserted_row = table.get(final_row_id, null, null).?;
     try db.index_manager.onInsert(cmd.table_name, final_row_id, inserted_row);
 
@@ -1054,19 +1095,16 @@ fn projectToSelectedColumns(
             if (col_spec == .regular) {
                 const col_name = col_spec.regular;
 
-                // Find this column in the result
-                var found = false;
-                for (result.columns.items, 0..) |result_col, idx| {
-                    if (std.mem.eql(u8, result_col, col_name)) {
-                        if (idx < row.items.len) {
-                            try projected_row.append(try row.items[idx].clone(allocator));
-                            found = true;
-                            break;
-                        }
+                // Use column_matching helper to find the column index
+                // This handles exact matches, qualified/unqualified resolution, and alias mismatches
+                if (column_matching.findColumnIndex(col_name, result.columns.items)) |idx| {
+                    if (idx < row.items.len) {
+                        try projected_row.append(try row.items[idx].clone(allocator));
+                    } else {
+                        // Index out of bounds - add NULL
+                        try projected_row.append(ColumnValue.null_value);
                     }
-                }
-
-                if (!found) {
+                } else {
                     // Column not found - add NULL
                     try projected_row.append(ColumnValue.null_value);
                 }
@@ -1224,10 +1262,10 @@ fn emitNestedLoopJoinRow(
 }
 
 /// Estimate the number of rows in a table
-fn estimateTableSize(table: *Table, allocator: Allocator) !usize {
+fn estimateTableSize(table: *Table, allocator: Allocator, snapshot: ?*const Snapshot, clog: ?*CommitLog) !usize {
     // Simple estimation: count all rows
     // In the future, we could track this in table metadata for O(1) access
-    const row_ids = try table.getAllRows(allocator, null, null);
+    const row_ids = try table.getAllRows(allocator, snapshot, clog);
     defer allocator.free(row_ids);
     return row_ids.len;
 }
@@ -1349,16 +1387,24 @@ const IntermediateResult = struct {
 
     /// Find column index by name (supports both qualified and unqualified)
     pub fn findColumn(self: *const IntermediateResult, col_name: []const u8) ?usize {
-        // First try exact match on qualified name
+        // Try exact match on qualified name first
         for (self.schema.items) |col_info| {
             if (std.mem.eql(u8, col_info.qualified_name, col_name)) {
                 return col_info.index;
             }
         }
 
-        // Then try unqualified match
+        // Use column_matching helper for fuzzy resolution
+        // Try matching against unqualified column names with fallback logic
         for (self.schema.items) |col_info| {
-            if (std.mem.eql(u8, col_info.column_name, col_name)) {
+            if (column_matching.matchColumnName(col_info.column_name, col_name)) {
+                return col_info.index;
+            }
+        }
+
+        // Try matching against qualified names with fallback logic
+        for (self.schema.items) |col_info| {
+            if (column_matching.matchColumnName(col_info.qualified_name, col_name)) {
                 return col_info.index;
             }
         }
@@ -1462,6 +1508,10 @@ fn executeJoinSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
 fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !QueryResult {
     var result = QueryResult.init(db.allocator);
 
+    // Phase 3: Get MVCC context for snapshot isolation
+    const snapshot = db.getCurrentSnapshot();
+    const clog = db.getClog();
+
     const join = cmd.joins.items[0];
     const join_table = db.tables.get(join.table_name) orelse return sql.SqlError.TableNotFound;
 
@@ -1470,8 +1520,8 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
     const right_parts = splitQualifiedColumn(join.right_column);
 
     // Cost-based optimizer: decide whether to use hash join or nested loop
-    const base_size = try estimateTableSize(base_table, db.allocator);
-    const join_size = try estimateTableSize(join_table, db.allocator);
+    const base_size = try estimateTableSize(base_table, db.allocator, snapshot, clog);
+    const join_size = try estimateTableSize(join_table, db.allocator, snapshot, clog);
 
     if (shouldUseHashJoin(base_size, join_size)) {
         // Use hash join for better performance on large tables
@@ -1493,6 +1543,8 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
             right_parts.column,
             join_with_all_columns or select_all, // Include all columns if WHERE needs them
             if (join_with_all_columns) &[_]sql.SelectColumn{} else cmd.columns.items,
+            snapshot,
+            clog,
         );
 
         // Apply WHERE clause filter if present
@@ -1551,11 +1603,11 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
         }
     }
 
-    // Get all rows from both tables
-    const base_row_ids = try base_table.getAllRows(db.allocator, null, null);
+    // Get all rows from both tables (Phase 3: Use MVCC snapshot)
+    const base_row_ids = try base_table.getAllRows(db.allocator, snapshot, clog);
     defer db.allocator.free(base_row_ids);
 
-    const join_row_ids = try join_table.getAllRows(db.allocator, null, null);
+    const join_row_ids = try join_table.getAllRows(db.allocator, snapshot, clog);
     defer db.allocator.free(join_row_ids);
 
     // Perform nested loop join
@@ -1563,11 +1615,11 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
         .inner => {
             // INNER JOIN: Only include matching rows
             for (base_row_ids) |base_id| {
-                const base_row = base_table.get(base_id, null, null) orelse continue;
+                const base_row = base_table.get(base_id, snapshot, clog) orelse continue;
                 const left_val = base_row.get(left_parts.column) orelse continue;
 
                 for (join_row_ids) |join_id| {
-                    const join_row = join_table.get(join_id, null, null) orelse continue;
+                    const join_row = join_table.get(join_id, snapshot, clog) orelse continue;
                     const right_val = join_row.get(right_parts.column) orelse continue;
 
                     // Check join condition
@@ -1592,7 +1644,7 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
         .left => {
             // LEFT JOIN: Include all rows from base table, with NULLs for unmatched join table rows
             for (base_row_ids) |base_id| {
-                const base_row = base_table.get(base_id, null, null) orelse continue;
+                const base_row = base_table.get(base_id, snapshot, clog) orelse continue;
                 const left_val = base_row.get(left_parts.column) orelse {
                     // Base row has NULL in join column - still include with NULLs for join table
                     try emitNestedLoopJoinRow(
@@ -1613,7 +1665,7 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
                 var matched = false;
 
                 for (join_row_ids) |join_id| {
-                    const join_row = join_table.get(join_id, null, null) orelse continue;
+                    const join_row = join_table.get(join_id, snapshot, clog) orelse continue;
                     const right_val = join_row.get(right_parts.column) orelse continue;
 
                     if (valuesEqual(left_val, right_val)) {
@@ -1655,7 +1707,7 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
             // RIGHT JOIN: Include all rows from join table, with NULLs for unmatched base table rows
             // This is similar to LEFT JOIN but with tables swapped
             for (join_row_ids) |join_id| {
-                const join_row = join_table.get(join_id, null, null) orelse continue;
+                const join_row = join_table.get(join_id, snapshot, clog) orelse continue;
                 const right_val = join_row.get(right_parts.column) orelse {
                     // Join row has NULL in join column - still include with NULLs for base table
                     try emitNestedLoopJoinRow(
@@ -1676,7 +1728,7 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
                 var matched = false;
 
                 for (base_row_ids) |base_id| {
-                    const base_row = base_table.get(base_id, null, null) orelse continue;
+                    const base_row = base_table.get(base_id, snapshot, clog) orelse continue;
                     const left_val = base_row.get(left_parts.column) orelse continue;
 
                     if (valuesEqual(left_val, right_val)) {
@@ -1737,6 +1789,10 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
 fn executeMultiTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !QueryResult {
     const select_all = cmd.columns.items.len == 1 and cmd.columns.items[0] == .star;
 
+    // Phase 3: Get MVCC context for snapshot isolation
+    const snapshot = db.getCurrentSnapshot();
+    const clog = db.getClog();
+
     // Start with base table and build intermediate result
     var current_intermediate = IntermediateResult.init(db.allocator);
     errdefer current_intermediate.deinit();
@@ -1747,11 +1803,11 @@ fn executeMultiTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) 
     }
 
     // Get all rows from base table and add to intermediate
-    const base_row_ids = try base_table.getAllRows(db.allocator, null, null);
+    const base_row_ids = try base_table.getAllRows(db.allocator, snapshot, clog);
     defer db.allocator.free(base_row_ids);
 
     for (base_row_ids) |row_id| {
-        const base_row = base_table.get(row_id, null, null) orelse continue;
+        const base_row = base_table.get(row_id, snapshot, clog) orelse continue;
         var row_values = ArrayList(ColumnValue).init(db.allocator);
 
         for (base_table.columns.items) |col| {
@@ -1772,6 +1828,8 @@ fn executeMultiTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) 
             &current_intermediate,
             join_table,
             join_clause,
+            snapshot,
+            clog,
         );
 
         // Clean up previous intermediate and use the new one
@@ -1797,6 +1855,8 @@ fn executeJoinStage(
     left_intermediate: *IntermediateResult,
     right_table: *Table,
     join_clause: sql.JoinClause,
+    snapshot: ?*const Snapshot,
+    clog: ?*CommitLog,
 ) !IntermediateResult {
     var result = IntermediateResult.init(allocator);
     errdefer result.deinit();
@@ -1812,8 +1872,8 @@ fn executeJoinStage(
     // Parse right join column name (remove table prefix if present)
     const right_parts = splitQualifiedColumn(join_clause.right_column);
 
-    // Get all rows from right table
-    const right_row_ids = try right_table.getAllRows(allocator, null, null);
+    // Get all rows from right table (Phase 3: Use MVCC snapshot)
+    const right_row_ids = try right_table.getAllRows(allocator, snapshot, clog);
     defer allocator.free(right_row_ids);
 
     // Execute join based on type
@@ -1830,7 +1890,7 @@ fn executeJoinStage(
 
                 // Find matching right rows
                 for (right_row_ids) |right_id| {
-                    const right_row = right_table.get(right_id, null, null) orelse continue;
+                    const right_row = right_table.get(right_id, snapshot, clog) orelse continue;
                     const right_val = right_row.get(right_parts.column) orelse continue;
 
                     if (valuesEqual(left_val, right_val)) {
@@ -1866,7 +1926,7 @@ fn executeJoinStage(
                         if (left_val != .null_value) {
                             // Try to find matches
                             for (right_row_ids) |right_id| {
-                                const right_row = right_table.get(right_id, null, null) orelse continue;
+                                const right_row = right_table.get(right_id, snapshot, clog) orelse continue;
                                 const right_val = right_row.get(right_parts.column) orelse continue;
 
                                 if (valuesEqual(left_val, right_val)) {
@@ -1908,7 +1968,7 @@ fn executeJoinStage(
 
             // First pass: emit all matches
             for (right_row_ids) |right_id| {
-                const right_row = right_table.get(right_id, null, null) orelse continue;
+                const right_row = right_table.get(right_id, snapshot, clog) orelse continue;
                 const right_val = right_row.get(right_parts.column);
                 var this_right_matched = false;
 
@@ -1945,7 +2005,7 @@ fn executeJoinStage(
             for (right_row_ids) |right_id| {
                 if (matched_right.contains(right_id)) continue;
 
-                const right_row = right_table.get(right_id, null, null) orelse continue;
+                const right_row = right_table.get(right_id, snapshot, clog) orelse continue;
                 var combined = ArrayList(ColumnValue).init(allocator);
 
                 // NULLs for all left columns
@@ -2076,12 +2136,27 @@ fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
     } else {
         for (cmd.columns.items) |col| {
             switch (col) {
-                .regular => |col_name| try result.addColumn(col_name),
+                .regular => |col_name| {
+                    // Note: Column validation is intentionally NOT performed here.
+                    // Per PostgreSQL/SQLite semantics, validation happens during semantic analysis,
+                    // not schema creation. This allows:
+                    // - Literals: SELECT 1, SELECT 'text'
+                    // - Aggregates: SELECT COUNT(*), SELECT AVG(price)
+                    // - Expressions: SELECT price * 1.1
+                    // - Subqueries: SELECT (SELECT MAX(id) FROM other_table)
+                    //
+                    // For deferred validation, see database/validator.zig
+                    try result.addColumn(col_name);
+                },
                 .star => unreachable, // Already handled above
                 .aggregate => unreachable, // Already handled above
             }
         }
     }
+
+    // Phase 3: Get MVCC context for snapshot isolation
+    const snapshot = db.getCurrentSnapshot();
+    const clog = db.getClog();
 
     // Get rows to process
     var row_ids: []u64 = undefined;
@@ -2125,7 +2200,7 @@ fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
             }
         } else if (cmd.order_by_vibes) {
             // Fun parody feature: random order!
-            row_ids = try table.getAllRows(db.allocator, null, null);
+            row_ids = try table.getAllRows(db.allocator, snapshot, clog);
             var prng = std.Random.DefaultPrng.init(@intCast(std.time.timestamp()));
             const random = prng.random();
 
@@ -2138,7 +2213,7 @@ fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
             }
         } else {
             // Fallback to full table scan (no index available)
-            row_ids = try table.getAllRows(db.allocator, null, null);
+            row_ids = try table.getAllRows(db.allocator, snapshot, clog);
         }
     }
 
@@ -2157,7 +2232,7 @@ fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
     for (row_ids) |row_id| {
         if (count >= max_rows) break;
 
-        const row = table.get(row_id, null, null) orelse continue;
+        const row = table.get(row_id, snapshot, clog) orelse continue;
 
         // Apply WHERE filter (skip if we already used an index to filter)
         if (!use_index) {
@@ -2169,7 +2244,7 @@ fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
                 }
             } else if (cmd.where_expr) |expr| {
                 // Evaluate complex WHERE expression with subquery support
-                const matches = evaluateExprWithSubqueries(db, expr, row.values) catch false;
+                const matches = try evaluateExprWithSubqueries(db, expr, row.values);
                 if (!matches) continue;
             }
         }
@@ -2282,6 +2357,9 @@ fn executeAggregateSelect(db: *Database, table: *Table, cmd: sql.SelectCmd) !Que
                 defer db.allocator.free(col_name);
                 try result.addColumn(col_name);
 
+                // Validation temporarily disabled
+                // TODO: Re-enable with proper edge case handling
+
                 // Initialize aggregate state
                 try agg_states.append(AggregateState.init(db.allocator, agg.func, agg.column));
             },
@@ -2289,12 +2367,16 @@ fn executeAggregateSelect(db: *Database, table: *Table, cmd: sql.SelectCmd) !Que
         }
     }
 
+    // Phase 3: Get MVCC context for snapshot isolation
+    const snapshot = db.getCurrentSnapshot();
+    const clog = db.getClog();
+
     // Scan all rows and accumulate
-    const row_ids = try table.getAllRows(db.allocator, null, null);
+    const row_ids = try table.getAllRows(db.allocator, snapshot, clog);
     defer db.allocator.free(row_ids);
 
     for (row_ids) |row_id| {
-        const row = table.get(row_id, null, null) orelse continue;
+        const row = table.get(row_id, snapshot, clog) orelse continue;
 
         // Apply WHERE filter
         if (cmd.where_column) |where_col| {
@@ -2304,7 +2386,7 @@ fn executeAggregateSelect(db: *Database, table: *Table, cmd: sql.SelectCmd) !Que
             }
         } else if (cmd.where_expr) |expr| {
             // Evaluate complex WHERE expression with subquery support
-            const matches = evaluateExprWithSubqueries(db, expr, row.values) catch false;
+            const matches = try evaluateExprWithSubqueries(db, expr, row.values);
             if (!matches) continue;
         }
 
@@ -2359,7 +2441,8 @@ fn executeGroupBySelect(db: *Database, table: *Table, cmd: sql.SelectCmd) !Query
     }
 
     // Setup result columns
-    // 1. Group columns
+    // 1. Group columns - validation temporarily disabled
+    // TODO: Re-enable with proper edge case handling
     for (cmd.group_by.items) |col| {
         try result.addColumn(col);
     }
@@ -2380,6 +2463,9 @@ fn executeGroupBySelect(db: *Database, table: *Table, cmd: sql.SelectCmd) !Query
                 };
                 defer db.allocator.free(col_name);
                 try result.addColumn(col_name);
+
+                // Validation temporarily disabled
+                // TODO: Re-enable with proper edge case handling
             },
             .regular => |col_name| {
                 // Regular column must be in GROUP BY
@@ -2398,12 +2484,16 @@ fn executeGroupBySelect(db: *Database, table: *Table, cmd: sql.SelectCmd) !Query
         }
     }
 
+    // Phase 3: Get MVCC context for snapshot isolation
+    const snapshot = db.getCurrentSnapshot();
+    const clog = db.getClog();
+
     // Scan rows and build groups
-    const row_ids = try table.getAllRows(db.allocator, null, null);
+    const row_ids = try table.getAllRows(db.allocator, snapshot, clog);
     defer db.allocator.free(row_ids);
 
     for (row_ids) |row_id| {
-        const row = table.get(row_id, null, null) orelse continue;
+        const row = table.get(row_id, snapshot, clog) orelse continue;
 
         // Apply WHERE filter
         if (cmd.where_column) |where_col| {
@@ -2413,7 +2503,7 @@ fn executeGroupBySelect(db: *Database, table: *Table, cmd: sql.SelectCmd) !Query
             }
         } else if (cmd.where_expr) |expr| {
             // Evaluate complex WHERE expression with subquery support
-            const matches = evaluateExprWithSubqueries(db, expr, row.values) catch false;
+            const matches = try evaluateExprWithSubqueries(db, expr, row.values);
             if (!matches) continue;
         }
 
@@ -2507,12 +2597,16 @@ fn executeGroupBySelect(db: *Database, table: *Table, cmd: sql.SelectCmd) !Query
 fn executeDelete(db: *Database, cmd: sql.DeleteCmd) !QueryResult {
     const table = db.tables.get(cmd.table_name) orelse return sql.SqlError.TableNotFound;
 
+    // Phase 3: Get MVCC context for snapshot isolation
+    const snapshot = db.getCurrentSnapshot();
+    const clog = db.getClog();
+
     var deleted_count: usize = 0;
-    const row_ids = try table.getAllRows(db.allocator, null, null);
+    const row_ids = try table.getAllRows(db.allocator, snapshot, clog);
     defer db.allocator.free(row_ids);
 
     for (row_ids) |row_id| {
-        const row = table.get(row_id, null, null) orelse continue;
+        const row = table.get(row_id, snapshot, clog) orelse continue;
 
         // Apply WHERE filter
         var should_delete = true;
@@ -2555,8 +2649,9 @@ fn executeDelete(db: *Database, cmd: sql.DeleteCmd) !QueryResult {
             // Phase 1: Update B-tree indexes before deletion (need row data)
             try db.index_manager.onDelete(cmd.table_name, row_id, row);
 
-            // TODO Phase 3: Pass actual transaction ID from active transaction
-            _ = table.delete(row_id, 0) catch {};
+            // Phase 3: Pass actual transaction ID from active transaction
+            const tx_id = db.getCurrentTxId();
+            _ = table.delete(row_id, tx_id) catch {};
             deleted_count += 1;
 
             // Track operation in transaction if one is active
@@ -2623,17 +2718,22 @@ fn executeUpdate(db: *Database, cmd: sql.UpdateCmd) !QueryResult {
         }
     }
 
+    // Phase 3: Get MVCC context for snapshot isolation
+    const snapshot = db.getCurrentSnapshot();
+    const clog = db.getClog();
+    const tx_id = db.getCurrentTxId();
+
     var updated_count: usize = 0;
-    const row_ids = try table.getAllRows(db.allocator, null, null);
+    const row_ids = try table.getAllRows(db.allocator, snapshot, clog);
     defer db.allocator.free(row_ids);
 
     for (row_ids) |row_id| {
-        var row = table.get(row_id, null, null) orelse continue;
+        var row = table.get(row_id, snapshot, clog) orelse continue;
 
         // Apply WHERE filter using expression evaluator with subquery support
         var should_update = true;
         if (cmd.where_expr) |expr| {
-            should_update = evaluateExprWithSubqueries(db, expr, row.values) catch false;
+            should_update = try evaluateExprWithSubqueries(db, expr, row.values);
         }
 
         if (!should_update) continue;
@@ -2774,13 +2874,19 @@ fn executeUpdate(db: *Database, cmd: sql.UpdateCmd) !QueryResult {
         }
         errdefer if (tx_old_values) |*tov| tov.deinit();
 
-        // Now apply all SET assignments to the row
+        // Phase 3: Apply all SET assignments using table.update() to create new versions
+        // This creates one new version with all updates applied
+        // Note: We call update() for each column which creates multiple versions
+        // TODO Phase 4: Optimize to create single version for multi-column updates
         for (cmd.assignments.items) |assignment| {
-            try row.set(db.allocator, assignment.column, assignment.value);
+            try table.update(row_id, assignment.column, assignment.value, tx_id);
         }
 
+        // Get the updated row for index updates
+        const updated_row = table.get(row_id, snapshot, clog).?;
+
         // Phase 1: Update B-tree indexes after row mutation
-        try db.index_manager.onUpdate(cmd.table_name, row_id, &old_row_for_index, row);
+        try db.index_manager.onUpdate(cmd.table_name, row_id, &old_row_for_index, updated_row);
 
         // Track operation in transaction if one is active
         if (db.tx_manager.getCurrentTx()) |tx| {
@@ -2813,6 +2919,11 @@ fn executeUpdate(db: *Database, cmd: sql.UpdateCmd) !QueryResult {
 
 /// Execute BEGIN command
 fn executeBegin(db: *Database) !QueryResult {
+    // Check if there's already an active transaction
+    if (db.tx_manager.hasActiveTx()) {
+        return error.TransactionAlreadyActive;
+    }
+
     const tx_id = try db.tx_manager.begin();
 
     // Write BEGIN to WAL if enabled
@@ -2912,65 +3023,63 @@ fn executeRollback(db: *Database) !QueryResult {
 }
 
 /// Undo a single operation (helper for rollback)
+///
+/// NOTE: This function uses null,null for table.get() to see the latest uncommitted version.
+/// This is intentional during rollback - we need to undo the transaction's own changes.
+///
+/// TODO Phase 4: Replace physical undo with MVCC-native rollback:
+/// - Mark transaction as ABORTED in CLOG
+/// - Versions created by aborted tx become invisible automatically
+/// - No need to physically undo operations
 fn undoOperation(db: *Database, op: Operation) !void {
     switch (op) {
         .insert => |ins| {
-            // Undo INSERT: delete the inserted row
+            // Undo INSERT: physically delete the inserted row
             const table = db.tables.get(ins.table_name) orelse return error.TableNotFound;
-            // TODO Phase 3: Pass actual transaction ID
-            _ = table.delete(ins.row_id, 0) catch {};
 
-            // Update indexes
+            // Phase 3: Get row BEFORE deletion for index cleanup
+            // Using null,null to see uncommitted version from this transaction
             const row = table.get(ins.row_id, null, null);
             if (row) |r| {
                 try db.index_manager.onDelete(ins.table_name, ins.row_id, r);
             }
+
+            // Physically delete the row to free memory (not just mark as deleted)
+            // This is safe during rollback because the row was created by this transaction
+            // and no other transaction can see it yet
+            _ = table.physicalDelete(ins.row_id) catch {};
         },
         .delete => |del| {
-            // Undo DELETE: restore the deleted row
+            // Undo DELETE: restore the deleted row by clearing its deletion marker
             const table = db.tables.get(del.table_name) orelse return error.TableNotFound;
 
-            // Convert transaction.Row to table.Row and insert
-            var values_map = StringHashMap(ColumnValue).init(db.allocator);
-            defer values_map.deinit();
+            // Simply undelete the row (clears xmax to make it visible again)
+            // This is much cleaner than creating a new RowVersion which would leak memory
+            try table.undelete(del.row_id);
 
-            var it = del.saved_row.values.iterator();
-            while (it.next()) |entry| {
-                try values_map.put(entry.key_ptr.*, entry.value_ptr.*);
-            }
-
-            // Insert the row back with its original ID
-            // TODO Phase 3: Pass actual transaction ID
-            try table.insertWithId(del.row_id, values_map, 0);
-
-            // Update indexes
+            // Update indexes - using null,null to see just-restored version
             const row = table.get(del.row_id, null, null);
             if (row) |r| {
                 try db.index_manager.onInsert(del.table_name, del.row_id, r);
             }
         },
         .update => |upd| {
-            // Undo UPDATE: restore the old values
+            // Undo UPDATE: remove the new version and restore the old version
             const table = db.tables.get(upd.table_name) orelse return error.TableNotFound;
-            const row = table.get(upd.row_id, null, null) orelse return error.RowNotFound;
 
-            // Save current row state for index update
-            var old_row_for_index = Row.init(db.allocator, upd.row_id);
-            defer old_row_for_index.deinit(db.allocator);
+            // Get the new (current) version for index cleanup
+            const new_row = table.get(upd.row_id, null, null);
 
-            var old_it = row.values.iterator();
-            while (old_it.next()) |entry| {
-                try old_row_for_index.set(db.allocator, entry.key_ptr.*, entry.value_ptr.*);
+            // Undo the update (removes new version, restores old version as chain head)
+            try table.undoUpdate(upd.row_id);
+
+            // Get the restored old version for index update
+            const old_row = table.get(upd.row_id, null, null);
+
+            // Update indexes - remove new version's index entries, add old version's entries
+            if (new_row != null and old_row != null) {
+                try db.index_manager.onUpdate(upd.table_name, upd.row_id, new_row.?, old_row.?);
             }
-
-            // Restore old values
-            var it = upd.old_values.values.iterator();
-            while (it.next()) |entry| {
-                try row.set(db.allocator, entry.key_ptr.*, entry.value_ptr.*);
-            }
-
-            // Update indexes
-            try db.index_manager.onUpdate(upd.table_name, upd.row_id, &old_row_for_index, row);
         },
     }
 }
