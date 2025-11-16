@@ -1560,11 +1560,11 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
         }
     }
 
-    // Get all rows from both tables
-    const base_row_ids = try base_table.getAllRows(db.allocator, null, null);
+    // Get all rows from both tables (Phase 3: Use MVCC snapshot)
+    const base_row_ids = try base_table.getAllRows(db.allocator, snapshot, clog);
     defer db.allocator.free(base_row_ids);
 
-    const join_row_ids = try join_table.getAllRows(db.allocator, null, null);
+    const join_row_ids = try join_table.getAllRows(db.allocator, snapshot, clog);
     defer db.allocator.free(join_row_ids);
 
     // Perform nested loop join
@@ -1572,11 +1572,11 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
         .inner => {
             // INNER JOIN: Only include matching rows
             for (base_row_ids) |base_id| {
-                const base_row = base_table.get(base_id, null, null) orelse continue;
+                const base_row = base_table.get(base_id, snapshot, clog) orelse continue;
                 const left_val = base_row.get(left_parts.column) orelse continue;
 
                 for (join_row_ids) |join_id| {
-                    const join_row = join_table.get(join_id, null, null) orelse continue;
+                    const join_row = join_table.get(join_id, snapshot, clog) orelse continue;
                     const right_val = join_row.get(right_parts.column) orelse continue;
 
                     // Check join condition
@@ -1601,7 +1601,7 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
         .left => {
             // LEFT JOIN: Include all rows from base table, with NULLs for unmatched join table rows
             for (base_row_ids) |base_id| {
-                const base_row = base_table.get(base_id, null, null) orelse continue;
+                const base_row = base_table.get(base_id, snapshot, clog) orelse continue;
                 const left_val = base_row.get(left_parts.column) orelse {
                     // Base row has NULL in join column - still include with NULLs for join table
                     try emitNestedLoopJoinRow(
@@ -1622,7 +1622,7 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
                 var matched = false;
 
                 for (join_row_ids) |join_id| {
-                    const join_row = join_table.get(join_id, null, null) orelse continue;
+                    const join_row = join_table.get(join_id, snapshot, clog) orelse continue;
                     const right_val = join_row.get(right_parts.column) orelse continue;
 
                     if (valuesEqual(left_val, right_val)) {
@@ -1664,7 +1664,7 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
             // RIGHT JOIN: Include all rows from join table, with NULLs for unmatched base table rows
             // This is similar to LEFT JOIN but with tables swapped
             for (join_row_ids) |join_id| {
-                const join_row = join_table.get(join_id, null, null) orelse continue;
+                const join_row = join_table.get(join_id, snapshot, clog) orelse continue;
                 const right_val = join_row.get(right_parts.column) orelse {
                     // Join row has NULL in join column - still include with NULLs for base table
                     try emitNestedLoopJoinRow(
@@ -1685,7 +1685,7 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
                 var matched = false;
 
                 for (base_row_ids) |base_id| {
-                    const base_row = base_table.get(base_id, null, null) orelse continue;
+                    const base_row = base_table.get(base_id, snapshot, clog) orelse continue;
                     const left_val = base_row.get(left_parts.column) orelse continue;
 
                     if (valuesEqual(left_val, right_val)) {
@@ -1746,6 +1746,10 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
 fn executeMultiTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !QueryResult {
     const select_all = cmd.columns.items.len == 1 and cmd.columns.items[0] == .star;
 
+    // Phase 3: Get MVCC context for snapshot isolation
+    const snapshot = db.getCurrentSnapshot();
+    const clog = db.getClog();
+
     // Start with base table and build intermediate result
     var current_intermediate = IntermediateResult.init(db.allocator);
     errdefer current_intermediate.deinit();
@@ -1756,11 +1760,11 @@ fn executeMultiTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) 
     }
 
     // Get all rows from base table and add to intermediate
-    const base_row_ids = try base_table.getAllRows(db.allocator, null, null);
+    const base_row_ids = try base_table.getAllRows(db.allocator, snapshot, clog);
     defer db.allocator.free(base_row_ids);
 
     for (base_row_ids) |row_id| {
-        const base_row = base_table.get(row_id, null, null) orelse continue;
+        const base_row = base_table.get(row_id, snapshot, clog) orelse continue;
         var row_values = ArrayList(ColumnValue).init(db.allocator);
 
         for (base_table.columns.items) |col| {
@@ -1781,6 +1785,8 @@ fn executeMultiTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) 
             &current_intermediate,
             join_table,
             join_clause,
+            snapshot,
+            clog,
         );
 
         // Clean up previous intermediate and use the new one
@@ -1806,6 +1812,8 @@ fn executeJoinStage(
     left_intermediate: *IntermediateResult,
     right_table: *Table,
     join_clause: sql.JoinClause,
+    snapshot: ?*const Snapshot,
+    clog: ?*CommitLog,
 ) !IntermediateResult {
     var result = IntermediateResult.init(allocator);
     errdefer result.deinit();
@@ -1821,8 +1829,8 @@ fn executeJoinStage(
     // Parse right join column name (remove table prefix if present)
     const right_parts = splitQualifiedColumn(join_clause.right_column);
 
-    // Get all rows from right table
-    const right_row_ids = try right_table.getAllRows(allocator, null, null);
+    // Get all rows from right table (Phase 3: Use MVCC snapshot)
+    const right_row_ids = try right_table.getAllRows(allocator, snapshot, clog);
     defer allocator.free(right_row_ids);
 
     // Execute join based on type
@@ -1839,7 +1847,7 @@ fn executeJoinStage(
 
                 // Find matching right rows
                 for (right_row_ids) |right_id| {
-                    const right_row = right_table.get(right_id, null, null) orelse continue;
+                    const right_row = right_table.get(right_id, snapshot, clog) orelse continue;
                     const right_val = right_row.get(right_parts.column) orelse continue;
 
                     if (valuesEqual(left_val, right_val)) {
@@ -1875,7 +1883,7 @@ fn executeJoinStage(
                         if (left_val != .null_value) {
                             // Try to find matches
                             for (right_row_ids) |right_id| {
-                                const right_row = right_table.get(right_id, null, null) orelse continue;
+                                const right_row = right_table.get(right_id, snapshot, clog) orelse continue;
                                 const right_val = right_row.get(right_parts.column) orelse continue;
 
                                 if (valuesEqual(left_val, right_val)) {
@@ -1917,7 +1925,7 @@ fn executeJoinStage(
 
             // First pass: emit all matches
             for (right_row_ids) |right_id| {
-                const right_row = right_table.get(right_id, null, null) orelse continue;
+                const right_row = right_table.get(right_id, snapshot, clog) orelse continue;
                 const right_val = right_row.get(right_parts.column);
                 var this_right_matched = false;
 
@@ -1954,7 +1962,7 @@ fn executeJoinStage(
             for (right_row_ids) |right_id| {
                 if (matched_right.contains(right_id)) continue;
 
-                const right_row = right_table.get(right_id, null, null) orelse continue;
+                const right_row = right_table.get(right_id, snapshot, clog) orelse continue;
                 var combined = ArrayList(ColumnValue).init(allocator);
 
                 // NULLs for all left columns
@@ -2949,19 +2957,29 @@ fn executeRollback(db: *Database) !QueryResult {
 }
 
 /// Undo a single operation (helper for rollback)
+///
+/// NOTE: This function uses null,null for table.get() to see the latest uncommitted version.
+/// This is intentional during rollback - we need to undo the transaction's own changes.
+///
+/// TODO Phase 4: Replace physical undo with MVCC-native rollback:
+/// - Mark transaction as ABORTED in CLOG
+/// - Versions created by aborted tx become invisible automatically
+/// - No need to physically undo operations
 fn undoOperation(db: *Database, op: Operation) !void {
     switch (op) {
         .insert => |ins| {
             // Undo INSERT: delete the inserted row
             const table = db.tables.get(ins.table_name) orelse return error.TableNotFound;
-            // TODO Phase 3: Pass actual transaction ID
-            _ = table.delete(ins.row_id, 0) catch {};
 
-            // Update indexes
+            // Phase 3: Get row BEFORE deletion for index cleanup
+            // Using null,null to see uncommitted version from this transaction
             const row = table.get(ins.row_id, null, null);
             if (row) |r| {
                 try db.index_manager.onDelete(ins.table_name, ins.row_id, r);
             }
+
+            // TODO Phase 4: Use transaction ID to mark version as aborted
+            _ = table.delete(ins.row_id, 0) catch {};
         },
         .delete => |del| {
             // Undo DELETE: restore the deleted row
@@ -2977,10 +2995,10 @@ fn undoOperation(db: *Database, op: Operation) !void {
             }
 
             // Insert the row back with its original ID
-            // TODO Phase 3: Pass actual transaction ID
+            // TODO Phase 4: Use transaction ID to mark version as restored
             try table.insertWithId(del.row_id, values_map, 0);
 
-            // Update indexes
+            // Update indexes - using null,null to see just-restored version
             const row = table.get(del.row_id, null, null);
             if (row) |r| {
                 try db.index_manager.onInsert(del.table_name, del.row_id, r);
@@ -2989,6 +3007,8 @@ fn undoOperation(db: *Database, op: Operation) !void {
         .update => |upd| {
             // Undo UPDATE: restore the old values
             const table = db.tables.get(upd.table_name) orelse return error.TableNotFound;
+
+            // Using null,null to see uncommitted version from this transaction
             const row = table.get(upd.row_id, null, null) orelse return error.RowNotFound;
 
             // Save current row state for index update
