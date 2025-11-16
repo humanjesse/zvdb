@@ -13,6 +13,8 @@ const ColumnType = @import("../table.zig").ColumnType;
 const Row = @import("../table.zig").Row;
 const sql = @import("../sql.zig");
 const AggregateFunc = sql.AggregateFunc;
+const OrderByClause = sql.OrderByClause;
+const OrderDirection = sql.OrderDirection;
 const StringHashMap = std.StringHashMap;
 const ArrayList = std.array_list.Managed;
 const WalRecordType = @import("../wal.zig").WalRecordType;
@@ -489,6 +491,135 @@ fn compareForMinMax(a: ColumnValue, b: ColumnValue) std.math.Order {
         },
         else => return .eq,
     }
+}
+
+// ============================================================================
+// ORDER BY Support
+// ============================================================================
+
+/// Compare two ColumnValues for sorting
+fn compareColumnValues(a: ColumnValue, b: ColumnValue) std.math.Order {
+    // NULL handling: NULL < any value
+    if (a == .null_value and b == .null_value) return .eq;
+    if (a == .null_value) return .lt;
+    if (b == .null_value) return .gt;
+
+    // Type-based comparison
+    switch (a) {
+        .int => |a_int| {
+            if (b != .int) return .eq; // Type mismatch
+            const b_int = b.int;
+            if (a_int < b_int) return .lt;
+            if (a_int > b_int) return .gt;
+            return .eq;
+        },
+        .float => |a_float| {
+            if (b != .float) return .eq; // Type mismatch
+            const b_float = b.float;
+            if (a_float < b_float) return .lt;
+            if (a_float > b_float) return .gt;
+            return .eq;
+        },
+        .text => |a_text| {
+            if (b != .text) return .eq; // Type mismatch
+            const cmp = std.mem.order(u8, a_text, b.text);
+            return cmp;
+        },
+        .bool => |a_bool| {
+            if (b != .bool) return .eq; // Type mismatch
+            const b_bool = b.bool;
+            if (a_bool == b_bool) return .eq;
+            // false < true
+            if (!a_bool and b_bool) return .lt;
+            return .gt;
+        },
+        .null_value => return .eq, // Already handled above
+        .embedding => return .eq, // Embeddings not comparable
+    }
+}
+
+/// Apply ORDER BY clause to sort query results
+fn applyOrderBy(result: *QueryResult, order_by: OrderByClause) !void {
+    if (order_by.items.items.len == 0) return;
+
+    // Create a context for sorting that includes both result and order_by
+    const SortContext = struct {
+        result: *QueryResult,
+        order_by: OrderByClause,
+
+        fn lessThan(ctx: @This(), a_idx: usize, b_idx: usize) bool {
+            const a_row = ctx.result.rows.items[a_idx];
+            const b_row = ctx.result.rows.items[b_idx];
+
+            // Compare each ORDER BY column in sequence
+            for (ctx.order_by.items.items) |order_item| {
+                // Find column index
+                var col_idx: ?usize = null;
+                for (ctx.result.columns.items, 0..) |col_name, idx| {
+                    if (std.mem.eql(u8, col_name, order_item.column)) {
+                        col_idx = idx;
+                        break;
+                    }
+                }
+
+                if (col_idx == null) continue; // Column not found, skip
+
+                const a_val = a_row.items[col_idx.?];
+                const b_val = b_row.items[col_idx.?];
+
+                // Compare values
+                const cmp = compareColumnValues(a_val, b_val);
+
+                if (cmp == .eq) {
+                    // Values equal, continue to next ORDER BY column
+                    continue;
+                }
+
+                // Apply direction
+                if (order_item.direction == .asc) {
+                    return cmp == .lt;
+                } else { // desc
+                    return cmp == .gt;
+                }
+            }
+
+            // All ORDER BY columns are equal
+            return false;
+        }
+    };
+
+    // Sort using indices
+    var indices = try result.allocator.alloc(usize, result.rows.items.len);
+    defer result.allocator.free(indices);
+
+    for (indices, 0..) |*idx, i| {
+        idx.* = i;
+    }
+
+    const context = SortContext{
+        .result = result,
+        .order_by = order_by,
+    };
+
+    std.sort.pdq(usize, indices, context, SortContext.lessThan);
+
+    // Rearrange rows based on sorted indices
+    var sorted_rows = ArrayList(ArrayList(ColumnValue)).init(result.allocator);
+    errdefer {
+        for (sorted_rows.items) |*row| {
+            row.deinit();
+        }
+        sorted_rows.deinit();
+    }
+
+    for (indices) |idx| {
+        try sorted_rows.append(result.rows.items[idx]);
+    }
+
+    // Replace original rows with sorted rows
+    // Don't deinit the row data since we moved it to sorted_rows
+    result.rows.deinit();
+    result.rows = sorted_rows;
 }
 
 // ============================================================================
@@ -1196,12 +1327,34 @@ fn executeJoinSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
     if (cmd.joins.items.len == 0) return error.NoJoins;
 
     // For single join, use the optimized 2-table path
-    if (cmd.joins.items.len == 1) {
-        return executeTwoTableJoin(db, cmd, base_table);
+    var result = if (cmd.joins.items.len == 1)
+        try executeTwoTableJoin(db, cmd, base_table)
+    else
+        // For multiple joins (3+ tables), use the pipeline approach
+        try executeMultiTableJoin(db, cmd, base_table);
+
+    // Apply ORDER BY if present
+    if (cmd.order_by) |order_by| {
+        try applyOrderBy(&result, order_by);
     }
 
-    // For multiple joins (3+ tables), use the pipeline approach
-    return executeMultiTableJoin(db, cmd, base_table);
+    // Apply LIMIT if present
+    if (cmd.limit) |limit| {
+        if (result.rows.items.len > limit) {
+            // Free excess rows
+            for (result.rows.items[limit..]) |*row| {
+                for (row.items) |*val| {
+                    var v = val.*;
+                    v.deinit(result.allocator);
+                }
+                row.deinit();
+            }
+            // Truncate
+            result.rows.items.len = limit;
+        }
+    }
+
+    return result;
 }
 
 /// Optimized path for 2-table joins (base table + 1 join)
@@ -1890,8 +2043,13 @@ fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
 
     defer if (should_free_ids) db.allocator.free(row_ids);
 
-    // Apply LIMIT
-    const max_rows = if (cmd.limit) |lim| @min(lim, row_ids.len) else row_ids.len;
+    // Determine if we need to process all rows (for ORDER BY) or can apply LIMIT early
+    // Don't apply LIMIT early if we have ORDER BY (unless it's similarity/vibes which already sorted)
+    const has_generic_order_by = cmd.order_by != null and cmd.order_by_similarity == null and !cmd.order_by_vibes;
+    const max_rows = if (!has_generic_order_by and cmd.limit != null)
+        @min(cmd.limit.?, row_ids.len)
+    else
+        row_ids.len;
 
     // Process each row
     var count: usize = 0;
@@ -1964,6 +2122,30 @@ fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
 
         try result.addRow(result_row);
         count += 1;
+    }
+
+    // Apply ORDER BY if present (and not already sorted by similarity/vibes)
+    if (cmd.order_by) |order_by| {
+        if (cmd.order_by_similarity == null and !cmd.order_by_vibes) {
+            try applyOrderBy(&result, order_by);
+        }
+    }
+
+    // Apply LIMIT after ORDER BY (if we didn't apply it earlier)
+    if (has_generic_order_by and cmd.limit != null) {
+        const limit = cmd.limit.?;
+        if (result.rows.items.len > limit) {
+            // Free excess rows
+            for (result.rows.items[limit..]) |*row| {
+                for (row.items) |*val| {
+                    var v = val.*;
+                    v.deinit(result.allocator);
+                }
+                row.deinit();
+            }
+            // Truncate
+            result.rows.items.len = limit;
+        }
     }
 
     return result;
@@ -2189,6 +2371,27 @@ fn executeGroupBySelect(db: *Database, table: *Table, cmd: sql.SelectCmd) !Query
         }
 
         try result.addRow(result_row);
+    }
+
+    // Apply ORDER BY if present
+    if (cmd.order_by) |order_by| {
+        try applyOrderBy(&result, order_by);
+    }
+
+    // Apply LIMIT if present
+    if (cmd.limit) |limit| {
+        if (result.rows.items.len > limit) {
+            // Free excess rows
+            for (result.rows.items[limit..]) |*row| {
+                for (row.items) |*val| {
+                    var v = val.*;
+                    v.deinit(result.allocator);
+                }
+                row.deinit();
+            }
+            // Truncate
+            result.rows.items.len = limit;
+        }
     }
 
     return result;

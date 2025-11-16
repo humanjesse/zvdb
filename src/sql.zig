@@ -24,6 +24,34 @@ pub const SqlError = error{
     Overflow,
 };
 
+/// ORDER BY direction
+pub const OrderDirection = enum {
+    asc,
+    desc,
+};
+
+/// Single ORDER BY clause item
+pub const OrderByItem = struct {
+    column: []const u8, // Column name or aggregate function name
+    direction: OrderDirection,
+
+    pub fn deinit(self: *OrderByItem, allocator: Allocator) void {
+        allocator.free(self.column);
+    }
+};
+
+/// Full ORDER BY clause
+pub const OrderByClause = struct {
+    items: ArrayList(OrderByItem),
+
+    pub fn deinit(self: *OrderByClause, allocator: Allocator) void {
+        for (self.items.items) |*item| {
+            item.deinit(allocator);
+        }
+        self.items.deinit();
+    }
+};
+
 /// SQL command types
 pub const SqlCommand = union(enum) {
     create_table: CreateTableCmd,
@@ -126,6 +154,7 @@ pub const SelectCmd = struct {
     similar_to_text: ?[]const u8,
     order_by_similarity: ?[]const u8, // ORDER BY SIMILARITY TO "text"
     order_by_vibes: bool, // Fun parody feature!
+    order_by: ?OrderByClause, // Generic ORDER BY clause
     group_by: ArrayList([]const u8), // GROUP BY columns
     limit: ?usize,
 
@@ -154,6 +183,11 @@ pub const SelectCmd = struct {
         if (self.similar_to_column) |col| allocator.free(col);
         if (self.similar_to_text) |text| allocator.free(text);
         if (self.order_by_similarity) |text| allocator.free(text);
+
+        // Free generic ORDER BY clause
+        if (self.order_by) |*ob| {
+            ob.deinit(allocator);
+        }
 
         // Free GROUP BY columns
         for (self.group_by.items) |col| {
@@ -701,6 +735,7 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
     var similar_to_text: ?[]const u8 = null;
     var order_by_similarity: ?[]const u8 = null;
     var order_by_vibes = false;
+    var order_by: ?OrderByClause = null;
     var group_by = ArrayList([]const u8).init(allocator);
     var limit: ?usize = null;
 
@@ -836,6 +871,7 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
                 i += 1;
             }
         } else if (eqlIgnoreCase(tokens[i].text, "ORDER")) {
+            const order_start = i; // Save starting position
             i += 1;
             if (i >= tokens.len or !eqlIgnoreCase(tokens[i].text, "BY")) return SqlError.InvalidSyntax;
             i += 1;
@@ -856,7 +892,10 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
                 order_by_similarity = try allocator.dupe(u8, text);
                 i += 1;
             } else {
-                i += 1;
+                // Generic ORDER BY (column name with optional ASC/DESC)
+                const result = try parseOrderBy(allocator, tokens, order_start);
+                order_by = result.clause;
+                i = result.next_idx;
             }
         } else if (eqlIgnoreCase(tokens[i].text, "LIMIT")) {
             i += 1;
@@ -879,6 +918,7 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
         .similar_to_text = similar_to_text,
         .order_by_similarity = order_by_similarity,
         .order_by_vibes = order_by_vibes,
+        .order_by = order_by,
         .group_by = group_by,
         .limit = limit,
     };
@@ -1493,5 +1533,71 @@ fn parseUpdate(allocator: Allocator, tokens: []const Token) !UpdateCmd {
         .table_name = table_name,
         .assignments = assignments,
         .where_expr = where_expr,
+    };
+}
+
+/// Parse ORDER BY clause
+fn parseOrderBy(allocator: Allocator, tokens: []const Token, start_idx: usize) !struct { clause: OrderByClause, next_idx: usize } {
+    var idx = start_idx;
+
+    // Expect "ORDER"
+    if (idx >= tokens.len or !eqlIgnoreCase(tokens[idx].text, "ORDER")) {
+        return error.InvalidSyntax;
+    }
+    idx += 1;
+
+    // Expect "BY"
+    if (idx >= tokens.len or !eqlIgnoreCase(tokens[idx].text, "BY")) {
+        return error.InvalidSyntax;
+    }
+    idx += 1;
+
+    var items = ArrayList(OrderByItem).init(allocator);
+    errdefer {
+        for (items.items) |*item| {
+            item.deinit(allocator);
+        }
+        items.deinit();
+    }
+
+    while (idx < tokens.len) {
+        // Parse column name (could be aggregate like "COUNT(*)")
+        if (idx >= tokens.len) break;
+
+        const col_name = tokens[idx].text;
+        idx += 1;
+
+        // Check for direction (ASC/DESC)
+        var direction = OrderDirection.asc; // Default to ASC
+        if (idx < tokens.len) {
+            if (eqlIgnoreCase(tokens[idx].text, "ASC")) {
+                direction = .asc;
+                idx += 1;
+            } else if (eqlIgnoreCase(tokens[idx].text, "DESC")) {
+                direction = .desc;
+                idx += 1;
+            }
+        }
+
+        // Create OrderByItem
+        const owned_col = try allocator.dupe(u8, col_name);
+        try items.append(OrderByItem{
+            .column = owned_col,
+            .direction = direction,
+        });
+
+        // Check for comma (multiple ORDER BY columns)
+        if (idx < tokens.len and std.mem.eql(u8, tokens[idx].text, ",")) {
+            idx += 1;
+            continue;
+        } else {
+            // No comma, done with ORDER BY
+            break;
+        }
+    }
+
+    return .{
+        .clause = OrderByClause{ .items = items },
+        .next_idx = idx,
     };
 }
