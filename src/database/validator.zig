@@ -375,7 +375,7 @@ pub fn validateExpression(
             try validateColumnReference(ctx, col);
         },
 
-        .aggregate => {
+        .aggregate => |agg| {
             // Check if aggregates are allowed in this scope
             switch (ctx.scope) {
                 .where, .group_by => {
@@ -384,6 +384,10 @@ pub fn validateExpression(
                 },
                 .select, .having, .order_by => {
                     // Aggregates are valid in these scopes
+                    // Validate the column reference if not COUNT(*)
+                    if (agg.column) |col| {
+                        try validateColumnReference(ctx, col);
+                    }
                     return;
                 },
             }
@@ -391,12 +395,14 @@ pub fn validateExpression(
 
         .binary => |bin| {
             // Recursively validate both sides
+            // bin is a pointer to BinaryExpr, which contains Expr values (not pointers)
             try validateExpression(ctx, bin.left);
             try validateExpression(ctx, bin.right);
         },
 
         .unary => |un| {
             // Recursively validate the operand
+            // un is a pointer to UnaryExpr, which contains an Expr value (not pointer)
             try validateExpression(ctx, un.expr);
         },
 
@@ -407,6 +413,28 @@ pub fn validateExpression(
             return;
         },
     }
+}
+
+/// Validate an expression and collect errors into a ValidationResult
+/// This is a helper that converts ValidationError into ValidationResult
+pub fn validateExpressionWithResult(
+    ctx: *const ValidationContext,
+    expr: sql.Expr,
+    result: *ValidationResult,
+) !void {
+    validateExpression(ctx, expr) catch |err| {
+        const msg = try formatErrorMessage(result.allocator, err, null);
+        defer result.allocator.free(msg);
+
+        const hint = switch (err) {
+            ValidationError.AggregateInWhere => "Use HAVING clause instead of WHERE for aggregate filtering",
+            ValidationError.ColumnNotFound => "Check column name spelling and table schema",
+            ValidationError.AmbiguousColumn => "Use qualified column names (table.column)",
+            else => null,
+        };
+
+        try result.addError(err, null, msg, hint);
+    };
 }
 
 // ============================================================================
@@ -490,6 +518,250 @@ pub fn validateSelectColumns(
             }
         }
     }
+}
+
+// ============================================================================
+// INSERT Command Validation
+// ============================================================================
+
+/// Validate an INSERT command's columns and values
+pub fn validateInsert(
+    allocator: Allocator,
+    cmd: *const sql.InsertCmd,
+    table: *Table,
+) !ValidationResult {
+    var result = ValidationResult.init(allocator);
+    errdefer result.deinit();
+
+    // Check for empty column list
+    if (cmd.columns.items.len == 0) {
+        try result.addError(
+            ValidationError.InvalidExpression,
+            null,
+            "INSERT command must specify at least one column",
+            "Try: INSERT INTO table_name (col1, col2) VALUES (val1, val2)",
+        );
+        return result;
+    }
+
+    // Check that value count matches column count
+    if (cmd.columns.items.len != cmd.values.items.len) {
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "INSERT column count ({d}) does not match value count ({d})",
+            .{ cmd.columns.items.len, cmd.values.items.len },
+        );
+        defer allocator.free(msg);
+
+        try result.addError(
+            ValidationError.InvalidExpression,
+            null,
+            msg,
+            "Ensure the number of columns matches the number of values",
+        );
+        return result;
+    }
+
+    // Track seen columns to detect duplicates
+    var seen_columns = StringHashMap(void).init(allocator);
+    defer seen_columns.deinit();
+
+    // Validate each column exists in the table
+    for (cmd.columns.items) |col_name| {
+        // Check for duplicate columns in INSERT
+        if (seen_columns.contains(col_name)) {
+            const msg = try std.fmt.allocPrint(
+                allocator,
+                "column \"{s}\" specified more than once",
+                .{col_name},
+            );
+            defer allocator.free(msg);
+
+            try result.addError(
+                ValidationError.InvalidExpression,
+                col_name,
+                msg,
+                "Remove duplicate column references",
+            );
+            continue;
+        }
+        try seen_columns.put(col_name, {});
+
+        // Check if column exists in table schema
+        var column_exists = false;
+        for (table.schema.columns.items) |schema_col| {
+            if (std.mem.eql(u8, col_name, schema_col.name)) {
+                column_exists = true;
+                break;
+            }
+        }
+
+        if (!column_exists) {
+            const msg = try std.fmt.allocPrint(
+                allocator,
+                "column \"{s}\" does not exist in table \"{s}\"",
+                .{ col_name, table.name },
+            );
+            defer allocator.free(msg);
+
+            try result.addError(
+                ValidationError.ColumnNotFound,
+                col_name,
+                msg,
+                null, // TODO: Add fuzzy matching suggestion in Phase 3
+            );
+        }
+    }
+
+    return result;
+}
+
+// ============================================================================
+// UPDATE Command Validation
+// ============================================================================
+
+/// Validate an UPDATE command's assignments and WHERE clause
+pub fn validateUpdate(
+    allocator: Allocator,
+    cmd: *const sql.UpdateCmd,
+    table: *Table,
+) !ValidationResult {
+    var result = ValidationResult.init(allocator);
+    errdefer result.deinit();
+
+    // Check for empty assignments
+    if (cmd.assignments.items.len == 0) {
+        try result.addError(
+            ValidationError.InvalidExpression,
+            null,
+            "UPDATE command must specify at least one column assignment",
+            "Try: UPDATE table_name SET col1 = value1 WHERE condition",
+        );
+        return result;
+    }
+
+    // Track seen columns to detect duplicate assignments
+    var seen_columns = StringHashMap(void).init(allocator);
+    defer seen_columns.deinit();
+
+    // Validate each assignment column exists
+    for (cmd.assignments.items) |assignment| {
+        const col_name = assignment.column;
+
+        // Check for duplicate assignments
+        if (seen_columns.contains(col_name)) {
+            const msg = try std.fmt.allocPrint(
+                allocator,
+                "column \"{s}\" assigned more than once",
+                .{col_name},
+            );
+            defer allocator.free(msg);
+
+            try result.addError(
+                ValidationError.InvalidExpression,
+                col_name,
+                msg,
+                "Remove duplicate assignments",
+            );
+            continue;
+        }
+        try seen_columns.put(col_name, {});
+
+        // Check if column exists in table schema
+        var column_exists = false;
+        for (table.schema.columns.items) |schema_col| {
+            if (std.mem.eql(u8, col_name, schema_col.name)) {
+                column_exists = true;
+                break;
+            }
+        }
+
+        if (!column_exists) {
+            const msg = try std.fmt.allocPrint(
+                allocator,
+                "column \"{s}\" does not exist in table \"{s}\"",
+                .{ col_name, table.name },
+            );
+            defer allocator.free(msg);
+
+            try result.addError(
+                ValidationError.ColumnNotFound,
+                col_name,
+                msg,
+                null, // TODO: Add fuzzy matching suggestion in Phase 3
+            );
+        }
+    }
+
+    // Validate WHERE clause if present
+    if (cmd.where_expr) |expr| {
+        // Build column resolver for WHERE validation
+        var resolver = try ColumnResolver.init(allocator, table);
+        defer resolver.deinit();
+
+        var where_ctx = ValidationContext.init(allocator, .where);
+        defer where_ctx.deinit();
+        where_ctx.resolver = &resolver;
+
+        // Validate WHERE expression
+        validateExpression(&where_ctx, expr) catch |err| {
+            const msg = try formatErrorMessage(allocator, err, null);
+            defer allocator.free(msg);
+
+            try result.addError(
+                err,
+                null,
+                msg,
+                "Check that all columns in WHERE clause exist in the table",
+            );
+        };
+    }
+
+    return result;
+}
+
+// ============================================================================
+// DELETE Command Validation
+// ============================================================================
+
+/// Validate a DELETE command's WHERE clause
+pub fn validateDelete(
+    allocator: Allocator,
+    cmd: *const sql.DeleteCmd,
+    table: *Table,
+) !ValidationResult {
+    var result = ValidationResult.init(allocator);
+    errdefer result.deinit();
+
+    // Validate WHERE column if present (simple WHERE clause)
+    if (cmd.where_column) |col_name| {
+        // Check if column exists in table schema
+        var column_exists = false;
+        for (table.schema.columns.items) |schema_col| {
+            if (std.mem.eql(u8, col_name, schema_col.name)) {
+                column_exists = true;
+                break;
+            }
+        }
+
+        if (!column_exists) {
+            const msg = try std.fmt.allocPrint(
+                allocator,
+                "column \"{s}\" does not exist in table \"{s}\"",
+                .{ col_name, table.name },
+            );
+            defer allocator.free(msg);
+
+            try result.addError(
+                ValidationError.ColumnNotFound,
+                col_name,
+                msg,
+                null, // TODO: Add fuzzy matching suggestion in Phase 3
+            );
+        }
+    }
+
+    return result;
 }
 
 // ============================================================================
@@ -599,4 +871,380 @@ test "formatErrorMessage: ambiguous column" {
 
     try testing.expect(std.mem.indexOf(u8, msg, "id") != null);
     try testing.expect(std.mem.indexOf(u8, msg, "ambiguous") != null);
+}
+
+// ============================================================================
+// INSERT Validation Tests
+// ============================================================================
+
+test "validateInsert: valid insert" {
+    const ColumnDef = @import("../table.zig").ColumnDef;
+    const ColumnType = @import("../table.zig").ColumnType;
+    const TableSchema = @import("../table.zig").TableSchema;
+    const ColumnValue = @import("../table.zig").ColumnValue;
+
+    var schema = TableSchema.init(testing.allocator);
+    defer schema.deinit();
+    try schema.addColumn("id", ColumnType.int);
+    try schema.addColumn("name", ColumnType.text);
+
+    var table = Table{
+        .name = "users",
+        .schema = schema,
+        .rows = std.ArrayList(std.ArrayList(ColumnValue)).init(testing.allocator),
+        .allocator = testing.allocator,
+    };
+    defer table.rows.deinit();
+
+    // Create a valid INSERT command
+    var columns = std.ArrayList([]const u8).init(testing.allocator);
+    defer columns.deinit();
+    try columns.append("id");
+    try columns.append("name");
+
+    var values = std.ArrayList(ColumnValue).init(testing.allocator);
+    defer values.deinit();
+    try values.append(ColumnValue{ .int = 1 });
+    try values.append(ColumnValue{ .text = "Alice" });
+
+    const insert_cmd = sql.InsertCmd{
+        .table_name = "users",
+        .columns = columns,
+        .values = values,
+    };
+
+    var result = try validateInsert(testing.allocator, &insert_cmd, &table);
+    defer result.deinit();
+
+    try testing.expect(result.valid);
+    try testing.expectEqual(@as(usize, 0), result.errors.items.len);
+}
+
+test "validateInsert: column not found" {
+    const ColumnDef = @import("../table.zig").ColumnDef;
+    const ColumnType = @import("../table.zig").ColumnType;
+    const TableSchema = @import("../table.zig").TableSchema;
+    const ColumnValue = @import("../table.zig").ColumnValue;
+
+    var schema = TableSchema.init(testing.allocator);
+    defer schema.deinit();
+    try schema.addColumn("id", ColumnType.int);
+    try schema.addColumn("name", ColumnType.text);
+
+    var table = Table{
+        .name = "users",
+        .schema = schema,
+        .rows = std.ArrayList(std.ArrayList(ColumnValue)).init(testing.allocator),
+        .allocator = testing.allocator,
+    };
+    defer table.rows.deinit();
+
+    // Create INSERT with invalid column
+    var columns = std.ArrayList([]const u8).init(testing.allocator);
+    defer columns.deinit();
+    try columns.append("id");
+    try columns.append("invalid_col");
+
+    var values = std.ArrayList(ColumnValue).init(testing.allocator);
+    defer values.deinit();
+    try values.append(ColumnValue{ .int = 1 });
+    try values.append(ColumnValue{ .text = "Alice" });
+
+    const insert_cmd = sql.InsertCmd{
+        .table_name = "users",
+        .columns = columns,
+        .values = values,
+    };
+
+    var result = try validateInsert(testing.allocator, &insert_cmd, &table);
+    defer result.deinit();
+
+    try testing.expect(!result.valid);
+    try testing.expect(result.errors.items.len > 0);
+    try testing.expectEqual(ValidationError.ColumnNotFound, result.errors.items[0].error_type);
+}
+
+test "validateInsert: duplicate columns" {
+    const ColumnDef = @import("../table.zig").ColumnDef;
+    const ColumnType = @import("../table.zig").ColumnType;
+    const TableSchema = @import("../table.zig").TableSchema;
+    const ColumnValue = @import("../table.zig").ColumnValue;
+
+    var schema = TableSchema.init(testing.allocator);
+    defer schema.deinit();
+    try schema.addColumn("id", ColumnType.int);
+    try schema.addColumn("name", ColumnType.text);
+
+    var table = Table{
+        .name = "users",
+        .schema = schema,
+        .rows = std.ArrayList(std.ArrayList(ColumnValue)).init(testing.allocator),
+        .allocator = testing.allocator,
+    };
+    defer table.rows.deinit();
+
+    // Create INSERT with duplicate column
+    var columns = std.ArrayList([]const u8).init(testing.allocator);
+    defer columns.deinit();
+    try columns.append("id");
+    try columns.append("id"); // Duplicate!
+
+    var values = std.ArrayList(ColumnValue).init(testing.allocator);
+    defer values.deinit();
+    try values.append(ColumnValue{ .int = 1 });
+    try values.append(ColumnValue{ .int = 2 });
+
+    const insert_cmd = sql.InsertCmd{
+        .table_name = "users",
+        .columns = columns,
+        .values = values,
+    };
+
+    var result = try validateInsert(testing.allocator, &insert_cmd, &table);
+    defer result.deinit();
+
+    try testing.expect(!result.valid);
+    try testing.expect(result.errors.items.len > 0);
+}
+
+test "validateInsert: column count mismatch" {
+    const ColumnDef = @import("../table.zig").ColumnDef;
+    const ColumnType = @import("../table.zig").ColumnType;
+    const TableSchema = @import("../table.zig").TableSchema;
+    const ColumnValue = @import("../table.zig").ColumnValue;
+
+    var schema = TableSchema.init(testing.allocator);
+    defer schema.deinit();
+    try schema.addColumn("id", ColumnType.int);
+    try schema.addColumn("name", ColumnType.text);
+
+    var table = Table{
+        .name = "users",
+        .schema = schema,
+        .rows = std.ArrayList(std.ArrayList(ColumnValue)).init(testing.allocator),
+        .allocator = testing.allocator,
+    };
+    defer table.rows.deinit();
+
+    // Create INSERT with mismatched counts
+    var columns = std.ArrayList([]const u8).init(testing.allocator);
+    defer columns.deinit();
+    try columns.append("id");
+    try columns.append("name");
+
+    var values = std.ArrayList(ColumnValue).init(testing.allocator);
+    defer values.deinit();
+    try values.append(ColumnValue{ .int = 1 }); // Only one value!
+
+    const insert_cmd = sql.InsertCmd{
+        .table_name = "users",
+        .columns = columns,
+        .values = values,
+    };
+
+    var result = try validateInsert(testing.allocator, &insert_cmd, &table);
+    defer result.deinit();
+
+    try testing.expect(!result.valid);
+    try testing.expect(result.errors.items.len > 0);
+}
+
+// ============================================================================
+// UPDATE Validation Tests
+// ============================================================================
+
+test "validateUpdate: valid update" {
+    const ColumnDef = @import("../table.zig").ColumnDef;
+    const ColumnType = @import("../table.zig").ColumnType;
+    const TableSchema = @import("../table.zig").TableSchema;
+    const ColumnValue = @import("../table.zig").ColumnValue;
+
+    var schema = TableSchema.init(testing.allocator);
+    defer schema.deinit();
+    try schema.addColumn("id", ColumnType.int);
+    try schema.addColumn("name", ColumnType.text);
+
+    var table = Table{
+        .name = "users",
+        .schema = schema,
+        .rows = std.ArrayList(std.ArrayList(ColumnValue)).init(testing.allocator),
+        .allocator = testing.allocator,
+    };
+    defer table.rows.deinit();
+
+    // Create a valid UPDATE command
+    var assignments = std.ArrayList(sql.Assignment).init(testing.allocator);
+    defer assignments.deinit();
+    try assignments.append(sql.Assignment{
+        .column = "name",
+        .value = ColumnValue{ .text = "Bob" },
+    });
+
+    const update_cmd = sql.UpdateCmd{
+        .table_name = "users",
+        .assignments = assignments,
+        .where_expr = null,
+    };
+
+    var result = try validateUpdate(testing.allocator, &update_cmd, &table);
+    defer result.deinit();
+
+    try testing.expect(result.valid);
+    try testing.expectEqual(@as(usize, 0), result.errors.items.len);
+}
+
+test "validateUpdate: column not found" {
+    const ColumnDef = @import("../table.zig").ColumnDef;
+    const ColumnType = @import("../table.zig").ColumnType;
+    const TableSchema = @import("../table.zig").TableSchema;
+    const ColumnValue = @import("../table.zig").ColumnValue;
+
+    var schema = TableSchema.init(testing.allocator);
+    defer schema.deinit();
+    try schema.addColumn("id", ColumnType.int);
+    try schema.addColumn("name", ColumnType.text);
+
+    var table = Table{
+        .name = "users",
+        .schema = schema,
+        .rows = std.ArrayList(std.ArrayList(ColumnValue)).init(testing.allocator),
+        .allocator = testing.allocator,
+    };
+    defer table.rows.deinit();
+
+    // Create UPDATE with invalid column
+    var assignments = std.ArrayList(sql.Assignment).init(testing.allocator);
+    defer assignments.deinit();
+    try assignments.append(sql.Assignment{
+        .column = "invalid_col",
+        .value = ColumnValue{ .text = "Bob" },
+    });
+
+    const update_cmd = sql.UpdateCmd{
+        .table_name = "users",
+        .assignments = assignments,
+        .where_expr = null,
+    };
+
+    var result = try validateUpdate(testing.allocator, &update_cmd, &table);
+    defer result.deinit();
+
+    try testing.expect(!result.valid);
+    try testing.expect(result.errors.items.len > 0);
+    try testing.expectEqual(ValidationError.ColumnNotFound, result.errors.items[0].error_type);
+}
+
+test "validateUpdate: duplicate assignments" {
+    const ColumnDef = @import("../table.zig").ColumnDef;
+    const ColumnType = @import("../table.zig").ColumnType;
+    const TableSchema = @import("../table.zig").TableSchema;
+    const ColumnValue = @import("../table.zig").ColumnValue;
+
+    var schema = TableSchema.init(testing.allocator);
+    defer schema.deinit();
+    try schema.addColumn("id", ColumnType.int);
+    try schema.addColumn("name", ColumnType.text);
+
+    var table = Table{
+        .name = "users",
+        .schema = schema,
+        .rows = std.ArrayList(std.ArrayList(ColumnValue)).init(testing.allocator),
+        .allocator = testing.allocator,
+    };
+    defer table.rows.deinit();
+
+    // Create UPDATE with duplicate assignments
+    var assignments = std.ArrayList(sql.Assignment).init(testing.allocator);
+    defer assignments.deinit();
+    try assignments.append(sql.Assignment{
+        .column = "name",
+        .value = ColumnValue{ .text = "Bob" },
+    });
+    try assignments.append(sql.Assignment{
+        .column = "name", // Duplicate!
+        .value = ColumnValue{ .text = "Charlie" },
+    });
+
+    const update_cmd = sql.UpdateCmd{
+        .table_name = "users",
+        .assignments = assignments,
+        .where_expr = null,
+    };
+
+    var result = try validateUpdate(testing.allocator, &update_cmd, &table);
+    defer result.deinit();
+
+    try testing.expect(!result.valid);
+    try testing.expect(result.errors.items.len > 0);
+}
+
+// ============================================================================
+// DELETE Validation Tests
+// ============================================================================
+
+test "validateDelete: valid delete" {
+    const ColumnDef = @import("../table.zig").ColumnDef;
+    const ColumnType = @import("../table.zig").ColumnType;
+    const TableSchema = @import("../table.zig").TableSchema;
+    const ColumnValue = @import("../table.zig").ColumnValue;
+
+    var schema = TableSchema.init(testing.allocator);
+    defer schema.deinit();
+    try schema.addColumn("id", ColumnType.int);
+    try schema.addColumn("name", ColumnType.text);
+
+    var table = Table{
+        .name = "users",
+        .schema = schema,
+        .rows = std.ArrayList(std.ArrayList(ColumnValue)).init(testing.allocator),
+        .allocator = testing.allocator,
+    };
+    defer table.rows.deinit();
+
+    // Create a valid DELETE command
+    const delete_cmd = sql.DeleteCmd{
+        .table_name = "users",
+        .where_column = "id",
+        .where_value = ColumnValue{ .int = 1 },
+    };
+
+    var result = try validateDelete(testing.allocator, &delete_cmd, &table);
+    defer result.deinit();
+
+    try testing.expect(result.valid);
+    try testing.expectEqual(@as(usize, 0), result.errors.items.len);
+}
+
+test "validateDelete: column not found" {
+    const ColumnDef = @import("../table.zig").ColumnDef;
+    const ColumnType = @import("../table.zig").ColumnType;
+    const TableSchema = @import("../table.zig").TableSchema;
+    const ColumnValue = @import("../table.zig").ColumnValue;
+
+    var schema = TableSchema.init(testing.allocator);
+    defer schema.deinit();
+    try schema.addColumn("id", ColumnType.int);
+    try schema.addColumn("name", ColumnType.text);
+
+    var table = Table{
+        .name = "users",
+        .schema = schema,
+        .rows = std.ArrayList(std.ArrayList(ColumnValue)).init(testing.allocator),
+        .allocator = testing.allocator,
+    };
+    defer table.rows.deinit();
+
+    // Create DELETE with invalid column
+    const delete_cmd = sql.DeleteCmd{
+        .table_name = "users",
+        .where_column = "invalid_col",
+        .where_value = ColumnValue{ .int = 1 },
+    };
+
+    var result = try validateDelete(testing.allocator, &delete_cmd, &table);
+    defer result.deinit();
+
+    try testing.expect(!result.valid);
+    try testing.expect(result.errors.items.len > 0);
+    try testing.expectEqual(ValidationError.ColumnNotFound, result.errors.items[0].error_type);
 }
