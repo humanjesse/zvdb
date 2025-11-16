@@ -485,6 +485,27 @@ fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
     return true;
 }
 
+/// Check if a token is a SELECT clause keyword
+/// Used to detect table aliases (non-keywords after table names)
+fn isSelectKeyword(token: []const u8) bool {
+    return eqlIgnoreCase(token, "JOIN") or
+        eqlIgnoreCase(token, "INNER") or
+        eqlIgnoreCase(token, "LEFT") or
+        eqlIgnoreCase(token, "RIGHT") or
+        eqlIgnoreCase(token, "OUTER") or
+        eqlIgnoreCase(token, "FULL") or
+        eqlIgnoreCase(token, "CROSS") or
+        eqlIgnoreCase(token, "ON") or
+        eqlIgnoreCase(token, "WHERE") or
+        eqlIgnoreCase(token, "GROUP") or
+        eqlIgnoreCase(token, "HAVING") or
+        eqlIgnoreCase(token, "ORDER") or
+        eqlIgnoreCase(token, "LIMIT") or
+        eqlIgnoreCase(token, "SIMILAR") or
+        eqlIgnoreCase(token, "AND") or
+        eqlIgnoreCase(token, "OR");
+}
+
 /// Parse a SQL command
 pub fn parse(allocator: Allocator, sql: []const u8) !SqlCommand {
     var tokens = try tokenize(allocator, sql);
@@ -747,6 +768,12 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
     errdefer allocator.free(table_name);
     i += 1;
 
+    // Skip table alias if present (e.g., "FROM users u" - skip the "u")
+    // An alias is any token that's not a SQL keyword
+    if (i < tokens.len and !isSelectKeyword(tokens[i].text)) {
+        i += 1; // Skip alias
+    }
+
     var joins = ArrayList(JoinClause).init(allocator);
     errdefer {
         for (joins.items) |*join| {
@@ -823,6 +850,11 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
         if (i >= tokens.len) return SqlError.InvalidSyntax;
         const join_table = try allocator.dupe(u8, tokens[i].text);
         i += 1;
+
+        // Skip table alias if present (e.g., "JOIN orders o" - skip the "o")
+        if (i < tokens.len and !eqlIgnoreCase(tokens[i].text, "ON")) {
+            i += 1; // Skip alias
+        }
 
         if (i >= tokens.len or !eqlIgnoreCase(tokens[i].text, "ON")) {
             allocator.free(join_table);
@@ -969,7 +1001,13 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
     }
 
     // Build the SelectCmd
-    var cmd = SelectCmd{
+    // Validate HAVING only used with GROUP BY (before creating cmd)
+    if (having_expr != null and group_by.items.len == 0) {
+        // Return error and let errdefers handle cleanup
+        return error.HavingWithoutGroupBy;
+    }
+
+    const cmd = SelectCmd{
         .table_name = table_name,
         .columns = columns,
         .joins = joins,
@@ -985,13 +1023,6 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
         .having_expr = having_expr,
         .limit = limit,
     };
-
-    // Validate HAVING only used with GROUP BY
-    if (cmd.having_expr != null and cmd.group_by.items.len == 0) {
-        // Clean up before returning error
-        cmd.deinit(allocator);
-        return error.HavingWithoutGroupBy;
-    }
 
     return cmd;
 }
