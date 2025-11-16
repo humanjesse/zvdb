@@ -318,13 +318,7 @@ pub fn executeDelete(db: *Database, cmd: sql.DeleteCmd) !QueryResult {
         // Apply WHERE filter using expression evaluator (like UPDATE)
         var should_delete = true;
         if (cmd.where_expr) |expr| {
-            const matches = try expr_evaluator.evaluateExprWithSubqueries(
-                db,
-                expr,
-                row.values,
-                executeSelect,
-            );
-            should_delete = matches;
+            should_delete = try evaluateExprWithSubqueries(db, expr, row.values);
         }
 
         if (should_delete) {

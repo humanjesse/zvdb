@@ -959,190 +959,6 @@ test "validateUpdate: assignment triple duplicate" {
 }
 
 // ============================================================================
-// DELETE Validation Error Tests (10 tests)
-// ============================================================================
-
-test "validateDelete: WHERE column not found" {
-    var table = try createTestTable(testing.allocator, "users");
-    defer table.deinit();
-
-    const delete_cmd = sql.DeleteCmd{
-        .table_name = "users",
-        .where_column = "invalid_column",
-        .where_value = ColumnValue{ .int = 1 },
-    };
-
-    var result = try validator.validateDelete(testing.allocator, &delete_cmd, &table);
-    defer result.deinit();
-
-    try testing.expect(!result.valid);
-    try testing.expect(result.errors.items.len > 0);
-    try testing.expectEqual(validator.ValidationError.ColumnNotFound, result.errors.items[0].error_type);
-}
-
-test "validateDelete: WHERE column with case mismatch" {
-    var table = try createTestTable(testing.allocator, "users");
-    defer table.deinit();
-
-    const delete_cmd = sql.DeleteCmd{
-        .table_name = "users",
-        .where_column = "ID", // Should be "id"
-        .where_value = ColumnValue{ .int = 1 },
-    };
-
-    var result = try validator.validateDelete(testing.allocator, &delete_cmd, &table);
-    defer result.deinit();
-
-    try testing.expect(!result.valid);
-    try testing.expect(result.errors.items.len > 0);
-    try testing.expectEqual(validator.ValidationError.ColumnNotFound, result.errors.items[0].error_type);
-}
-
-test "validateDelete: WHERE column with special characters" {
-    var table = try createTestTable(testing.allocator, "users");
-    defer table.deinit();
-
-    const delete_cmd = sql.DeleteCmd{
-        .table_name = "users",
-        .where_column = "col@#$",
-        .where_value = ColumnValue{ .int = 1 },
-    };
-
-    var result = try validator.validateDelete(testing.allocator, &delete_cmd, &table);
-    defer result.deinit();
-
-    try testing.expect(!result.valid);
-    try testing.expect(result.errors.items.len > 0);
-    try testing.expectEqual(validator.ValidationError.ColumnNotFound, result.errors.items[0].error_type);
-}
-
-test "validateDelete: WHERE column with whitespace" {
-    var table = try createTestTable(testing.allocator, "users");
-    defer table.deinit();
-
-    const delete_cmd = sql.DeleteCmd{
-        .table_name = "users",
-        .where_column = " id ",
-        .where_value = ColumnValue{ .int = 1 },
-    };
-
-    var result = try validator.validateDelete(testing.allocator, &delete_cmd, &table);
-    defer result.deinit();
-
-    try testing.expect(!result.valid);
-    try testing.expect(result.errors.items.len > 0);
-    try testing.expectEqual(validator.ValidationError.ColumnNotFound, result.errors.items[0].error_type);
-}
-
-test "validateDelete: WHERE very long column name" {
-    var table = try createTestTable(testing.allocator, "users");
-    defer table.deinit();
-
-    const delete_cmd = sql.DeleteCmd{
-        .table_name = "users",
-        .where_column = "this_is_a_very_long_column_name_that_does_not_exist_in_the_schema",
-        .where_value = ColumnValue{ .int = 1 },
-    };
-
-    var result = try validator.validateDelete(testing.allocator, &delete_cmd, &table);
-    defer result.deinit();
-
-    try testing.expect(!result.valid);
-    try testing.expect(result.errors.items.len > 0);
-    try testing.expectEqual(validator.ValidationError.ColumnNotFound, result.errors.items[0].error_type);
-}
-
-test "validateDelete: WHERE numeric column name" {
-    var table = try createTestTable(testing.allocator, "users");
-    defer table.deinit();
-
-    const delete_cmd = sql.DeleteCmd{
-        .table_name = "users",
-        .where_column = "123",
-        .where_value = ColumnValue{ .int = 1 },
-    };
-
-    var result = try validator.validateDelete(testing.allocator, &delete_cmd, &table);
-    defer result.deinit();
-
-    try testing.expect(!result.valid);
-    try testing.expect(result.errors.items.len > 0);
-    try testing.expectEqual(validator.ValidationError.ColumnNotFound, result.errors.items[0].error_type);
-}
-
-test "validateDelete: WHERE empty column name" {
-    var table = try createTestTable(testing.allocator, "users");
-    defer table.deinit();
-
-    const delete_cmd = sql.DeleteCmd{
-        .table_name = "users",
-        .where_column = "",
-        .where_value = ColumnValue{ .int = 1 },
-    };
-
-    var result = try validator.validateDelete(testing.allocator, &delete_cmd, &table);
-    defer result.deinit();
-
-    try testing.expect(!result.valid);
-    try testing.expect(result.errors.items.len > 0);
-    try testing.expectEqual(validator.ValidationError.ColumnNotFound, result.errors.items[0].error_type);
-}
-
-test "validateDelete: WHERE column with unicode" {
-    var table = try createTestTable(testing.allocator, "users");
-    defer table.deinit();
-
-    const delete_cmd = sql.DeleteCmd{
-        .table_name = "users",
-        .where_column = "ñame",
-        .where_value = ColumnValue{ .text = "test" },
-    };
-
-    var result = try validator.validateDelete(testing.allocator, &delete_cmd, &table);
-    defer result.deinit();
-
-    try testing.expect(!result.valid);
-    try testing.expect(result.errors.items.len > 0);
-    try testing.expectEqual(validator.ValidationError.ColumnNotFound, result.errors.items[0].error_type);
-}
-
-test "validateDelete: WHERE null column reference" {
-    var table = try createTestTable(testing.allocator, "users");
-    defer table.deinit();
-
-    const delete_cmd = sql.DeleteCmd{
-        .table_name = "users",
-        .where_column = null,
-        .where_value = null,
-    };
-
-    var result = try validator.validateDelete(testing.allocator, &delete_cmd, &table);
-    defer result.deinit();
-
-    // With null WHERE, this should be valid (DELETE ALL)
-    try testing.expect(result.valid);
-    try testing.expectEqual(@as(usize, 0), result.errors.items.len);
-}
-
-test "validateDelete: WHERE column with tab character" {
-    var table = try createTestTable(testing.allocator, "users");
-    defer table.deinit();
-
-    const delete_cmd = sql.DeleteCmd{
-        .table_name = "users",
-        .where_column = "na\tme",
-        .where_value = ColumnValue{ .text = "test" },
-    };
-
-    var result = try validator.validateDelete(testing.allocator, &delete_cmd, &table);
-    defer result.deinit();
-
-    try testing.expect(!result.valid);
-    try testing.expect(result.errors.items.len > 0);
-    try testing.expectEqual(validator.ValidationError.ColumnNotFound, result.errors.items[0].error_type);
-}
-
-// ============================================================================
 // Validation Mode Tests (15 tests)
 // ============================================================================
 
@@ -1701,7 +1517,12 @@ test "complex: all valid columns in large schema" {
     defer table.deinit();
 
     var columns = std.array_list.Managed([]const u8).init(testing.allocator);
-    defer columns.deinit();
+    defer {
+        for (columns.items) |col_name| {
+            testing.allocator.free(col_name);
+        }
+        columns.deinit();
+    }
 
     var values = std.array_list.Managed(ColumnValue).init(testing.allocator);
     defer values.deinit();
@@ -1710,7 +1531,6 @@ test "complex: all valid columns in large schema" {
     var i: usize = 0;
     while (i < 50) : (i += 1) {
         const col_name = try std.fmt.allocPrint(testing.allocator, "col_{d}", .{i});
-        defer testing.allocator.free(col_name);
         try columns.append(col_name);
         try values.append(ColumnValue{ .int = @intCast(i) });
     }

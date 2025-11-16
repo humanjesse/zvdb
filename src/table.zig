@@ -812,6 +812,7 @@ pub const Table = struct {
             try table.columns.append(Column{
                 .name = col_name,
                 .col_type = col_type,
+                .embedding_dim = if (col_type == .embedding) 768 else null,
             });
         }
 
