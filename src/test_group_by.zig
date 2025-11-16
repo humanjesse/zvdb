@@ -10,39 +10,60 @@ const Database = @import("database/core.zig").Database;
 
 /// Setup employees table with department grouping
 fn setupEmployeesTable(db: *Database) !void {
-    _ = try db.execute("CREATE TABLE employees (id int, name text, department text)");
-    _ = try db.execute("INSERT INTO employees VALUES (1, 'Alice', 'Engineering')");
-    _ = try db.execute("INSERT INTO employees VALUES (2, 'Bob', 'Sales')");
-    _ = try db.execute("INSERT INTO employees VALUES (3, 'Charlie', 'Engineering')");
-    _ = try db.execute("INSERT INTO employees VALUES (4, 'David', 'Sales')");
+    var result = try db.execute("CREATE TABLE employees (id int, name text, department text)");
+    result.deinit();
+    result = try db.execute("INSERT INTO employees VALUES (1, 'Alice', 'Engineering')");
+    result.deinit();
+    result = try db.execute("INSERT INTO employees VALUES (2, 'Bob', 'Sales')");
+    result.deinit();
+    result = try db.execute("INSERT INTO employees VALUES (3, 'Charlie', 'Engineering')");
+    result.deinit();
+    result = try db.execute("INSERT INTO employees VALUES (4, 'David', 'Sales')");
+    result.deinit();
 }
 
 /// Setup sales table with product grouping
 fn setupSalesTable(db: *Database) !void {
-    _ = try db.execute("CREATE TABLE sales (id int, product text, amount float)");
-    _ = try db.execute("INSERT INTO sales VALUES (1, 'Widget', 100.0)");
-    _ = try db.execute("INSERT INTO sales VALUES (2, 'Gadget', 200.0)");
-    _ = try db.execute("INSERT INTO sales VALUES (3, 'Widget', 150.0)");
-    _ = try db.execute("INSERT INTO sales VALUES (4, 'Gadget', 250.0)");
+    var result = try db.execute("CREATE TABLE sales (id int, product text, amount float)");
+    result.deinit();
+    result = try db.execute("INSERT INTO sales VALUES (1, 'Widget', 100.0)");
+    result.deinit();
+    result = try db.execute("INSERT INTO sales VALUES (2, 'Gadget', 200.0)");
+    result.deinit();
+    result = try db.execute("INSERT INTO sales VALUES (3, 'Widget', 150.0)");
+    result.deinit();
+    result = try db.execute("INSERT INTO sales VALUES (4, 'Gadget', 250.0)");
+    result.deinit();
 }
 
 /// Setup scores table with player grouping
 fn setupScoresTable(db: *Database) !void {
-    _ = try db.execute("CREATE TABLE scores (id int, player text, score int)");
-    _ = try db.execute("INSERT INTO scores VALUES (1, 'Alice', 85)");
-    _ = try db.execute("INSERT INTO scores VALUES (2, 'Bob', 92)");
-    _ = try db.execute("INSERT INTO scores VALUES (3, 'Alice', 78)");
-    _ = try db.execute("INSERT INTO scores VALUES (4, 'Bob', 88)");
-    _ = try db.execute("INSERT INTO scores VALUES (5, 'Alice', 95)");
+    var result = try db.execute("CREATE TABLE scores (id int, player text, score int)");
+    result.deinit();
+    result = try db.execute("INSERT INTO scores VALUES (1, 'Alice', 85)");
+    result.deinit();
+    result = try db.execute("INSERT INTO scores VALUES (2, 'Bob', 92)");
+    result.deinit();
+    result = try db.execute("INSERT INTO scores VALUES (3, 'Alice', 78)");
+    result.deinit();
+    result = try db.execute("INSERT INTO scores VALUES (4, 'Bob', 88)");
+    result.deinit();
+    result = try db.execute("INSERT INTO scores VALUES (5, 'Alice', 95)");
+    result.deinit();
 }
 
 /// Setup orders table with customer grouping and status filtering
 fn setupOrdersTable(db: *Database) !void {
-    _ = try db.execute("CREATE TABLE orders (id int, customer text, amount float, status text)");
-    _ = try db.execute("INSERT INTO orders VALUES (1, 'Alice', 100.0, 'completed')");
-    _ = try db.execute("INSERT INTO orders VALUES (2, 'Bob', 200.0, 'completed')");
-    _ = try db.execute("INSERT INTO orders VALUES (3, 'Alice', 150.0, 'completed')");
-    _ = try db.execute("INSERT INTO orders VALUES (4, 'Bob', 175.0, 'pending')");
+    var result = try db.execute("CREATE TABLE orders (id int, customer text, amount float, status text)");
+    result.deinit();
+    result = try db.execute("INSERT INTO orders VALUES (1, 'Alice', 100.0, 'completed')");
+    result.deinit();
+    result = try db.execute("INSERT INTO orders VALUES (2, 'Bob', 200.0, 'completed')");
+    result.deinit();
+    result = try db.execute("INSERT INTO orders VALUES (3, 'Alice', 150.0, 'completed')");
+    result.deinit();
+    result = try db.execute("INSERT INTO orders VALUES (4, 'Bob', 175.0, 'pending')");
+    result.deinit();
 }
 
 // ============================================================================
@@ -293,13 +314,18 @@ test "GROUP BY: all aggregates together" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE metrics (id int, team text, value float)");
-    _ = try db.execute("INSERT INTO metrics VALUES (1, 'Alpha', 10.0)");
-    _ = try db.execute("INSERT INTO metrics VALUES (2, 'Alpha', 20.0)");
-    _ = try db.execute("INSERT INTO metrics VALUES (3, 'Beta', 15.0)");
-    _ = try db.execute("INSERT INTO metrics VALUES (4, 'Alpha', 30.0)");
+    var result = try db.execute("CREATE TABLE metrics (id int, team text, value float)");
+    result.deinit();
+    result = try db.execute("INSERT INTO metrics VALUES (1, 'Alpha', 10.0)");
+    result.deinit();
+    result = try db.execute("INSERT INTO metrics VALUES (2, 'Alpha', 20.0)");
+    result.deinit();
+    result = try db.execute("INSERT INTO metrics VALUES (3, 'Beta', 15.0)");
+    result.deinit();
+    result = try db.execute("INSERT INTO metrics VALUES (4, 'Alpha', 30.0)");
+    result.deinit();
 
-    var result = try db.execute("SELECT team, COUNT(*), SUM(value), AVG(value), MIN(value), MAX(value) FROM metrics GROUP BY team");
+    result = try db.execute("SELECT team, COUNT(*), SUM(value), AVG(value), MIN(value), MAX(value) FROM metrics GROUP BY team");
     defer result.deinit();
 
     try expect(result.rows.items.len == 2);
@@ -335,12 +361,16 @@ test "GROUP BY: single group with multiple rows" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE items (id int, type text, quantity int)");
-    _ = try db.execute("INSERT INTO items VALUES (1, 'fruit', 5)");
-    _ = try db.execute("INSERT INTO items VALUES (2, 'fruit', 10)");
-    _ = try db.execute("INSERT INTO items VALUES (3, 'fruit', 7)");
+    var result = try db.execute("CREATE TABLE items (id int, type text, quantity int)");
+    result.deinit();
+    result = try db.execute("INSERT INTO items VALUES (1, 'fruit', 5)");
+    result.deinit();
+    result = try db.execute("INSERT INTO items VALUES (2, 'fruit', 10)");
+    result.deinit();
+    result = try db.execute("INSERT INTO items VALUES (3, 'fruit', 7)");
+    result.deinit();
 
-    var result = try db.execute("SELECT type, SUM(quantity) FROM items GROUP BY type");
+    result = try db.execute("SELECT type, SUM(quantity) FROM items GROUP BY type");
     defer result.deinit();
 
     try expect(result.rows.items.len == 1);
@@ -359,14 +389,20 @@ test "GROUP BY: NULL values in GROUP BY column" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE employees (id int, name text, department text)");
-    _ = try db.execute("INSERT INTO employees VALUES (1, 'Alice', 'Engineering')");
-    _ = try db.execute("INSERT INTO employees VALUES (2, 'Bob', NULL)");
-    _ = try db.execute("INSERT INTO employees VALUES (3, 'Charlie', 'Sales')");
-    _ = try db.execute("INSERT INTO employees VALUES (4, 'David', NULL)");
-    _ = try db.execute("INSERT INTO employees VALUES (5, 'Eve', 'Engineering')");
+    var result = try db.execute("CREATE TABLE employees (id int, name text, department text)");
+    result.deinit();
+    result = try db.execute("INSERT INTO employees VALUES (1, 'Alice', 'Engineering')");
+    result.deinit();
+    result = try db.execute("INSERT INTO employees VALUES (2, 'Bob', NULL)");
+    result.deinit();
+    result = try db.execute("INSERT INTO employees VALUES (3, 'Charlie', 'Sales')");
+    result.deinit();
+    result = try db.execute("INSERT INTO employees VALUES (4, 'David', NULL)");
+    result.deinit();
+    result = try db.execute("INSERT INTO employees VALUES (5, 'Eve', 'Engineering')");
+    result.deinit();
 
-    var result = try db.execute("SELECT department, COUNT(*) FROM employees GROUP BY department");
+    result = try db.execute("SELECT department, COUNT(*) FROM employees GROUP BY department");
     defer result.deinit();
 
     // Should have 3 groups: Engineering, Sales, and NULL
@@ -398,13 +434,18 @@ test "GROUP BY: multiple NULLs group together" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE sales (id int, region text, amount float)");
-    _ = try db.execute("INSERT INTO sales VALUES (1, NULL, 100.0)");
-    _ = try db.execute("INSERT INTO sales VALUES (2, NULL, 200.0)");
-    _ = try db.execute("INSERT INTO sales VALUES (3, NULL, 150.0)");
-    _ = try db.execute("INSERT INTO sales VALUES (4, 'West', 300.0)");
+    var result = try db.execute("CREATE TABLE sales (id int, region text, amount float)");
+    result.deinit();
+    result = try db.execute("INSERT INTO sales VALUES (1, NULL, 100.0)");
+    result.deinit();
+    result = try db.execute("INSERT INTO sales VALUES (2, NULL, 200.0)");
+    result.deinit();
+    result = try db.execute("INSERT INTO sales VALUES (3, NULL, 150.0)");
+    result.deinit();
+    result = try db.execute("INSERT INTO sales VALUES (4, 'West', 300.0)");
+    result.deinit();
 
-    var result = try db.execute("SELECT region, SUM(amount), COUNT(*) FROM sales GROUP BY region");
+    result = try db.execute("SELECT region, SUM(amount), COUNT(*) FROM sales GROUP BY region");
     defer result.deinit();
 
     try expect(result.rows.items.len == 2);
@@ -432,12 +473,16 @@ test "GROUP BY: NULL vs empty string distinction" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 
-    _ = try db.execute("CREATE TABLE data (id int, category text, value int)");
-    _ = try db.execute("INSERT INTO data VALUES (1, NULL, 10)");
-    _ = try db.execute("INSERT INTO data VALUES (2, '', 20)");
-    _ = try db.execute("INSERT INTO data VALUES (3, 'A', 30)");
+    var result = try db.execute("CREATE TABLE data (id int, category text, value int)");
+    result.deinit();
+    result = try db.execute("INSERT INTO data VALUES (1, NULL, 10)");
+    result.deinit();
+    result = try db.execute("INSERT INTO data VALUES (2, '', 20)");
+    result.deinit();
+    result = try db.execute("INSERT INTO data VALUES (3, 'A', 30)");
+    result.deinit();
 
-    var result = try db.execute("SELECT category, SUM(value) FROM data GROUP BY category");
+    result = try db.execute("SELECT category, SUM(value) FROM data GROUP BY category");
     defer result.deinit();
 
     // NULL, empty string, and 'A' should be three distinct groups
@@ -526,10 +571,12 @@ test "GROUP BY: with ORDER BY aggregate DESC" {
     try setupEmployeesTable(&db);
 
     // Order by COUNT(*) descending - both departments have 2 employees, but let's add more data
-    _ = try db.execute("INSERT INTO employees VALUES (5, 'Eve', 'Engineering')");
-    _ = try db.execute("INSERT INTO employees VALUES (6, 'Frank', 'HR')");
+    var result = try db.execute("INSERT INTO employees VALUES (5, 'Eve', 'Engineering')");
+    result.deinit();
+    result = try db.execute("INSERT INTO employees VALUES (6, 'Frank', 'HR')");
+    result.deinit();
 
-    var result = try db.execute("SELECT department, COUNT(*) FROM employees GROUP BY department ORDER BY COUNT(*) DESC");
+    result = try db.execute("SELECT department, COUNT(*) FROM employees GROUP BY department ORDER BY COUNT(*) DESC");
     defer result.deinit();
 
     try expect(result.rows.items.len == 3);
@@ -604,11 +651,13 @@ test "GROUP BY: with HAVING COUNT filter" {
     defer db.deinit();
 
     try setupEmployeesTable(&db);
-    _ = try db.execute("INSERT INTO employees VALUES (5, 'Eve', 'Engineering')");
-    _ = try db.execute("INSERT INTO employees VALUES (6, 'Frank', 'HR')");
+    var result = try db.execute("INSERT INTO employees VALUES (5, 'Eve', 'Engineering')");
+    result.deinit();
+    result = try db.execute("INSERT INTO employees VALUES (6, 'Frank', 'HR')");
+    result.deinit();
 
     // Only departments with more than 1 employee
-    var result = try db.execute("SELECT department, COUNT(*) FROM employees GROUP BY department HAVING COUNT(*) > 1");
+    result = try db.execute("SELECT department, COUNT(*) FROM employees GROUP BY department HAVING COUNT(*) > 1");
     defer result.deinit();
 
     // Should have 2 departments: Engineering (3) and Sales (2), but not HR (1)
@@ -683,11 +732,13 @@ test "GROUP BY: with HAVING, ORDER BY, and LIMIT" {
     defer db.deinit();
 
     try setupSalesTable(&db);
-    _ = try db.execute("INSERT INTO sales VALUES (5, 'Doohickey', 50.0)");
-    _ = try db.execute("INSERT INTO sales VALUES (6, 'Doohickey', 75.0)");
+    var result = try db.execute("INSERT INTO sales VALUES (5, 'Doohickey', 50.0)");
+    result.deinit();
+    result = try db.execute("INSERT INTO sales VALUES (6, 'Doohickey', 75.0)");
+    result.deinit();
 
     // HAVING filters, then ORDER BY sorts, then LIMIT restricts
-    var result = try db.execute("SELECT product, SUM(amount) FROM sales GROUP BY product HAVING SUM(amount) > 100.0 ORDER BY SUM(amount) DESC LIMIT 2");
+    result = try db.execute("SELECT product, SUM(amount) FROM sales GROUP BY product HAVING SUM(amount) > 100.0 ORDER BY SUM(amount) DESC LIMIT 2");
     defer result.deinit();
 
     // Three products pass HAVING: Gadget (450), Widget (250), Doohickey (125)

@@ -316,6 +316,7 @@ pub const Expr = union(enum) {
     binary: *BinaryExpr,
     unary: *UnaryExpr,
     subquery: *SelectCmd, // Nested SELECT statement for subqueries
+    aggregate: AggregateExpr, // Aggregate function for HAVING clauses
 
     pub fn deinit(self: *Expr, allocator: Allocator) void {
         switch (self.*) {
@@ -335,6 +336,10 @@ pub const Expr = union(enum) {
             .subquery => |sq| {
                 sq.deinit(allocator);
                 allocator.destroy(sq);
+            },
+            .aggregate => |*agg| {
+                var a = agg.*;
+                a.deinit(allocator);
             },
         }
     }
@@ -1298,6 +1303,39 @@ fn parsePrimaryExpr(allocator: Allocator, tokens: []const Token, idx: *usize) (A
         return Expr{ .literal = value };
     }
 
+    // Check for aggregate function (COUNT, SUM, AVG, MIN, MAX)
+    if (AggregateFunc.fromString(token_text)) |func| {
+        idx.* += 1;
+
+        // Expect opening parenthesis
+        if (idx.* >= tokens.len or !std.mem.eql(u8, tokens[idx.*].text, "(")) {
+            return SqlError.InvalidSyntax;
+        }
+        idx.* += 1;
+
+        var agg_column: ?[]const u8 = null;
+        if (idx.* < tokens.len and !std.mem.eql(u8, tokens[idx.*].text, "*") and !std.mem.eql(u8, tokens[idx.*].text, ")")) {
+            // Named column: COUNT(age), SUM(amount)
+            agg_column = try allocator.dupe(u8, tokens[idx.*].text);
+            idx.* += 1;
+        } else if (idx.* < tokens.len and std.mem.eql(u8, tokens[idx.*].text, "*")) {
+            // COUNT(*) - no column
+            idx.* += 1;
+        }
+
+        // Expect closing parenthesis
+        if (idx.* >= tokens.len or !std.mem.eql(u8, tokens[idx.*].text, ")")) {
+            if (agg_column) |col| allocator.free(col);
+            return SqlError.InvalidSyntax;
+        }
+        idx.* += 1;
+
+        return Expr{ .aggregate = .{
+            .func = func,
+            .column = agg_column,
+        } };
+    }
+
     // Otherwise, it's a column reference
     const col_name = try allocator.dupe(u8, token_text);
     idx.* += 1;
@@ -1335,6 +1373,18 @@ pub fn evaluateExpr(expr: Expr, row_values: anytype, db: ?*anyopaque) bool {
                 }
             }
             return false; // Column not found
+        },
+        .aggregate => {
+            // Get the aggregate value and check if it's truthy
+            const val = getExprValue(expr, row_values, db);
+            return switch (val) {
+                .null_value => false,
+                .bool => |b| b,
+                .int => |i| i != 0,
+                .float => |f| f != 0.0,
+                .text => |t| t.len > 0,
+                .embedding => true,
+            };
         },
         .binary => |bin| {
             return evaluateBinaryExpr(bin.*, row_values, db);
@@ -1396,6 +1446,42 @@ fn getExprValue(expr: Expr, row_values: anytype, db: ?*anyopaque) ColumnValue {
             var it = row_values.iterator();
             while (it.next()) |entry| {
                 if (std.mem.eql(u8, entry.key_ptr.*, col)) {
+                    return entry.value_ptr.*;
+                }
+            }
+            return ColumnValue.null_value;
+        },
+        .aggregate => |agg| {
+            // Build the aggregate column name to match what's stored in grouped results
+            // We need a temporary allocator for this string - use a stack buffer
+            var buf: [256]u8 = undefined;
+            const col_name = switch (agg.func) {
+                .count => if (agg.column) |col|
+                    std.fmt.bufPrint(&buf, "COUNT({s})", .{col}) catch "COUNT(*)"
+                else
+                    "COUNT(*)",
+                .sum => if (agg.column) |col|
+                    std.fmt.bufPrint(&buf, "SUM({s})", .{col}) catch ""
+                else
+                    "",
+                .avg => if (agg.column) |col|
+                    std.fmt.bufPrint(&buf, "AVG({s})", .{col}) catch ""
+                else
+                    "",
+                .min => if (agg.column) |col|
+                    std.fmt.bufPrint(&buf, "MIN({s})", .{col}) catch ""
+                else
+                    "",
+                .max => if (agg.column) |col|
+                    std.fmt.bufPrint(&buf, "MAX({s})", .{col}) catch ""
+                else
+                    "",
+            };
+
+            // Look up the aggregate column in row_values
+            var it = row_values.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, col_name)) {
                     return entry.value_ptr.*;
                 }
             }
@@ -1589,8 +1675,51 @@ fn parseOrderBy(allocator: Allocator, tokens: []const Token, start_idx: usize) !
         // Parse column name (could be aggregate like "COUNT(*)")
         if (idx >= tokens.len) break;
 
-        const col_name = tokens[idx].text;
-        idx += 1;
+        var col_name: []const u8 = undefined;
+        var needs_free = false;
+
+        // Check if this is an aggregate function
+        if (AggregateFunc.fromString(tokens[idx].text)) |func| {
+            // Parse aggregate function: COUNT(*), SUM(column), etc.
+            idx += 1;
+
+            if (idx >= tokens.len or !std.mem.eql(u8, tokens[idx].text, "(")) {
+                return SqlError.InvalidSyntax;
+            }
+            idx += 1;
+
+            var agg_column: ?[]const u8 = null;
+            if (idx < tokens.len and !std.mem.eql(u8, tokens[idx].text, "*") and !std.mem.eql(u8, tokens[idx].text, ")")) {
+                // Named column: COUNT(age), SUM(amount)
+                agg_column = tokens[idx].text;
+                idx += 1;
+            } else if (idx < tokens.len and std.mem.eql(u8, tokens[idx].text, "*")) {
+                // COUNT(*) - no column
+                idx += 1;
+            }
+
+            if (idx >= tokens.len or !std.mem.eql(u8, tokens[idx].text, ")")) {
+                return SqlError.InvalidSyntax;
+            }
+            idx += 1;
+
+            // Build the aggregate column name to match what's in the result
+            col_name = switch (func) {
+                .count => if (agg_column) |col|
+                    try std.fmt.allocPrint(allocator, "COUNT({s})", .{col})
+                else
+                    try allocator.dupe(u8, "COUNT(*)"),
+                .sum => try std.fmt.allocPrint(allocator, "SUM({s})", .{agg_column.?}),
+                .avg => try std.fmt.allocPrint(allocator, "AVG({s})", .{agg_column.?}),
+                .min => try std.fmt.allocPrint(allocator, "MIN({s})", .{agg_column.?}),
+                .max => try std.fmt.allocPrint(allocator, "MAX({s})", .{agg_column.?}),
+            };
+            needs_free = true;
+        } else {
+            // Regular column name
+            col_name = tokens[idx].text;
+            idx += 1;
+        }
 
         // Check for direction (ASC/DESC)
         var direction = OrderDirection.asc; // Default to ASC
@@ -1605,7 +1734,7 @@ fn parseOrderBy(allocator: Allocator, tokens: []const Token, start_idx: usize) !
         }
 
         // Create OrderByItem
-        const owned_col = try allocator.dupe(u8, col_name);
+        const owned_col = if (needs_free) col_name else try allocator.dupe(u8, col_name);
         try items.append(OrderByItem{
             .column = owned_col,
             .direction = direction,

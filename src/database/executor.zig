@@ -252,6 +252,41 @@ fn getExprValueFromExpr(
             }
             return ColumnValue.null_value;
         },
+        .aggregate => |agg| {
+            // Build the aggregate column name to match what's stored in grouped results
+            var buf: [256]u8 = undefined;
+            const col_name = switch (agg.func) {
+                .count => if (agg.column) |col|
+                    std.fmt.bufPrint(&buf, "COUNT({s})", .{col}) catch "COUNT(*)"
+                else
+                    "COUNT(*)",
+                .sum => if (agg.column) |col|
+                    std.fmt.bufPrint(&buf, "SUM({s})", .{col}) catch ""
+                else
+                    "",
+                .avg => if (agg.column) |col|
+                    std.fmt.bufPrint(&buf, "AVG({s})", .{col}) catch ""
+                else
+                    "",
+                .min => if (agg.column) |col|
+                    std.fmt.bufPrint(&buf, "MIN({s})", .{col}) catch ""
+                else
+                    "",
+                .max => if (agg.column) |col|
+                    std.fmt.bufPrint(&buf, "MAX({s})", .{col}) catch ""
+                else
+                    "",
+            };
+
+            // Look up the aggregate column in row_values
+            var it = row_values.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, col_name)) {
+                    return entry.value_ptr.*;
+                }
+            }
+            return ColumnValue.null_value;
+        },
         .subquery => |sq| {
             // Evaluate as scalar subquery
             return evaluateScalarSubquery(db, sq, db.allocator);
@@ -589,7 +624,7 @@ fn applyOrderBy(result: *QueryResult, order_by: OrderByClause) !void {
     };
 
     // Sort using indices
-    var indices = try result.allocator.alloc(usize, result.rows.items.len);
+    const indices = try result.allocator.alloc(usize, result.rows.items.len);
     defer result.allocator.free(indices);
 
     for (indices, 0..) |*idx, i| {
@@ -2288,6 +2323,7 @@ fn executeAggregateSelect(db: *Database, table: *Table, cmd: sql.SelectCmd) !Que
 
 fn executeGroupBySelect(db: *Database, table: *Table, cmd: sql.SelectCmd) !QueryResult {
     var result = QueryResult.init(db.allocator);
+    errdefer result.deinit();
 
     // Group data structure: group_key -> (group_values, aggregate_states)
     const GroupData = struct {
