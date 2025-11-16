@@ -299,7 +299,8 @@ pub const IndexManager = struct {
         max_value: ColumnValue,
     ) ![]u64 {
         const info = self.indexes.get(index_name) orelse return error.IndexNotFound;
-        return try info.btree.findRange(min_value, max_value);
+        // Default to inclusive range [min_value, max_value]
+        return try info.btree.findRange(min_value, max_value, true, true);
     }
 
     /// Get total number of indexes

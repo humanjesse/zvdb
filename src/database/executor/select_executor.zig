@@ -13,6 +13,7 @@ const join_executor = @import("join_executor.zig");
 const aggregate_executor = @import("aggregate_executor.zig");
 const sort_executor = @import("sort_executor.zig");
 const expr_evaluator = @import("expr_evaluator.zig");
+const query_optimizer = @import("query_optimizer.zig");
 
 /// Main SELECT execution function
 /// Routes to specialized executors based on query type:
@@ -116,71 +117,80 @@ pub fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
     var row_ids: []u64 = undefined;
     const should_free_ids = true;
 
-    // Phase 1: Query Optimizer - Check if we can use an index
-    const use_index = if (cmd.where_column) |where_col| blk: {
-        if (cmd.where_value) |where_val| {
-            // Look for an index on this column
-            if (db.index_manager.findIndexForColumn(cmd.table_name, where_col)) |index_info| {
-                // Found an index! Use it instead of table scan
-                row_ids = try index_info.btree.search(where_val);
+    // Handle special ordering first (ORDER BY SIMILARITY, ORDER BY VIBES)
+    // These bypass the regular query optimizer
+    var use_index = false;
+
+    if (cmd.order_by_similarity) |similarity_text| {
+        // Handle ORDER BY SIMILARITY TO "text"
+        // Find embedding column in table to get its dimension
+        var embedding_dim: ?usize = null;
+        for (table.columns.items) |col| {
+            if (col.col_type == .embedding) {
+                embedding_dim = col.embedding_dim;
+                break;
+            }
+        }
+
+        if (embedding_dim == null) return sql.SqlError.InvalidSyntax;
+        const dim = embedding_dim.?;
+
+        // For semantic search, we need to generate an embedding from the text
+        const query_embedding = try db.allocator.alloc(f32, dim);
+        defer db.allocator.free(query_embedding);
+
+        // Simple hash-based embedding (in real use, you'd use an actual embedding model)
+        const hash = std.hash.Wyhash.hash(0, similarity_text);
+        for (query_embedding, 0..) |*val, i| {
+            const seed = hash +% i;
+            val.* = @as(f32, @floatFromInt(seed & 0xFF)) / 255.0;
+        }
+
+        // Get or create HNSW index for this dimension
+        const hnsw = try db.getOrCreateHnswForDim(dim);
+        const search_results = try hnsw.search(query_embedding, cmd.limit orelse 10);
+        defer db.allocator.free(search_results);
+
+        row_ids = try db.allocator.alloc(u64, search_results.len);
+        for (search_results, 0..) |res, i| {
+            row_ids[i] = res.external_id;
+        }
+    } else if (cmd.order_by_vibes) {
+        // Fun parody feature: random order!
+        row_ids = try table.getAllRows(db.allocator, snapshot, clog);
+        var prng = std.Random.DefaultPrng.init(@intCast(std.time.timestamp()));
+        const random = prng.random();
+
+        // Shuffle
+        for (row_ids, 0..) |_, i| {
+            const j = random.intRangeLessThan(usize, 0, row_ids.len);
+            const temp = row_ids[i];
+            row_ids[i] = row_ids[j];
+            row_ids[j] = temp;
+        }
+    } else {
+        // Phase 1: Query Optimizer - Use cost-based optimization to choose execution strategy
+        var optimizer = query_optimizer.QueryOptimizer.init(db.allocator, db, table);
+        const query_plan = try optimizer.optimize(cmd);
+
+        // Execute the query using the optimized plan
+        use_index = switch (query_plan.strategy) {
+            .table_scan => blk: {
+                // No index - use full table scan
+                row_ids = try table.getAllRows(db.allocator, snapshot, clog);
+                break :blk false;
+            },
+            .index_scan => blk: {
+                // Use index scan
+                row_ids = try query_optimizer.executeWithPlan(db, table, query_plan, db.allocator);
                 break :blk true;
-            }
-        }
-        break :blk false;
-    } else false;
-
-    // Handle ORDER BY SIMILARITY TO "text"
-    if (!use_index) {
-        if (cmd.order_by_similarity) |similarity_text| {
-            // Find embedding column in table to get its dimension
-            var embedding_dim: ?usize = null;
-            for (table.columns.items) |col| {
-                if (col.col_type == .embedding) {
-                    embedding_dim = col.embedding_dim;
-                    break;
-                }
-            }
-
-            if (embedding_dim == null) return sql.SqlError.InvalidSyntax;
-            const dim = embedding_dim.?;
-
-            // For semantic search, we need to generate an embedding from the text
-            const query_embedding = try db.allocator.alloc(f32, dim);
-            defer db.allocator.free(query_embedding);
-
-            // Simple hash-based embedding (in real use, you'd use an actual embedding model)
-            const hash = std.hash.Wyhash.hash(0, similarity_text);
-            for (query_embedding, 0..) |*val, i| {
-                const seed = hash +% i;
-                val.* = @as(f32, @floatFromInt(seed & 0xFF)) / 255.0;
-            }
-
-            // Get or create HNSW index for this dimension
-            const hnsw = try db.getOrCreateHnswForDim(dim);
-            const search_results = try hnsw.search(query_embedding, cmd.limit orelse 10);
-            defer db.allocator.free(search_results);
-
-            row_ids = try db.allocator.alloc(u64, search_results.len);
-            for (search_results, 0..) |res, i| {
-                row_ids[i] = res.external_id;
-            }
-        } else if (cmd.order_by_vibes) {
-            // Fun parody feature: random order!
-            row_ids = try table.getAllRows(db.allocator, snapshot, clog);
-            var prng = std.Random.DefaultPrng.init(@intCast(std.time.timestamp()));
-            const random = prng.random();
-
-            // Shuffle
-            for (row_ids, 0..) |_, i| {
-                const j = random.intRangeLessThan(usize, 0, row_ids.len);
-                const temp = row_ids[i];
-                row_ids[i] = row_ids[j];
-                row_ids[j] = temp;
-            }
-        } else {
-            // Fallback to full table scan (no index available)
-            row_ids = try table.getAllRows(db.allocator, snapshot, clog);
-        }
+            },
+            .multi_index_scan => blk: {
+                // Use multiple index scans
+                row_ids = try query_optimizer.executeWithPlan(db, table, query_plan, db.allocator);
+                break :blk true;
+            },
+        };
     }
 
     defer if (should_free_ids) db.allocator.free(row_ids);

@@ -347,7 +347,15 @@ pub const BTree = struct {
     /// Find all row IDs in a range [min_key, max_key]
     /// Returns a list of row IDs in sorted order
     /// Caller must free the returned list
-    pub fn findRange(self: *const BTree, min_key: ColumnValue, max_key: ColumnValue) ![]u64 {
+    /// min_inclusive: if true, include values equal to min_key
+    /// max_inclusive: if true, include values equal to max_key
+    pub fn findRange(
+        self: *const BTree,
+        min_key: ColumnValue,
+        max_key: ColumnValue,
+        min_inclusive: bool,
+        max_inclusive: bool,
+    ) ![]u64 {
         if (self.root == null) {
             return try self.allocator.alloc(u64, 0);
         }
@@ -355,7 +363,7 @@ pub const BTree = struct {
         var results = ArrayList(u64).init(self.allocator);
         errdefer results.deinit();
 
-        try self.findRangeInNode(self.root.?, min_key, max_key, &results);
+        try self.findRangeInNode(self.root.?, min_key, max_key, min_inclusive, max_inclusive, &results);
 
         return try results.toOwnedSlice();
     }
@@ -366,6 +374,8 @@ pub const BTree = struct {
         node: *BTreeNode,
         min_key: ColumnValue,
         max_key: ColumnValue,
+        min_inclusive: bool,
+        max_inclusive: bool,
         results: *ArrayList(u64),
     ) !void {
         var i: usize = 0;
@@ -374,15 +384,30 @@ pub const BTree = struct {
             const cmp_min = compareColumnValues(key, min_key);
             const cmp_max = compareColumnValues(key, max_key);
 
-            // Search left child if key >= min_key
-            if (!node.is_leaf and (cmp_min == .gt or cmp_min == .eq)) {
+            // Search left child if key might be in range
+            const should_search_left = if (min_inclusive)
+                (cmp_min == .gt or cmp_min == .eq)
+            else
+                cmp_min == .gt;
+
+            if (!node.is_leaf and should_search_left) {
                 if (i < node.children.items.len) {
-                    try self.findRangeInNode(node.children.items[i].?, min_key, max_key, results);
+                    try self.findRangeInNode(node.children.items[i].?, min_key, max_key, min_inclusive, max_inclusive, results);
                 }
             }
 
             // Add this key if in range
-            if ((cmp_min == .gt or cmp_min == .eq) and (cmp_max == .lt or cmp_max == .eq)) {
+            const matches_min = if (min_inclusive)
+                (cmp_min == .gt or cmp_min == .eq)
+            else
+                cmp_min == .gt;
+
+            const matches_max = if (max_inclusive)
+                (cmp_max == .lt or cmp_max == .eq)
+            else
+                cmp_max == .lt;
+
+            if (matches_min and matches_max) {
                 if (node.is_leaf) {
                     try results.append(node.values.items[i]);
                 }
@@ -397,7 +422,7 @@ pub const BTree = struct {
         // Search rightmost child if not done
         if (!node.is_leaf and node.children.items.len > 0) {
             const last_child = node.children.items[node.children.items.len - 1].?;
-            try self.findRangeInNode(last_child, min_key, max_key, results);
+            try self.findRangeInNode(last_child, min_key, max_key, min_inclusive, max_inclusive, results);
         }
     }
 
@@ -601,10 +626,12 @@ test "BTree: range query" {
     try tree.insert(ColumnValue{ .int = 40 }, 400);
     try tree.insert(ColumnValue{ .int = 50 }, 500);
 
-    // Range query [20, 40]
+    // Range query [20, 40] (inclusive on both ends)
     const results = try tree.findRange(
         ColumnValue{ .int = 20 },
         ColumnValue{ .int = 40 },
+        true, // min_inclusive
+        true, // max_inclusive
     );
     defer testing.allocator.free(results);
 
