@@ -557,7 +557,7 @@ test "Persistence: Next ID counter preserved" {
         defer db.deinit();
 
         const table_before = db.tables.get("sequences").?;
-        const next_id_before = table_before.next_id;
+        const next_id_before = table_before.next_id.load(.monotonic);
 
         var insert3 = try db.execute("INSERT INTO sequences VALUES (3, 300)");
         defer insert3.deinit();
@@ -565,7 +565,7 @@ test "Persistence: Next ID counter preserved" {
         // Verify new row got expected ID
         const table_after = db.tables.get("sequences").?;
         try testing.expect(table_after.rows.count() == 3);
-        try testing.expect(table_after.next_id == next_id_before + 1);
+        try testing.expect(table_after.next_id.load(.monotonic) == next_id_before + 1);
     }
 
     // Clean up
@@ -1105,22 +1105,22 @@ test "WAL: Transaction ID increments" {
     defer create_result.deinit();
 
     // Transaction ID should start at 0
-    try testing.expect(db.current_tx_id == 0);
+    try testing.expect(db.current_tx_id.load(.monotonic) == 0);
 
     // Perform INSERT - should increment tx_id
     var insert1 = try db.execute("INSERT INTO test VALUES (1, 100)");
     defer insert1.deinit();
-    try testing.expect(db.current_tx_id == 1);
+    try testing.expect(db.current_tx_id.load(.monotonic) == 1);
 
     // Perform UPDATE - should increment tx_id again
     var update1 = try db.execute("UPDATE test SET value = 200 WHERE id = 1");
     defer update1.deinit();
-    try testing.expect(db.current_tx_id == 2);
+    try testing.expect(db.current_tx_id.load(.monotonic) == 2);
 
     // Perform DELETE - should increment tx_id again
     var delete1 = try db.execute("DELETE FROM test WHERE id = 1");
     defer delete1.deinit();
-    try testing.expect(db.current_tx_id == 3);
+    try testing.expect(db.current_tx_id.load(.monotonic) == 3);
 }
 
 test "WAL: Database works without WAL (optional)" {
@@ -1271,7 +1271,7 @@ test "WAL: Multiple embedding insertions with WAL" {
     // Verify transaction IDs incremented for each insert
     // Since we have WAL enabled, each INSERT command incremented the tx_id
     // We inserted 5 rows, so tx_id should now be 5 (started at 0)
-    try testing.expect(db.current_tx_id == 5);
+    try testing.expect(db.current_tx_id.load(.monotonic) == 5);
 
     // Verify HNSW has all vectors
     for (1..6) |row_num| {

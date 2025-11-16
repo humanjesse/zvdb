@@ -347,7 +347,7 @@ pub const Table = struct {
     name: []const u8,
     columns: ArrayList(Column),
     rows: AutoHashMap(u64, Row),
-    next_id: u64,
+    next_id: std.atomic.Value(u64),
     allocator: Allocator,
 
     pub fn init(allocator: Allocator, name: []const u8) !Table {
@@ -358,7 +358,7 @@ pub const Table = struct {
             .name = owned_name,
             .columns = ArrayList(Column).init(allocator),
             .rows = AutoHashMap(u64, Row).init(allocator),
-            .next_id = 1,
+            .next_id = std.atomic.Value(u64).init(1),
             .allocator = allocator,
         };
     }
@@ -384,8 +384,7 @@ pub const Table = struct {
     }
 
     pub fn insert(self: *Table, values: StringHashMap(ColumnValue)) !u64 {
-        const id = self.next_id;
-        self.next_id += 1;
+        const id = self.next_id.fetchAdd(1, .monotonic);
 
         var row = Row.init(self.allocator, id);
 
@@ -407,8 +406,13 @@ pub const Table = struct {
         }
 
         try self.rows.put(id, row);
-        if (id >= self.next_id) {
-            self.next_id = id + 1;
+
+        // Atomically update next_id if needed (ensure it's at least id + 1)
+        const desired_next = id + 1;
+        while (true) {
+            const current = self.next_id.load(.monotonic);
+            if (current >= desired_next) break;
+            _ = self.next_id.cmpxchgWeak(current, desired_next, .monotonic, .monotonic) orelse break;
         }
     }
 
@@ -462,7 +466,7 @@ pub const Table = struct {
         // Write metadata
         try utils.writeInt(file, u64, self.name.len);
         try file.writeAll(self.name);
-        try utils.writeInt(file, u64, self.next_id);
+        try utils.writeInt(file, u64, self.next_id.load(.monotonic));
 
         // Write schema
         try utils.writeInt(file, u64, self.columns.items.len);
@@ -546,7 +550,7 @@ pub const Table = struct {
             .name = name,
             .columns = ArrayList(Column).init(allocator),
             .rows = AutoHashMap(u64, Row).init(allocator),
-            .next_id = next_id,
+            .next_id = std.atomic.Value(u64).init(next_id),
             .allocator = allocator,
         };
         errdefer table.deinit();

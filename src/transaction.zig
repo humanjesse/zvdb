@@ -177,8 +177,8 @@ pub const TransactionManager = struct {
     /// Current active transaction (only one transaction at a time for now)
     current_tx: ?Transaction,
 
-    /// Next transaction ID to assign
-    next_tx_id: u64,
+    /// Next transaction ID to assign (atomic for thread-safety in future MVCC)
+    next_tx_id: std.atomic.Value(u64),
 
     /// Allocator for memory management
     allocator: Allocator,
@@ -187,7 +187,7 @@ pub const TransactionManager = struct {
     pub fn init(allocator: Allocator) TransactionManager {
         return TransactionManager{
             .current_tx = null,
-            .next_tx_id = 1,
+            .next_tx_id = std.atomic.Value(u64).init(1),
             .allocator = allocator,
         };
     }
@@ -214,9 +214,8 @@ pub const TransactionManager = struct {
             tx.deinit();
         }
 
-        // Create new transaction
-        const tx_id = self.next_tx_id;
-        self.next_tx_id += 1;
+        // Create new transaction with atomic ID assignment
+        const tx_id = self.next_tx_id.fetchAdd(1, .monotonic);
         self.current_tx = Transaction.init(tx_id, self.allocator);
 
         return tx_id;

@@ -87,9 +87,8 @@ pub fn writeWalRecord(
 ) !u64 {
     const w = db.wal orelse return error.WalNotEnabled;
 
-    // Get transaction ID and increment
-    const tx_id = db.current_tx_id;
-    db.current_tx_id += 1;
+    // Get transaction ID and increment atomically
+    const tx_id = db.current_tx_id.fetchAdd(1, .monotonic);
 
     // Create WAL record (writeRecord makes its own copy of table_name and data)
     const table_name_owned = try db.allocator.dupe(u8, table_name);
@@ -333,7 +332,7 @@ pub fn recoverFromWal(db: *Database, wal_dir: []const u8) !usize {
 
     // Update current_tx_id to prevent ID reuse in future transactions
     if (max_tx_id > 0) {
-        db.current_tx_id = max_tx_id + 1;
+        db.current_tx_id.store(max_tx_id + 1, .monotonic);
     }
 
     return recovered_count;
@@ -361,9 +360,12 @@ fn replayInsert(db: *Database, record: *const WalRecord) !void {
     // Insert the row into the table
     try table.rows.put(row.id, row);
 
-    // Update next_id to prevent ID conflicts with future inserts
-    if (row.id >= table.next_id) {
-        table.next_id = row.id + 1;
+    // Update next_id to prevent ID conflicts with future inserts (atomic CAS loop)
+    const desired_next = row.id + 1;
+    while (true) {
+        const current = table.next_id.load(.monotonic);
+        if (current >= desired_next) break;
+        _ = table.next_id.cmpxchgWeak(current, desired_next, .monotonic, .monotonic) orelse break;
     }
 }
 
@@ -422,8 +424,11 @@ fn replayUpdate(db: *Database, record: *const WalRecord) !void {
     // Insert the updated row
     try table.rows.put(updated_row.id, updated_row);
 
-    // Update next_id to prevent ID conflicts with future inserts
-    if (updated_row.id >= table.next_id) {
-        table.next_id = updated_row.id + 1;
+    // Update next_id to prevent ID conflicts with future inserts (atomic CAS loop)
+    const desired_next = updated_row.id + 1;
+    while (true) {
+        const current = table.next_id.load(.monotonic);
+        if (current >= desired_next) break;
+        _ = table.next_id.cmpxchgWeak(current, desired_next, .monotonic, .monotonic) orelse break;
     }
 }

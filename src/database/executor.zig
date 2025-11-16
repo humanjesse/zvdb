@@ -866,7 +866,8 @@ fn executeInsert(db: *Database, cmd: sql.InsertCmd) !QueryResult {
 
     // Always auto-generate the row_id (don't use user's "id" column as row_id)
     // This allows multiple rows with the same "id" column value, which is SQL compliant
-    const row_id = table.next_id;
+    // Atomically reserve the next row ID (thread-safe for concurrent inserts)
+    const row_id = table.next_id.fetchAdd(1, .monotonic);
 
     // WAL-Ahead Protocol: Write to WAL BEFORE modifying data
     if (db.wal != null) {
