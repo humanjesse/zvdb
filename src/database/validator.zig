@@ -770,44 +770,37 @@ pub fn validateDelete(
     var result = ValidationResult.init(allocator);
     errdefer result.deinit();
 
-    // Validate WHERE column if present (simple WHERE clause)
-    if (cmd.where_column) |col_name| {
-        // Check if column exists in table schema
-        var column_exists = false;
-        for (table.columns.items) |schema_col| {
-            if (std.mem.eql(u8, col_name, schema_col.name)) {
-                column_exists = true;
-                break;
-            }
-        }
+    // Validate WHERE clause if present (using full expression validation like UPDATE)
+    if (cmd.where_expr) |expr| {
+        // Build column resolver for WHERE validation
+        var resolver = try ColumnResolver.init(allocator, table);
+        defer resolver.deinit();
 
-        if (!column_exists) {
-            const msg = try std.fmt.allocPrint(
-                allocator,
-                "column \"{s}\" does not exist in table \"{s}\"",
-                .{ col_name, table.name },
-            );
+        var where_ctx = ValidationContext.init(allocator, .where);
+        defer where_ctx.deinit();
+        where_ctx.resolver = &resolver;
+
+        // Validate WHERE expression
+        validateExpression(&where_ctx, expr) catch |err| {
+            const msg = try formatErrorMessage(allocator, err, null);
             defer allocator.free(msg);
 
-            // Try to find a similar column name for suggestion
-            const hint = if (findSimilarColumnInTable(col_name, table, 2)) |similar|
-                try std.fmt.allocPrint(
-                    allocator,
-                    "Did you mean \"{s}\"?",
-                    .{similar},
-                )
-            else
-                null;
-
             try result.addError(
-                ValidationError.ColumnNotFound,
-                col_name,
+                err,
+                null,
                 msg,
-                hint,
+                "Check that all columns in WHERE clause exist in the table",
             );
+        };
 
-            // Free hint if allocated
-            if (hint) |h| allocator.free(h);
+        // Add any errors from context to result
+        for (where_ctx.errors.items) |ctx_err| {
+            try result.addError(
+                ctx_err.error_type,
+                ctx_err.column_name,
+                ctx_err.message,
+                ctx_err.hint,
+            );
         }
     }
 

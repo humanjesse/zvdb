@@ -17,12 +17,9 @@ const Operation = Transaction.Operation;
 // ============================================================================
 
 /// Execute BEGIN command
+/// NOTE: Multiple concurrent transactions are supported via MVCC.
+/// Each BEGIN creates a new transaction with snapshot isolation.
 pub fn executeBegin(db: *Database) !QueryResult {
-    // Check if there's already an active transaction
-    if (db.tx_manager.hasActiveTx()) {
-        return error.TransactionAlreadyActive;
-    }
-
     const tx_id = try db.tx_manager.begin();
 
     // Write BEGIN to WAL if enabled

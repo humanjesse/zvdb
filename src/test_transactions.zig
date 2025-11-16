@@ -334,7 +334,7 @@ test "rollback without active transaction returns error" {
     try testing.expectError(error.NoActiveTransaction, result);
 }
 
-test "nested transactions not allowed" {
+test "concurrent transactions allowed" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -346,13 +346,27 @@ test "nested transactions not allowed" {
     var result1 = try db.execute("BEGIN");
     defer result1.deinit();
 
-    // Try to start second transaction (should fail)
-    const result2 = db.execute("BEGIN");
-    try testing.expectError(error.TransactionAlreadyActive, result2);
+    // Extract first transaction ID from result
+    try testing.expect(result1.rows.items.len == 1);
+    const tx1_msg = result1.rows.items[0].items[0].text;
 
-    // Rollback the first transaction to clean up
-    var result3 = try db.execute("ROLLBACK");
+    // Start second transaction (should succeed with MVCC)
+    var result2 = try db.execute("BEGIN");
+    defer result2.deinit();
+
+    // Extract second transaction ID from result
+    try testing.expect(result2.rows.items.len == 1);
+    const tx2_msg = result2.rows.items[0].items[0].text;
+
+    // Verify different transaction IDs
+    try testing.expect(!std.mem.eql(u8, tx1_msg, tx2_msg));
+
+    // Both transactions can commit independently
+    var result3 = try db.execute("COMMIT");
     defer result3.deinit();
+
+    var result4 = try db.execute("COMMIT");
+    defer result4.deinit();
 }
 
 // ============================================================================

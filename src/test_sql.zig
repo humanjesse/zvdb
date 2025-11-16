@@ -2636,3 +2636,141 @@ test "WAL Recovery: Partial corruption in WAL file" {
         try testing.expect(table.count() > 0); // At least the new insert
     }
 }
+
+// ============================================================================
+// DELETE with Complex WHERE Tests (Fix #2)
+// ============================================================================
+
+test "DELETE with AND condition" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    var create = try db.execute("CREATE TABLE users (id int, age int, status text)");
+    defer create.deinit();
+
+    var insert1 = try db.execute("INSERT INTO users VALUES (1, 25, \"active\")");
+    defer insert1.deinit();
+    var insert2 = try db.execute("INSERT INTO users VALUES (2, 35, \"inactive\")");
+    defer insert2.deinit();
+    var insert3 = try db.execute("INSERT INTO users VALUES (3, 45, \"active\")");
+    defer insert3.deinit();
+    var insert4 = try db.execute("INSERT INTO users VALUES (4, 30, \"inactive\")");
+    defer insert4.deinit();
+
+    // DELETE with AND: Delete inactive users older than 30
+    var delete_result = try db.execute("DELETE FROM users WHERE age > 30 AND status = \"inactive\"");
+    defer delete_result.deinit();
+    try testing.expect(delete_result.rows.items[0].items[0].int == 1); // Only user 2 deleted
+
+    var select_result = try db.execute("SELECT * FROM users");
+    defer select_result.deinit();
+    try testing.expect(select_result.rows.items.len == 3);
+}
+
+test "DELETE with OR condition" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    var create = try db.execute("CREATE TABLE products (id int, price float, stock int)");
+    defer create.deinit();
+
+    var insert1 = try db.execute("INSERT INTO products VALUES (1, 10.5, 0)");
+    defer insert1.deinit();
+    var insert2 = try db.execute("INSERT INTO products VALUES (2, 5.0, 100)");
+    defer insert2.deinit();
+    var insert3 = try db.execute("INSERT INTO products VALUES (3, 150.0, 5)");
+    defer insert3.deinit();
+
+    // DELETE with OR: Delete products that are out of stock or too expensive
+    var delete_result = try db.execute("DELETE FROM products WHERE stock = 0 OR price > 100");
+    defer delete_result.deinit();
+    try testing.expect(delete_result.rows.items[0].items[0].int == 2); // Products 1 and 3
+
+    var select_result = try db.execute("SELECT * FROM products");
+    defer select_result.deinit();
+    try testing.expect(select_result.rows.items.len == 1);
+    try testing.expect(select_result.rows.items[0].items[0].int == 2); // Only product 2 remains
+}
+
+test "DELETE with IS NULL" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    var create = try db.execute("CREATE TABLE contacts (id int, email text, phone text)");
+    defer create.deinit();
+
+    var insert1 = try db.execute("INSERT INTO contacts VALUES (1, \"test@example.com\", NULL)");
+    defer insert1.deinit();
+    var insert2 = try db.execute("INSERT INTO contacts VALUES (2, NULL, \"123-456\")");
+    defer insert2.deinit();
+    var insert3 = try db.execute("INSERT INTO contacts VALUES (3, \"user@test.com\", \"789-012\")");
+    defer insert3.deinit();
+
+    // DELETE rows with NULL email
+    var delete_result = try db.execute("DELETE FROM contacts WHERE email IS NULL");
+    defer delete_result.deinit();
+    try testing.expect(delete_result.rows.items[0].items[0].int == 1); // Contact 2 deleted
+
+    var select_result = try db.execute("SELECT * FROM contacts");
+    defer select_result.deinit();
+    try testing.expect(select_result.rows.items.len == 2);
+}
+
+test "DELETE with subquery (IN)" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    var create_users = try db.execute("CREATE TABLE users (id int, name text, status text)");
+    defer create_users.deinit();
+    var create_orders = try db.execute("CREATE TABLE orders (id int, user_id int, amount float)");
+    defer create_orders.deinit();
+
+    var insert_u1 = try db.execute("INSERT INTO users VALUES (1, \"Alice\", \"active\")");
+    defer insert_u1.deinit();
+    var insert_u2 = try db.execute("INSERT INTO users VALUES (2, \"Bob\", \"active\")");
+    defer insert_u2.deinit();
+    var insert_u3 = try db.execute("INSERT INTO users VALUES (3, \"Charlie\", \"inactive\")");
+    defer insert_u3.deinit();
+
+    var insert_o1 = try db.execute("INSERT INTO orders VALUES (1, 1, 100.0)");
+    defer insert_o1.deinit();
+    var insert_o2 = try db.execute("INSERT INTO orders VALUES (2, 1, 200.0)");
+    defer insert_o2.deinit();
+
+    // DELETE users who have no orders
+    var delete_result = try db.execute("DELETE FROM users WHERE id NOT IN (SELECT user_id FROM orders)");
+    defer delete_result.deinit();
+    try testing.expect(delete_result.rows.items[0].items[0].int == 2); // Bob and Charlie deleted
+
+    var select_result = try db.execute("SELECT * FROM users");
+    defer select_result.deinit();
+    try testing.expect(select_result.rows.items.len == 1);
+    try testing.expect(select_result.rows.items[0].items[1].text[0] == 'A'); // Only Alice remains
+}
+
+test "DELETE with subquery (EXISTS)" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    var create_users = try db.execute("CREATE TABLE users (id int, name text)");
+    defer create_users.deinit();
+    var create_bans = try db.execute("CREATE TABLE bans (user_id int, reason text)");
+    defer create_bans.deinit();
+
+    var insert_u1 = try db.execute("INSERT INTO users VALUES (1, \"Alice\")");
+    defer insert_u1.deinit();
+    var insert_u2 = try db.execute("INSERT INTO users VALUES (2, \"Bob\")");
+    defer insert_u2.deinit();
+
+    var insert_b1 = try db.execute("INSERT INTO bans VALUES (2, \"spam\")");
+    defer insert_b1.deinit();
+
+    // DELETE banned users
+    var delete_result = try db.execute("DELETE FROM users WHERE EXISTS (SELECT 1 FROM bans WHERE user_id = 2)");
+    defer delete_result.deinit();
+
+    var select_result = try db.execute("SELECT * FROM users");
+    defer select_result.deinit();
+    // Note: EXISTS with constant subquery will delete all or none
+    // For proper correlated subquery, we'd need correlation support
+}

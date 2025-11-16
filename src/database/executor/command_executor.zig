@@ -315,18 +315,16 @@ pub fn executeDelete(db: *Database, cmd: sql.DeleteCmd) !QueryResult {
     for (row_ids) |row_id| {
         const row = table.get(row_id, snapshot, clog) orelse continue;
 
-        // Apply WHERE filter
+        // Apply WHERE filter using expression evaluator (like UPDATE)
         var should_delete = true;
-        if (cmd.where_column) |where_col| {
-            if (cmd.where_value) |where_val| {
-                const row_val = row.get(where_col) orelse {
-                    should_delete = false;
-                    continue;
-                };
-                if (!valuesEqual(row_val, where_val)) {
-                    should_delete = false;
-                }
-            }
+        if (cmd.where_expr) |expr| {
+            const matches = try expr_evaluator.evaluateExprWithSubqueries(
+                db,
+                expr,
+                row.values,
+                executeSelect,
+            );
+            should_delete = matches;
         }
 
         if (should_delete) {

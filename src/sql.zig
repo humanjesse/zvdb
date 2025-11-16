@@ -209,15 +209,13 @@ pub const SelectCmd = struct {
 /// DELETE command
 pub const DeleteCmd = struct {
     table_name: []const u8,
-    where_column: ?[]const u8,
-    where_value: ?ColumnValue,
+    where_expr: ?Expr,
 
     pub fn deinit(self: *DeleteCmd, allocator: Allocator) void {
         allocator.free(self.table_name);
-        if (self.where_column) |col| allocator.free(col);
-        if (self.where_value) |*val| {
-            var v = val.*;
-            v.deinit(allocator);
+        if (self.where_expr) |*expr| {
+            var e = expr.*;
+            e.deinit(allocator);
         }
     }
 };
@@ -1029,48 +1027,25 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
 }
 
 fn parseDelete(allocator: Allocator, tokens: []const Token) !DeleteCmd {
-    // DELETE FROM table WHERE col = val
+    // DELETE FROM table [WHERE expr]
     if (tokens.len < 3) return SqlError.InvalidSyntax;
     if (!eqlIgnoreCase(tokens[1].text, "FROM")) return SqlError.InvalidSyntax;
 
     const table_name = try allocator.dupe(u8, tokens[2].text);
-    var where_column: ?[]const u8 = null;
-    var where_value: ?ColumnValue = null;
+    errdefer allocator.free(table_name);
 
     var i: usize = 3;
+
+    // Parse optional WHERE clause (using full expression parser like UPDATE)
+    var where_expr: ?Expr = null;
     if (i < tokens.len and eqlIgnoreCase(tokens[i].text, "WHERE")) {
         i += 1;
-        if (i >= tokens.len) return SqlError.InvalidSyntax;
-        where_column = try allocator.dupe(u8, tokens[i].text);
-        i += 1;
-
-        if (i + 1 < tokens.len and std.mem.eql(u8, tokens[i].text, "=")) {
-            i += 1;
-            const token_text = tokens[i].text;
-            if (token_text[0] == '"' or token_text[0] == '\'') {
-                const str = parseString(token_text);
-                const owned = try allocator.dupe(u8, str);
-                where_value = ColumnValue{ .text = owned };
-            } else if (std.mem.indexOf(u8, token_text, ".")) |_| {
-                const f = try std.fmt.parseFloat(f64, token_text);
-                where_value = ColumnValue{ .float = f };
-            } else if (eqlIgnoreCase(token_text, "true")) {
-                where_value = ColumnValue{ .bool = true };
-            } else if (eqlIgnoreCase(token_text, "false")) {
-                where_value = ColumnValue{ .bool = false };
-            } else if (eqlIgnoreCase(token_text, "NULL")) {
-                where_value = ColumnValue.null_value;
-            } else {
-                const num = try std.fmt.parseInt(i64, token_text, 10);
-                where_value = ColumnValue{ .int = num };
-            }
-        }
+        where_expr = try parseExpr(allocator, tokens, &i);
     }
 
     return DeleteCmd{
         .table_name = table_name,
-        .where_column = where_column,
-        .where_value = where_value,
+        .where_expr = where_expr,
     };
 }
 
