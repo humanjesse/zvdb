@@ -100,6 +100,7 @@ pub const CreateTableCmd = struct {
 pub const ColumnDef = struct {
     name: []const u8,
     col_type: ColumnType,
+    embedding_dim: ?usize, // Dimension for embedding type (null for non-embedding types)
 };
 
 /// CREATE INDEX command
@@ -574,8 +575,35 @@ fn parseCreateTable(allocator: Allocator, tokens: []const Token) !CreateTableCmd
         const col_name = try allocator.dupe(u8, tokens[i].text);
         const col_type = try parseColumnType(tokens[i + 1].text);
 
-        try columns.append(.{ .name = col_name, .col_type = col_type });
-        i += 1; // Skip type token
+        var embedding_dim: ?usize = null;
+        var type_token_count: usize = 1; // How many tokens the type consumed
+
+        // For embedding type, dimension is required: embedding(N)
+        if (col_type == .embedding) {
+            // Expect: embedding ( number )
+            if (i + 4 >= tokens.len) return SqlError.InvalidSyntax;
+            if (!std.mem.eql(u8, tokens[i + 2].text, "(")) {
+                return SqlError.InvalidSyntax; // embedding must be followed by (N)
+            }
+
+            const dim_value = std.fmt.parseInt(usize, tokens[i + 3].text, 10) catch {
+                return SqlError.InvalidSyntax;
+            };
+
+            if (!std.mem.eql(u8, tokens[i + 4].text, ")")) {
+                return SqlError.InvalidSyntax;
+            }
+
+            embedding_dim = dim_value;
+            type_token_count = 4; // embedding ( N )
+        }
+
+        try columns.append(.{
+            .name = col_name,
+            .col_type = col_type,
+            .embedding_dim = embedding_dim,
+        });
+        i += type_token_count; // Skip type tokens
     }
 
     return CreateTableCmd{

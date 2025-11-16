@@ -255,7 +255,7 @@ pub fn benchmarkRecoveryWithHnsw(allocator: std.mem.Allocator, config: Benchmark
         try db.initVectorSearch(16, 200);
         try db.enableWal(config.wal_dir);
 
-        var create_result = try db.execute("CREATE TABLE docs (id int, title text, vec embedding)");
+        var create_result = try db.execute("CREATE TABLE docs (id int, title text, vec embedding(768))");
         defer create_result.deinit();
 
         const table = db.tables.get("docs").?;
@@ -284,7 +284,7 @@ pub fn benchmarkRecoveryWithHnsw(allocator: std.mem.Allocator, config: Benchmark
     try db.initVectorSearch(16, 200);
     try db.enableWal(config.wal_dir);
 
-    var create_result = try db.execute("CREATE TABLE docs (id int, title text, vec embedding)");
+    var create_result = try db.execute("CREATE TABLE docs (id int, title text, vec embedding(768))");
     defer create_result.deinit();
 
     var timer = try std.time.Timer.start();

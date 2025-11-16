@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const StringHashMap = std.StringHashMap;
+const AutoHashMap = std.AutoHashMap;
 const ArrayList = std.array_list.Managed;
 const Table = @import("../table.zig").Table;
 const ColumnValue = @import("../table.zig").ColumnValue;
@@ -98,7 +99,7 @@ pub const QueryResult = struct {
 /// Main database with SQL and vector search
 pub const Database = struct {
     tables: StringHashMap(*Table),
-    hnsw: ?*HNSW(f32), // Optional vector index
+    hnsw_indexes: AutoHashMap(usize, *HNSW(f32)), // Per-dimension vector indexes (key=dimension, value=HNSW)
     index_manager: IndexManager, // B-tree indexes for fast queries
     allocator: Allocator,
     data_dir: ?[]const u8, // Data directory for persistence (owned)
@@ -113,7 +114,7 @@ pub const Database = struct {
     pub fn init(allocator: Allocator) Database {
         return Database{
             .tables = StringHashMap(*Table).init(allocator),
-            .hnsw = null,
+            .hnsw_indexes = AutoHashMap(usize, *HNSW(f32)).init(allocator),
             .index_manager = IndexManager.init(allocator),
             .allocator = allocator,
             .data_dir = null,
@@ -152,10 +153,13 @@ pub const Database = struct {
         }
         self.tables.deinit();
 
-        if (self.hnsw) |h| {
-            h.deinit();
-            self.allocator.destroy(h);
+        // Clean up all HNSW indexes
+        var hnsw_it = self.hnsw_indexes.valueIterator();
+        while (hnsw_it.next()) |h| {
+            h.*.deinit();
+            self.allocator.destroy(h.*);
         }
+        self.hnsw_indexes.deinit();
 
         // Clean up indexes
         self.index_manager.deinit();
@@ -165,11 +169,27 @@ pub const Database = struct {
         }
     }
 
-    /// Initialize vector search capabilities
+    /// Get or create HNSW index for a specific dimension
+    pub fn getOrCreateHnswForDim(self: *Database, dim: usize) !*HNSW(f32) {
+        // Check if HNSW index for this dimension already exists
+        if (self.hnsw_indexes.get(dim)) |existing_hnsw| {
+            return existing_hnsw;
+        }
+
+        // Create new HNSW index for this dimension
+        const hnsw_ptr = try self.allocator.create(HNSW(f32));
+        // Use standard HNSW parameters: M=16, efConstruction=200
+        hnsw_ptr.* = HNSW(f32).init(self.allocator, 16, 200);
+        try self.hnsw_indexes.put(dim, hnsw_ptr);
+        return hnsw_ptr;
+    }
+
+    /// Initialize vector search capabilities (deprecated - use getOrCreateHnswForDim instead)
     pub fn initVectorSearch(self: *Database, m: usize, ef_construction: usize) !void {
+        // For backward compatibility, initialize a default 768-dimensional HNSW
         const hnsw_ptr = try self.allocator.create(HNSW(f32));
         hnsw_ptr.* = HNSW(f32).init(self.allocator, m, ef_construction);
-        self.hnsw = hnsw_ptr;
+        try self.hnsw_indexes.put(768, hnsw_ptr);
     }
 
     /// Enable persistence with specified data directory
