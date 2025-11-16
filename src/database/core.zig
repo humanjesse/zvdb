@@ -11,6 +11,22 @@ const TransactionManager = @import("../transaction.zig").TransactionManager;
 const Snapshot = @import("../transaction.zig").Snapshot;
 const CommitLog = @import("../transaction.zig").CommitLog;
 
+// ============================================================================
+// Validation Configuration
+// ============================================================================
+
+/// Validation mode determines how queries are validated
+pub const ValidationMode = enum {
+    /// Strict mode: validation errors cause queries to fail
+    strict,
+
+    /// Warning mode: validation errors are logged but execution continues
+    warnings,
+
+    /// Disabled mode: no validation is performed (backward compatibility)
+    disabled,
+};
+
 /// Query result set
 pub const QueryResult = struct {
     columns: ArrayList([]const u8),
@@ -90,6 +106,10 @@ pub const Database = struct {
     wal: ?*WalWriter, // Write-Ahead Log for durability (optional)
     tx_manager: TransactionManager, // Transaction manager (single source of truth for all transaction IDs)
 
+    // Validation configuration
+    enable_validation: bool, // Master switch for validation
+    validation_mode: ValidationMode, // How validation errors are handled
+
     pub fn init(allocator: Allocator) Database {
         return Database{
             .tables = StringHashMap(*Table).init(allocator),
@@ -100,6 +120,8 @@ pub const Database = struct {
             .auto_save = false,
             .wal = null,
             .tx_manager = TransactionManager.init(allocator),
+            .enable_validation = true, // Enabled by default for safety
+            .validation_mode = .strict, // Strict mode by default
         };
     }
 
@@ -238,6 +260,35 @@ pub const Database = struct {
     /// Get CLOG (Commit Log) for visibility checks
     pub fn getClog(self: *Database) *CommitLog {
         return &self.tx_manager.clog;
+    }
+
+    // ========================================================================
+    // Validation Configuration Helpers
+    // ========================================================================
+
+    /// Enable query validation
+    pub fn enableValidation(self: *Database) void {
+        self.enable_validation = true;
+    }
+
+    /// Disable query validation (for backward compatibility or debugging)
+    pub fn disableValidation(self: *Database) void {
+        self.enable_validation = false;
+    }
+
+    /// Set validation mode
+    pub fn setValidationMode(self: *Database, mode: ValidationMode) void {
+        self.validation_mode = mode;
+    }
+
+    /// Check if validation is currently enabled
+    pub fn isValidationEnabled(self: *const Database) bool {
+        return self.enable_validation;
+    }
+
+    /// Get current validation mode
+    pub fn getValidationMode(self: *const Database) ValidationMode {
+        return self.validation_mode;
     }
 };
 

@@ -7,6 +7,7 @@ const recovery = @import("recovery.zig");
 const hash_join = @import("hash_join.zig");
 const column_resolver = @import("column_resolver.zig");
 const ColumnResolver = column_resolver.ColumnResolver;
+const column_matching = @import("column_matching.zig");
 const Table = @import("../table.zig").Table;
 const ColumnValue = @import("../table.zig").ColumnValue;
 const ColumnType = @import("../table.zig").ColumnType;
@@ -284,36 +285,11 @@ fn getExprValueFromExpr(
     switch (expr) {
         .literal => |val| return val,
         .column => |col| {
-            // First try exact match
-            if (row_values.get(col)) |value| {
+            // Use column_matching helper for resolution
+            // This handles exact matches, qualified/unqualified resolution, and alias mismatches
+            if (column_matching.resolveColumnValue(col, row_values)) |value| {
                 return value;
             }
-
-            // If not found and column is qualified (has a dot), try matching by column part only
-            // This handles cases where aliases don't match (e.g., looking for "u.id" but map has "users.id")
-            if (std.mem.indexOf(u8, col, ".")) |dot_idx| {
-                const col_part = col[dot_idx + 1 ..];
-
-                // First, try the unqualified column name directly
-                // This is important because evaluateWhereOnJoinedRow adds unqualified names
-                // with the FIRST occurrence's value, which gives us the correct precedence
-                if (row_values.get(col_part)) |value| {
-                    return value;
-                }
-
-                // If unqualified lookup failed, try to find a qualified column with matching column part
-                // This handles edge cases where unqualified name wasn't added due to conflicts
-                var it = row_values.iterator();
-                while (it.next()) |entry| {
-                    if (std.mem.indexOf(u8, entry.key_ptr.*, ".")) |entry_dot_idx| {
-                        const entry_col_part = entry.key_ptr.*[entry_dot_idx + 1 ..];
-                        if (std.mem.eql(u8, entry_col_part, col_part)) {
-                            return entry.value_ptr.*;
-                        }
-                    }
-                }
-            }
-
             return ColumnValue.null_value;
         },
         .aggregate => |agg| {
@@ -1119,48 +1095,16 @@ fn projectToSelectedColumns(
             if (col_spec == .regular) {
                 const col_name = col_spec.regular;
 
-                // Find this column in the result
-                var found = false;
-                for (result.columns.items, 0..) |result_col, idx| {
-                    // Try exact match first
-                    if (std.mem.eql(u8, result_col, col_name)) {
-                        if (idx < row.items.len) {
-                            try projected_row.append(try row.items[idx].clone(allocator));
-                            found = true;
-                            break;
-                        }
+                // Use column_matching helper to find the column index
+                // This handles exact matches, qualified/unqualified resolution, and alias mismatches
+                if (column_matching.findColumnIndex(col_name, result.columns.items)) |idx| {
+                    if (idx < row.items.len) {
+                        try projected_row.append(try row.items[idx].clone(allocator));
+                    } else {
+                        // Index out of bounds - add NULL
+                        try projected_row.append(ColumnValue.null_value);
                     }
-                }
-
-                // If not found and column is qualified (has a dot), try matching by column part
-                // This handles cases where aliases don't match (e.g., selecting "u.name" but result has "users.name")
-                if (!found) {
-                    if (std.mem.indexOf(u8, col_name, ".")) |dot_idx| {
-                        const col_part = col_name[dot_idx + 1 ..];
-                        for (result.columns.items, 0..) |result_col, idx| {
-                            // Check if result_col matches the column part
-                            const matches = blk: {
-                                // If result_col is qualified, extract its column part
-                                if (std.mem.indexOf(u8, result_col, ".")) |result_dot_idx| {
-                                    const result_col_part = result_col[result_dot_idx + 1 ..];
-                                    break :blk std.mem.eql(u8, result_col_part, col_part);
-                                }
-                                // If result_col is unqualified, match against the column part
-                                break :blk std.mem.eql(u8, result_col, col_part);
-                            };
-
-                            if (matches) {
-                                if (idx < row.items.len) {
-                                    try projected_row.append(try row.items[idx].clone(allocator));
-                                    found = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if (!found) {
+                } else {
                     // Column not found - add NULL
                     try projected_row.append(ColumnValue.null_value);
                 }
@@ -1443,27 +1387,25 @@ const IntermediateResult = struct {
 
     /// Find column index by name (supports both qualified and unqualified)
     pub fn findColumn(self: *const IntermediateResult, col_name: []const u8) ?usize {
-        // First try exact match on qualified name
+        // Try exact match on qualified name first
         for (self.schema.items) |col_info| {
             if (std.mem.eql(u8, col_info.qualified_name, col_name)) {
                 return col_info.index;
             }
         }
 
-        // Then try unqualified match
+        // Use column_matching helper for fuzzy resolution
+        // Try matching against unqualified column names with fallback logic
         for (self.schema.items) |col_info| {
-            if (std.mem.eql(u8, col_info.column_name, col_name)) {
+            if (column_matching.matchColumnName(col_info.column_name, col_name)) {
                 return col_info.index;
             }
         }
 
-        // Finally, try matching by column part for aliased columns (e.g., "u.name" -> "name")
-        if (std.mem.indexOf(u8, col_name, ".")) |dot_idx| {
-            const col_part = col_name[dot_idx + 1 ..];
-            for (self.schema.items) |col_info| {
-                if (std.mem.eql(u8, col_info.column_name, col_part)) {
-                    return col_info.index;
-                }
+        // Try matching against qualified names with fallback logic
+        for (self.schema.items) |col_info| {
+            if (column_matching.matchColumnName(col_info.qualified_name, col_name)) {
+                return col_info.index;
             }
         }
 
@@ -2195,18 +2137,15 @@ fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
         for (cmd.columns.items) |col| {
             switch (col) {
                 .regular => |col_name| {
-                    // Validate that the column exists in the table schema
-                    // Skip validation for numeric literals (e.g., SELECT 1, SELECT 42)
-                    const is_numeric_literal = blk: {
-                        for (col_name) |c| {
-                            if (c < '0' or c > '9') break :blk false;
-                        }
-                        break :blk col_name.len > 0;
-                    };
-
-                    // Column validation temporarily disabled to debug JOIN test
-                    // TODO: Re-enable with proper handling of all edge cases
-                    _ = is_numeric_literal;
+                    // Note: Column validation is intentionally NOT performed here.
+                    // Per PostgreSQL/SQLite semantics, validation happens during semantic analysis,
+                    // not schema creation. This allows:
+                    // - Literals: SELECT 1, SELECT 'text'
+                    // - Aggregates: SELECT COUNT(*), SELECT AVG(price)
+                    // - Expressions: SELECT price * 1.1
+                    // - Subqueries: SELECT (SELECT MAX(id) FROM other_table)
+                    //
+                    // For deferred validation, see database/validator.zig
                     try result.addColumn(col_name);
                 },
                 .star => unreachable, // Already handled above
