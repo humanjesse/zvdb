@@ -514,3 +514,196 @@ test "GROUP BY: valid non-aggregate column in GROUP BY" {
 
     try expect(result.rows.items.len == 2);
 }
+
+// ============================================================================
+// ORDER BY Integration Tests (Phase 2.3)
+// ============================================================================
+
+test "GROUP BY: with ORDER BY aggregate DESC" {
+    var db = Database.init(std.testing.allocator);
+    defer db.deinit();
+
+    try setupEmployeesTable(&db);
+
+    // Order by COUNT(*) descending - both departments have 2 employees, but let's add more data
+    _ = try db.execute("INSERT INTO employees VALUES (5, 'Eve', 'Engineering')");
+    _ = try db.execute("INSERT INTO employees VALUES (6, 'Frank', 'HR')");
+
+    var result = try db.execute("SELECT department, COUNT(*) FROM employees GROUP BY department ORDER BY COUNT(*) DESC");
+    defer result.deinit();
+
+    try expect(result.rows.items.len == 3);
+
+    // Engineering should be first (3 employees), then Sales (2), then HR (1)
+    try expect(std.mem.eql(u8, result.rows.items[0].items[0].text, "Engineering"));
+    try expectEqual(@as(i64, 3), result.rows.items[0].items[1].int);
+
+    try expect(std.mem.eql(u8, result.rows.items[1].items[0].text, "Sales"));
+    try expectEqual(@as(i64, 2), result.rows.items[1].items[1].int);
+
+    try expect(std.mem.eql(u8, result.rows.items[2].items[0].text, "HR"));
+    try expectEqual(@as(i64, 1), result.rows.items[2].items[1].int);
+}
+
+test "GROUP BY: with ORDER BY grouped column ASC" {
+    var db = Database.init(std.testing.allocator);
+    defer db.deinit();
+
+    try setupEmployeesTable(&db);
+
+    var result = try db.execute("SELECT department, COUNT(*) FROM employees GROUP BY department ORDER BY department ASC");
+    defer result.deinit();
+
+    try expect(result.rows.items.len == 2);
+
+    // Alphabetically: Engineering, Sales
+    try expect(std.mem.eql(u8, result.rows.items[0].items[0].text, "Engineering"));
+    try expect(std.mem.eql(u8, result.rows.items[1].items[0].text, "Sales"));
+}
+
+test "GROUP BY: with ORDER BY SUM DESC" {
+    var db = Database.init(std.testing.allocator);
+    defer db.deinit();
+
+    try setupSalesTable(&db);
+
+    var result = try db.execute("SELECT product, SUM(amount) FROM sales GROUP BY product ORDER BY SUM(amount) DESC");
+    defer result.deinit();
+
+    try expect(result.rows.items.len == 2);
+
+    // Gadget has higher sum (450.0) than Widget (250.0)
+    try expect(std.mem.eql(u8, result.rows.items[0].items[0].text, "Gadget"));
+    try expect(@abs(result.rows.items[0].items[1].float - 450.0) < 0.01);
+
+    try expect(std.mem.eql(u8, result.rows.items[1].items[0].text, "Widget"));
+    try expect(@abs(result.rows.items[1].items[1].float - 250.0) < 0.01);
+}
+
+test "GROUP BY: with ORDER BY and LIMIT" {
+    var db = Database.init(std.testing.allocator);
+    defer db.deinit();
+
+    try setupSalesTable(&db);
+
+    // Get top 1 product by total sales
+    var result = try db.execute("SELECT product, SUM(amount) FROM sales GROUP BY product ORDER BY SUM(amount) DESC LIMIT 1");
+    defer result.deinit();
+
+    try expect(result.rows.items.len == 1);
+    try expect(std.mem.eql(u8, result.rows.items[0].items[0].text, "Gadget"));
+    try expect(@abs(result.rows.items[0].items[1].float - 450.0) < 0.01);
+}
+
+// ============================================================================
+// HAVING Clause Tests (Phase 3.3)
+// ============================================================================
+
+test "GROUP BY: with HAVING COUNT filter" {
+    var db = Database.init(std.testing.allocator);
+    defer db.deinit();
+
+    try setupEmployeesTable(&db);
+    _ = try db.execute("INSERT INTO employees VALUES (5, 'Eve', 'Engineering')");
+    _ = try db.execute("INSERT INTO employees VALUES (6, 'Frank', 'HR')");
+
+    // Only departments with more than 1 employee
+    var result = try db.execute("SELECT department, COUNT(*) FROM employees GROUP BY department HAVING COUNT(*) > 1");
+    defer result.deinit();
+
+    // Should have 2 departments: Engineering (3) and Sales (2), but not HR (1)
+    try expect(result.rows.items.len == 2);
+
+    var found_engineering = false;
+    var found_sales = false;
+
+    for (result.rows.items) |row| {
+        if (std.mem.eql(u8, row.items[0].text, "Engineering")) {
+            found_engineering = true;
+            try expectEqual(@as(i64, 3), row.items[1].int);
+        } else if (std.mem.eql(u8, row.items[0].text, "Sales")) {
+            found_sales = true;
+            try expectEqual(@as(i64, 2), row.items[1].int);
+        }
+    }
+
+    try expect(found_engineering);
+    try expect(found_sales);
+}
+
+test "GROUP BY: with HAVING SUM filter" {
+    var db = Database.init(std.testing.allocator);
+    defer db.deinit();
+
+    try setupSalesTable(&db);
+
+    // Only products with total sales > 300
+    var result = try db.execute("SELECT product, SUM(amount) FROM sales GROUP BY product HAVING SUM(amount) > 300.0");
+    defer result.deinit();
+
+    // Only Gadget (450.0) passes, Widget (250.0) doesn't
+    try expect(result.rows.items.len == 1);
+    try expect(std.mem.eql(u8, result.rows.items[0].items[0].text, "Gadget"));
+    try expect(@abs(result.rows.items[0].items[1].float - 450.0) < 0.01);
+}
+
+test "GROUP BY: with HAVING AVG filter" {
+    var db = Database.init(std.testing.allocator);
+    defer db.deinit();
+
+    try setupScoresTable(&db);
+
+    // Only players with average score > 85
+    var result = try db.execute("SELECT player, AVG(score) FROM scores GROUP BY player HAVING AVG(score) > 85.0");
+    defer result.deinit();
+
+    // Bob's average: (92+88)/2 = 90 (passes)
+    // Alice's average: (85+78+95)/3 = 86 (passes)
+    try expect(result.rows.items.len == 2);
+}
+
+test "GROUP BY: with HAVING and WHERE" {
+    var db = Database.init(std.testing.allocator);
+    defer db.deinit();
+
+    try setupOrdersTable(&db);
+
+    // WHERE filters rows first, then GROUP BY, then HAVING filters groups
+    var result = try db.execute("SELECT customer, SUM(amount) FROM orders WHERE status = 'completed' GROUP BY customer HAVING SUM(amount) > 200.0");
+    defer result.deinit();
+
+    // Only Alice (100+150=250) passes, Bob (200) doesn't
+    try expect(result.rows.items.len == 1);
+    try expect(std.mem.eql(u8, result.rows.items[0].items[0].text, "Alice"));
+    try expect(@abs(result.rows.items[0].items[1].float - 250.0) < 0.01);
+}
+
+test "GROUP BY: with HAVING, ORDER BY, and LIMIT" {
+    var db = Database.init(std.testing.allocator);
+    defer db.deinit();
+
+    try setupSalesTable(&db);
+    _ = try db.execute("INSERT INTO sales VALUES (5, 'Doohickey', 50.0)");
+    _ = try db.execute("INSERT INTO sales VALUES (6, 'Doohickey', 75.0)");
+
+    // HAVING filters, then ORDER BY sorts, then LIMIT restricts
+    var result = try db.execute("SELECT product, SUM(amount) FROM sales GROUP BY product HAVING SUM(amount) > 100.0 ORDER BY SUM(amount) DESC LIMIT 2");
+    defer result.deinit();
+
+    // Three products pass HAVING: Gadget (450), Widget (250), Doohickey (125)
+    // Top 2 by sum: Gadget, Widget
+    try expect(result.rows.items.len == 2);
+    try expect(std.mem.eql(u8, result.rows.items[0].items[0].text, "Gadget"));
+    try expect(std.mem.eql(u8, result.rows.items[1].items[0].text, "Widget"));
+}
+
+test "GROUP BY: error on HAVING without GROUP BY" {
+    var db = Database.init(std.testing.allocator);
+    defer db.deinit();
+
+    try setupEmployeesTable(&db);
+
+    // HAVING requires GROUP BY
+    const result = db.execute("SELECT name FROM employees HAVING id > 1");
+    try expectError(error.HavingWithoutGroupBy, result);
+}

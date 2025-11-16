@@ -22,6 +22,7 @@ pub const SqlError = error{
     TypeMismatch,
     InvalidCharacter,
     Overflow,
+    HavingWithoutGroupBy,  // HAVING used without GROUP BY
 };
 
 /// ORDER BY direction
@@ -156,6 +157,7 @@ pub const SelectCmd = struct {
     order_by_vibes: bool, // Fun parody feature!
     order_by: ?OrderByClause, // Generic ORDER BY clause
     group_by: ArrayList([]const u8), // GROUP BY columns
+    having_expr: ?Expr,  // HAVING clause for filtering grouped results
     limit: ?usize,
 
     pub fn deinit(self: *SelectCmd, allocator: Allocator) void {
@@ -194,6 +196,12 @@ pub const SelectCmd = struct {
             allocator.free(col);
         }
         self.group_by.deinit();
+
+        // Free HAVING expression
+        if (self.having_expr) |*expr| {
+            var e = expr.*;
+            e.deinit(allocator);
+        }
     }
 };
 
@@ -737,6 +745,7 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
     var order_by_vibes = false;
     var order_by: ?OrderByClause = null;
     var group_by = ArrayList([]const u8).init(allocator);
+    var having_expr: ?Expr = null;
     var limit: ?usize = null;
 
     // Parse JOINs (before WHERE, GROUP BY, ORDER BY, LIMIT)
@@ -859,7 +868,8 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
 
             // Parse comma-separated list of columns
             while (i < tokens.len) {
-                if (eqlIgnoreCase(tokens[i].text, "ORDER") or
+                if (eqlIgnoreCase(tokens[i].text, "HAVING") or
+                    eqlIgnoreCase(tokens[i].text, "ORDER") or
                     eqlIgnoreCase(tokens[i].text, "LIMIT"))
                 {
                     break;
@@ -870,6 +880,10 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
                 }
                 i += 1;
             }
+        } else if (eqlIgnoreCase(tokens[i].text, "HAVING")) {
+            const having_result = try parseHaving(allocator, tokens, i);
+            having_expr = having_result.expr;
+            i = having_result.next_idx;
         } else if (eqlIgnoreCase(tokens[i].text, "ORDER")) {
             const order_start = i; // Save starting position
             i += 1;
@@ -907,7 +921,8 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
         }
     }
 
-    return SelectCmd{
+    // Build the SelectCmd
+    var cmd = SelectCmd{
         .table_name = table_name,
         .columns = columns,
         .joins = joins,
@@ -920,8 +935,18 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
         .order_by_vibes = order_by_vibes,
         .order_by = order_by,
         .group_by = group_by,
+        .having_expr = having_expr,
         .limit = limit,
     };
+
+    // Validate HAVING only used with GROUP BY
+    if (cmd.having_expr != null and cmd.group_by.items.len == 0) {
+        // Clean up before returning error
+        cmd.deinit(allocator);
+        return error.HavingWithoutGroupBy;
+    }
+
+    return cmd;
 }
 
 fn parseDelete(allocator: Allocator, tokens: []const Token) !DeleteCmd {
@@ -1599,5 +1624,36 @@ fn parseOrderBy(allocator: Allocator, tokens: []const Token, start_idx: usize) !
     return .{
         .clause = OrderByClause{ .items = items },
         .next_idx = idx,
+    };
+}
+
+/// Parse HAVING clause (similar to WHERE but for GROUP BY results)
+fn parseHaving(allocator: Allocator, tokens: []const Token, start_idx: usize) !struct { expr: Expr, next_idx: usize } {
+    var idx = start_idx;
+
+    // Expect "HAVING"
+    if (idx >= tokens.len or !eqlIgnoreCase(tokens[idx].text, "HAVING")) {
+        return error.InvalidSyntax;
+    }
+    idx += 1;
+
+    // Find end of HAVING clause (before ORDER BY or LIMIT)
+    var having_end = idx;
+    while (having_end < tokens.len) {
+        if (eqlIgnoreCase(tokens[having_end].text, "ORDER") or
+            eqlIgnoreCase(tokens[having_end].text, "LIMIT"))
+        {
+            break;
+        }
+        having_end += 1;
+    }
+
+    // Parse the condition expression (same as WHERE expressions)
+    var expr_idx = idx;
+    const expr = try parseExpr(allocator, tokens[0..having_end], &expr_idx);
+
+    return .{
+        .expr = expr,
+        .next_idx = having_end,
     };
 }

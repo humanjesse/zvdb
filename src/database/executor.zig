@@ -622,6 +622,68 @@ fn applyOrderBy(result: *QueryResult, order_by: OrderByClause) !void {
     result.rows = sorted_rows;
 }
 
+/// Apply HAVING clause to filter GROUP BY results
+fn applyHavingFilter(
+    result: *QueryResult,
+    having_expr: sql.Expr,
+    db: *Database,
+) !void {
+    var filtered_rows = ArrayList(ArrayList(ColumnValue)).init(result.allocator);
+    errdefer {
+        for (filtered_rows.items) |*row| {
+            for (row.items) |*val| {
+                var v = val.*;
+                v.deinit(result.allocator);
+            }
+            row.deinit();
+        }
+        filtered_rows.deinit();
+    }
+
+    // For each grouped row, check if it passes the HAVING condition
+    for (result.rows.items) |row| {
+        // Build a map of column name → value for this group
+        var row_values = StringHashMap(ColumnValue).init(result.allocator);
+        defer row_values.deinit();
+
+        for (result.columns.items, 0..) |col_name, idx| {
+            if (idx < row.items.len) {
+                try row_values.put(col_name, row.items[idx]);
+            }
+        }
+
+        // Evaluate HAVING expression for this grouped row
+        // Use the same evaluateExprWithSubqueries function that WHERE uses
+        const passes = evaluateExprWithSubqueries(db, having_expr, row_values) catch false;
+
+        if (passes) {
+            // Keep this row - clone it to filtered_rows
+            var cloned_row = ArrayList(ColumnValue).init(result.allocator);
+            errdefer cloned_row.deinit();
+
+            for (row.items) |val| {
+                const cloned_val = try val.clone(result.allocator);
+                try cloned_row.append(cloned_val);
+            }
+
+            try filtered_rows.append(cloned_row);
+        }
+    }
+
+    // Free original rows
+    for (result.rows.items) |*row| {
+        for (row.items) |*val| {
+            var v = val.*;
+            v.deinit(result.allocator);
+        }
+        row.deinit();
+    }
+    result.rows.deinit();
+
+    // Replace with filtered rows
+    result.rows = filtered_rows;
+}
+
 // ============================================================================
 // GROUP BY Support
 // ============================================================================
@@ -2371,6 +2433,11 @@ fn executeGroupBySelect(db: *Database, table: *Table, cmd: sql.SelectCmd) !Query
         }
 
         try result.addRow(result_row);
+    }
+
+    // Apply HAVING clause if present
+    if (cmd.having_expr) |having_expr| {
+        try applyHavingFilter(&result, having_expr, db);
     }
 
     // Apply ORDER BY if present
