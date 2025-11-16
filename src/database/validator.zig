@@ -391,8 +391,13 @@ pub fn validateExpression(
 
         .binary => |bin| {
             // Recursively validate both sides
-            try validateExpression(ctx, bin.left.*);
-            try validateExpression(ctx, bin.right.*);
+            try validateExpression(ctx, bin.left);
+            try validateExpression(ctx, bin.right);
+        },
+
+        .unary => |un| {
+            // Recursively validate the operand
+            try validateExpression(ctx, un.expr);
         },
 
         .subquery => {
@@ -415,35 +420,22 @@ pub fn validateSelectColumns(
     base_table: *Table,
     joined_tables: ?[]const *Table,
 ) ValidationError!void {
-    // Build column resolver if we have joins
-    var resolver_storage: ?ColumnResolver = null;
-    defer {
-        if (resolver_storage) |*r| r.deinit();
-    }
+    // Build column resolver - always needed for validation
+    var resolver = try ColumnResolver.init(allocator, base_table);
+    defer resolver.deinit();
 
-    var resolver_ptr: ?*ColumnResolver = null;
-
+    // Add joined tables if present
     if (joined_tables) |tables| {
-        if (tables.len > 0) {
-            // Initialize resolver with base table
-            var resolver = try ColumnResolver.init(allocator, base_table);
-            errdefer resolver.deinit();
-
-            // Add joined tables
-            for (tables) |table| {
-                try resolver.addJoinedTable(table);
-            }
-
-            resolver_storage = resolver;
-            resolver_ptr = &resolver_storage.?;
+        for (tables) |table| {
+            try resolver.addJoinedTable(table);
         }
     }
 
     // Create validation context
     var ctx = ValidationContext.init(allocator, .select);
     defer ctx.deinit();
-    ctx.resolver = resolver_ptr;
-    ctx.has_group_by = cmd.group_by_column != null;
+    ctx.resolver = &resolver;
+    ctx.has_group_by = cmd.group_by.items.len > 0;
 
     // Validate each selected column
     for (cmd.columns.items) |col_spec| {
@@ -468,7 +460,7 @@ pub fn validateSelectColumns(
     if (cmd.where_expr) |expr| {
         var where_ctx = ValidationContext.init(allocator, .where);
         defer where_ctx.deinit();
-        where_ctx.resolver = resolver_ptr;
+        where_ctx.resolver = &resolver;
 
         try validateExpression(&where_ctx, expr);
     }
@@ -477,20 +469,25 @@ pub fn validateSelectColumns(
     if (cmd.having_expr) |expr| {
         var having_ctx = ValidationContext.init(allocator, .having);
         defer having_ctx.deinit();
-        having_ctx.resolver = resolver_ptr;
+        having_ctx.resolver = &resolver;
 
         try validateExpression(&having_ctx, expr);
     }
 
     // Validate ORDER BY clause if present
-    if (cmd.order_by) |order_by_list| {
+    if (cmd.order_by) |order_by_clause| {
         var order_ctx = ValidationContext.init(allocator, .order_by);
         defer order_ctx.deinit();
-        order_ctx.resolver = resolver_ptr;
+        order_ctx.resolver = &resolver;
         order_ctx.has_group_by = ctx.has_group_by;
 
-        for (order_by_list.items) |order_clause| {
-            try validateColumnReference(&order_ctx, order_clause.column);
+        for (order_by_clause.items.items) |order_item| {
+            // Skip validation for aggregate functions (e.g., "COUNT(*)", "SUM(amount)")
+            // These are validated separately against the SELECT clause in GROUP BY queries
+            const is_aggregate_expr = std.mem.indexOf(u8, order_item.column, "(") != null;
+            if (!is_aggregate_expr) {
+                try validateColumnReference(&order_ctx, order_item.column);
+            }
         }
     }
 }

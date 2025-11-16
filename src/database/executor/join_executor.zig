@@ -570,6 +570,7 @@ pub fn executeJoinSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
 /// Optimized path for 2-table joins (base table + 1 join)
 fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !QueryResult {
     var result = QueryResult.init(db.allocator);
+    errdefer result.deinit();
 
     // Phase 3: Get MVCC context for snapshot isolation
     const snapshot = db.getCurrentSnapshot();

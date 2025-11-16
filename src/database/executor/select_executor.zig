@@ -28,6 +28,10 @@ pub fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
 
     const table = db.tables.get(cmd.table_name) orelse return sql.SqlError.TableNotFound;
 
+    // Validate column names before execution
+    const validator = @import("../validator.zig");
+    try validator.validateSelectColumns(db.allocator, &cmd, table, null);
+
     // Check if this is an aggregate query
     var has_aggregates = false;
     var has_regular_columns = false;
@@ -61,6 +65,7 @@ pub fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
 
     // Regular SELECT (non-aggregate)
     var result = QueryResult.init(db.allocator);
+    errdefer result.deinit();
 
     // Determine which columns to select
     select_all = select_all or cmd.columns.items.len == 0;

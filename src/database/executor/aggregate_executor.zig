@@ -296,6 +296,7 @@ pub fn applyHavingFilter(
 /// Execute SELECT with aggregates but no GROUP BY
 pub fn executeAggregateSelect(db: *Database, table: *Table, cmd: sql.SelectCmd) !QueryResult {
     var result = QueryResult.init(db.allocator);
+    errdefer result.deinit();
 
     // Initialize aggregate states
     var agg_states = ArrayList(AggregateState).init(db.allocator);
