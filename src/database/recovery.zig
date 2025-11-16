@@ -87,8 +87,8 @@ pub fn writeWalRecord(
 ) !u64 {
     const w = db.wal orelse return error.WalNotEnabled;
 
-    // Get transaction ID and increment atomically
-    const tx_id = db.current_tx_id.fetchAdd(1, .monotonic);
+    // Get transaction ID and increment atomically from TransactionManager (single source of truth)
+    const tx_id = db.tx_manager.next_tx_id.fetchAdd(1, .monotonic);
 
     // Create WAL record (writeRecord makes its own copy of table_name and data)
     const table_name_owned = try db.allocator.dupe(u8, table_name);
@@ -330,9 +330,9 @@ pub fn recoverFromWal(db: *Database, wal_dir: []const u8) !usize {
         std.debug.print("WAL Recovery complete: {} transactions, {} operations applied\n", .{ recovered_count, applied_operations });
     }
 
-    // Update current_tx_id to prevent ID reuse in future transactions
+    // Update TransactionManager to prevent ID reuse in future transactions
     if (max_tx_id > 0) {
-        db.current_tx_id.store(max_tx_id + 1, .monotonic);
+        db.tx_manager.next_tx_id.store(max_tx_id + 1, .monotonic);
     }
 
     return recovered_count;

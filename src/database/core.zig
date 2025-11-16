@@ -86,8 +86,7 @@ pub const Database = struct {
     data_dir: ?[]const u8, // Data directory for persistence (owned)
     auto_save: bool, // Auto-save on deinit
     wal: ?*WalWriter, // Write-Ahead Log for durability (optional)
-    current_tx_id: std.atomic.Value(u64), // Atomic transaction ID counter (thread-safe for MVCC)
-    tx_manager: TransactionManager, // Transaction manager for BEGIN/COMMIT/ROLLBACK
+    tx_manager: TransactionManager, // Transaction manager (single source of truth for all transaction IDs)
 
     pub fn init(allocator: Allocator) Database {
         return Database{
@@ -98,7 +97,6 @@ pub const Database = struct {
             .data_dir = null,
             .auto_save = false,
             .wal = null,
-            .current_tx_id = std.atomic.Value(u64).init(0),
             .tx_manager = TransactionManager.init(allocator),
         };
     }

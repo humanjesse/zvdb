@@ -1104,23 +1104,23 @@ test "WAL: Transaction ID increments" {
     var create_result = try db.execute("CREATE TABLE test (id int, value int)");
     defer create_result.deinit();
 
-    // Transaction ID should start at 0
-    try testing.expect(db.current_tx_id.load(.monotonic) == 0);
+    // Transaction ID should start at 1 (TransactionManager initializes to 1)
+    try testing.expect(db.tx_manager.next_tx_id.load(.monotonic) == 1);
 
-    // Perform INSERT - should increment tx_id
+    // Perform INSERT - should increment tx_id (WAL write gets ID 1, counter becomes 2)
     var insert1 = try db.execute("INSERT INTO test VALUES (1, 100)");
     defer insert1.deinit();
-    try testing.expect(db.current_tx_id.load(.monotonic) == 1);
+    try testing.expect(db.tx_manager.next_tx_id.load(.monotonic) == 2);
 
-    // Perform UPDATE - should increment tx_id again
+    // Perform UPDATE - should increment tx_id again (WAL write gets ID 2, counter becomes 3)
     var update1 = try db.execute("UPDATE test SET value = 200 WHERE id = 1");
     defer update1.deinit();
-    try testing.expect(db.current_tx_id.load(.monotonic) == 2);
+    try testing.expect(db.tx_manager.next_tx_id.load(.monotonic) == 3);
 
-    // Perform DELETE - should increment tx_id again
+    // Perform DELETE - should increment tx_id again (WAL write gets ID 3, counter becomes 4)
     var delete1 = try db.execute("DELETE FROM test WHERE id = 1");
     defer delete1.deinit();
-    try testing.expect(db.current_tx_id.load(.monotonic) == 3);
+    try testing.expect(db.tx_manager.next_tx_id.load(.monotonic) == 4);
 }
 
 test "WAL: Database works without WAL (optional)" {
@@ -1270,8 +1270,8 @@ test "WAL: Multiple embedding insertions with WAL" {
 
     // Verify transaction IDs incremented for each insert
     // Since we have WAL enabled, each INSERT command incremented the tx_id
-    // We inserted 5 rows, so tx_id should now be 5 (started at 0)
-    try testing.expect(db.current_tx_id.load(.monotonic) == 5);
+    // We inserted 5 rows, so tx_id should now be 6 (started at 1, each insert consumed one ID)
+    try testing.expect(db.tx_manager.next_tx_id.load(.monotonic) == 6);
 
     // Verify HNSW has all vectors
     for (1..6) |row_num| {
