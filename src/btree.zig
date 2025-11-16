@@ -443,6 +443,18 @@ pub const BTree = struct {
                 removed_key.deinit(node.allocator);
                 _ = node.values.orderedRemove(i);
                 return true;
+            } else if (cmp == .eq and !node.is_leaf) {
+                // Matching separator in internal node - search left child first
+                // (In B+ tree style, the separator key is duplicated in the right subtree)
+                if (i < node.children.items.len) {
+                    const found = try self.deleteFromNode(node.children.items[i].?, key, row_id);
+                    if (found) return true;
+                }
+                // Also search right child as the key might be there too
+                if (i + 1 < node.children.items.len) {
+                    return try self.deleteFromNode(node.children.items[i + 1].?, key, row_id);
+                }
+                return false;
             } else if (cmp == .lt) {
                 // Key would be in left child
                 if (!node.is_leaf and i < node.children.items.len) {
@@ -651,4 +663,38 @@ test "BTree: delete operation" {
     const results2 = try tree.search(ColumnValue{ .int = 10 });
     defer testing.allocator.free(results2);
     try testing.expectEqual(@as(usize, 1), results2.len);
+}
+
+test "BTree: delete from tree with splits" {
+    var tree = BTree.init(testing.allocator);
+    defer tree.deinit();
+
+    // Insert enough values to trigger splits (MAX_KEYS = 31)
+    var i: u64 = 0;
+    while (i < 100) : (i += 1) {
+        try tree.insert(ColumnValue{ .int = @intCast(i) }, i * 10);
+    }
+
+    try testing.expectEqual(@as(usize, 100), tree.getSize());
+
+    // Delete a key from the middle (which should be in an internal node)
+    const deleted = try tree.delete(ColumnValue{ .int = 50 }, 500);
+    try testing.expect(deleted);
+    try testing.expectEqual(@as(usize, 99), tree.getSize());
+
+    // Verify it's gone
+    const results = try tree.search(ColumnValue{ .int = 50 });
+    defer testing.allocator.free(results);
+    try testing.expectEqual(@as(usize, 0), results.len);
+
+    // Verify other keys still exist
+    const results2 = try tree.search(ColumnValue{ .int = 49 });
+    defer testing.allocator.free(results2);
+    try testing.expectEqual(@as(usize, 1), results2.len);
+    try testing.expectEqual(@as(u64, 490), results2[0]);
+
+    const results3 = try tree.search(ColumnValue{ .int = 51 });
+    defer testing.allocator.free(results3);
+    try testing.expectEqual(@as(usize, 1), results3.len);
+    try testing.expectEqual(@as(u64, 510), results3[0]);
 }

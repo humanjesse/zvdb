@@ -551,6 +551,51 @@ pub const Table = struct {
         // Don't physically remove - old snapshots may still need to see it!
     }
 
+    /// Physically delete a row and its entire version chain from the table
+    /// This is used during transaction rollback to clean up rows that were inserted
+    /// within a transaction that is being aborted. Unlike the regular delete(),
+    /// this completely removes the row from memory.
+    /// WARNING: Only use this during rollback - normal deletes should use delete()
+    pub fn physicalDelete(self: *Table, id: u64) !void {
+        const chain_head = self.version_chains.get(id) orelse return error.RowNotFound;
+
+        // Remove from version chains map
+        _ = self.version_chains.remove(id);
+
+        // Free the entire version chain
+        chain_head.deinitChain(self.allocator);
+    }
+
+    /// Undelete a row by clearing its xmax field
+    /// This is used during transaction rollback to restore rows that were deleted
+    /// within a transaction that is being aborted. Unlike insertWithId(),
+    /// this doesn't create a new RowVersion but just marks the existing one as not deleted.
+    /// WARNING: Only use this during rollback - normal operations should not call this
+    pub fn undelete(self: *Table, id: u64) !void {
+        const chain_head = self.version_chains.get(id) orelse return error.RowNotFound;
+
+        // Clear the deletion marker (xmax = 0 means "not deleted")
+        chain_head.xmax = 0;
+    }
+
+    /// Undo an update by removing the newest version and restoring the previous one
+    /// This is used during transaction rollback to undo UPDATE operations.
+    /// It removes the new RowVersion created by the update and makes the old version current again.
+    /// WARNING: Only use this during rollback - assumes the chain has at least 2 versions
+    pub fn undoUpdate(self: *Table, id: u64) !void {
+        const new_version = self.version_chains.get(id) orelse return error.RowNotFound;
+        const old_version = new_version.next orelse return error.InvalidVersionChain;
+
+        // Clear the old version's xmax (it's no longer superseded)
+        old_version.xmax = 0;
+
+        // Make the old version the chain head again
+        try self.version_chains.put(id, old_version);
+
+        // Free the new version (but don't follow the chain - old_version is still valid)
+        new_version.deinit(self.allocator);
+    }
+
     /// Update a row by creating a new version (MVCC-enabled)
     /// Creates a new version with the updated value and chains it to the old version
     pub fn update(self: *Table, row_id: u64, column: []const u8, new_value: ColumnValue, tx_id: u64) !void {
