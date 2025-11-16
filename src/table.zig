@@ -80,6 +80,7 @@ pub const ColumnType = enum {
 pub const Column = struct {
     name: []const u8,
     col_type: ColumnType,
+    embedding_dim: ?usize, // Dimension for embedding columns (null for non-embedding types)
 
     pub fn init(allocator: Allocator, name: []const u8, col_type: ColumnType) !Column {
         const owned_name = try allocator.alloc(u8, name.len);
@@ -87,6 +88,17 @@ pub const Column = struct {
         return Column{
             .name = owned_name,
             .col_type = col_type,
+            .embedding_dim = if (col_type == .embedding) 768 else null, // Default to 768 for backward compatibility
+        };
+    }
+
+    pub fn initWithDim(allocator: Allocator, name: []const u8, col_type: ColumnType, dim: ?usize) !Column {
+        const owned_name = try allocator.alloc(u8, name.len);
+        @memcpy(owned_name, name);
+        return Column{
+            .name = owned_name,
+            .col_type = col_type,
+            .embedding_dim = dim,
         };
     }
 
