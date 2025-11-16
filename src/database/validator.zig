@@ -533,14 +533,25 @@ pub fn validateInsert(
     var result = ValidationResult.init(allocator);
     errdefer result.deinit();
 
-    // Check for empty column list
+    // When no columns specified, INSERT uses all table columns in order
+    // Example: INSERT INTO users VALUES (1, 'Alice')
     if (cmd.columns.items.len == 0) {
-        try result.addError(
-            ValidationError.InvalidExpression,
-            null,
-            "INSERT command must specify at least one column",
-            "Try: INSERT INTO table_name (col1, col2) VALUES (val1, val2)",
-        );
+        // Validate value count matches table column count
+        if (cmd.values.items.len != table.columns.items.len) {
+            const msg = try std.fmt.allocPrint(
+                allocator,
+                "INSERT has {d} values but table \"{s}\" has {d} columns",
+                .{ cmd.values.items.len, table.name, table.columns.items.len },
+            );
+            defer allocator.free(msg);
+
+            try result.addError(
+                ValidationError.InvalidExpression,
+                null,
+                msg,
+                "Either specify column names or provide values for all columns",
+            );
+        }
         return result;
     }
 
@@ -818,15 +829,15 @@ pub fn levenshteinDistance(a: []const u8, b: []const u8) usize {
     const rows = a.len + 1;
     const cols = b.len + 1;
 
-    // Use stack allocation for small strings, heap for large ones
-    var matrix_buffer: [256]usize = undefined;
-    const use_stack = rows * cols <= 256;
+    // For very long strings, return maximum distance (sum of lengths)
+    // to avoid buffer overflow. These won't match anyway for fuzzy matching.
+    if (rows * cols > 256) {
+        return a.len + b.len;
+    }
 
-    var matrix_slice = if (use_stack)
-        matrix_buffer[0..rows * cols]
-    else
-        // For large strings, we'd need heap allocation, but for now just use truncated stack
-        matrix_buffer[0..256];
+    // Use stack allocation for small strings
+    var matrix_buffer: [256]usize = undefined;
+    var matrix_slice = matrix_buffer[0..rows * cols];
 
     // Initialize first row and column
     for (0..rows) |i| {
@@ -860,6 +871,7 @@ pub fn findSimilarColumn(
     max_distance: usize,
 ) ?[]const u8 {
     if (haystack.len == 0) return null;
+    if (needle.len == 0) return null; // Empty search string shouldn't match anything
 
     var best_match: ?[]const u8 = null;
     var best_distance: usize = max_distance + 1;
@@ -1318,12 +1330,12 @@ test "levenshteinDistance: single character difference" {
 
 test "levenshteinDistance: multiple differences" {
     try testing.expectEqual(@as(usize, 3), levenshteinDistance("kitten", "sitting")); // classic example
-    try testing.expectEqual(@as(usize, 2), levenshteinDistance("user_name", "username")); // underscore removed
+    try testing.expectEqual(@as(usize, 1), levenshteinDistance("user_name", "username")); // underscore removed = 1 deletion
 }
 
 test "levenshteinDistance: typos" {
-    try testing.expectEqual(@as(usize, 1), levenshteinDistance("name", "nmae")); // transposition (counted as 2 in basic LD)
-    try testing.expectEqual(@as(usize, 2), levenshteinDistance("email", "emial")); // transposition
+    try testing.expectEqual(@as(usize, 2), levenshteinDistance("name", "nmae")); // transposition = 2 substitutions in basic LD
+    try testing.expectEqual(@as(usize, 2), levenshteinDistance("email", "emial")); // transposition = 2 substitutions
 }
 
 test "findSimilarColumn: exact match within threshold" {

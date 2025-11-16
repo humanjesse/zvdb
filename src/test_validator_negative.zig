@@ -576,14 +576,16 @@ test "validateUpdate: single duplicate assignment" {
 
     const col1 = try testing.allocator.dupe(u8, "name");
     const col2 = try testing.allocator.dupe(u8, "name"); // Duplicate
+    const val1 = try testing.allocator.dupe(u8, "Alice");
+    const val2 = try testing.allocator.dupe(u8, "Bob");
 
     try assignments.append(sql.Assignment{
         .column = col1,
-        .value = ColumnValue{ .text = "Alice" },
+        .value = ColumnValue{ .text = val1 },
     });
     try assignments.append(sql.Assignment{
         .column = col2,
-        .value = ColumnValue{ .text = "Bob" },
+        .value = ColumnValue{ .text = val2 },
     });
 
     const update_cmd = sql.UpdateCmd{
@@ -618,11 +620,15 @@ test "validateUpdate: multiple duplicate assignments" {
     const col2 = try testing.allocator.dupe(u8, "name"); // Duplicate
     const col3 = try testing.allocator.dupe(u8, "email");
     const col4 = try testing.allocator.dupe(u8, "email"); // Duplicate
+    const val1 = try testing.allocator.dupe(u8, "A");
+    const val2 = try testing.allocator.dupe(u8, "B");
+    const val3 = try testing.allocator.dupe(u8, "C");
+    const val4 = try testing.allocator.dupe(u8, "D");
 
-    try assignments.append(sql.Assignment{ .column = col1, .value = ColumnValue{ .text = "A" } });
-    try assignments.append(sql.Assignment{ .column = col2, .value = ColumnValue{ .text = "B" } });
-    try assignments.append(sql.Assignment{ .column = col3, .value = ColumnValue{ .text = "C" } });
-    try assignments.append(sql.Assignment{ .column = col4, .value = ColumnValue{ .text = "D" } });
+    try assignments.append(sql.Assignment{ .column = col1, .value = ColumnValue{ .text = val1 } });
+    try assignments.append(sql.Assignment{ .column = col2, .value = ColumnValue{ .text = val2 } });
+    try assignments.append(sql.Assignment{ .column = col3, .value = ColumnValue{ .text = val3 } });
+    try assignments.append(sql.Assignment{ .column = col4, .value = ColumnValue{ .text = val4 } });
 
     const update_cmd = sql.UpdateCmd{
         .table_name = "users",
@@ -652,9 +658,10 @@ test "validateUpdate: assignment with case mismatch" {
     }
 
     const col = try testing.allocator.dupe(u8, "NAME"); // Should be "name"
+    const val = try testing.allocator.dupe(u8, "Alice");
     try assignments.append(sql.Assignment{
         .column = col,
-        .value = ColumnValue{ .text = "Alice" },
+        .value = ColumnValue{ .text = val },
     });
 
     const update_cmd = sql.UpdateCmd{
@@ -720,9 +727,10 @@ test "validateUpdate: assignment with whitespace column" {
     }
 
     const col = try testing.allocator.dupe(u8, " name ");
+    const val = try testing.allocator.dupe(u8, "Alice");
     try assignments.append(sql.Assignment{
         .column = col,
-        .value = ColumnValue{ .text = "Alice" },
+        .value = ColumnValue{ .text = val },
     });
 
     const update_cmd = sql.UpdateCmd{
@@ -825,8 +833,9 @@ test "validateUpdate: mixed valid and invalid assignments" {
     const col2 = try testing.allocator.dupe(u8, "invalid1"); // Invalid
     const col3 = try testing.allocator.dupe(u8, "age"); // Valid
     const col4 = try testing.allocator.dupe(u8, "invalid2"); // Invalid
+    const val1 = try testing.allocator.dupe(u8, "A");
 
-    try assignments.append(sql.Assignment{ .column = col1, .value = ColumnValue{ .text = "A" } });
+    try assignments.append(sql.Assignment{ .column = col1, .value = ColumnValue{ .text = val1 } });
     try assignments.append(sql.Assignment{ .column = col2, .value = ColumnValue{ .int = 1 } });
     try assignments.append(sql.Assignment{ .column = col3, .value = ColumnValue{ .int = 25 } });
     try assignments.append(sql.Assignment{ .column = col4, .value = ColumnValue{ .int = 2 } });
@@ -928,10 +937,13 @@ test "validateUpdate: assignment triple duplicate" {
     const col1 = try testing.allocator.dupe(u8, "name");
     const col2 = try testing.allocator.dupe(u8, "name");
     const col3 = try testing.allocator.dupe(u8, "name");
+    const val1 = try testing.allocator.dupe(u8, "A");
+    const val2 = try testing.allocator.dupe(u8, "B");
+    const val3 = try testing.allocator.dupe(u8, "C");
 
-    try assignments.append(sql.Assignment{ .column = col1, .value = ColumnValue{ .text = "A" } });
-    try assignments.append(sql.Assignment{ .column = col2, .value = ColumnValue{ .text = "B" } });
-    try assignments.append(sql.Assignment{ .column = col3, .value = ColumnValue{ .text = "C" } });
+    try assignments.append(sql.Assignment{ .column = col1, .value = ColumnValue{ .text = val1 } });
+    try assignments.append(sql.Assignment{ .column = col2, .value = ColumnValue{ .text = val2 } });
+    try assignments.append(sql.Assignment{ .column = col3, .value = ColumnValue{ .text = val3 } });
 
     const update_cmd = sql.UpdateCmd{
         .table_name = "users",
@@ -1434,11 +1446,11 @@ test "validation mode: warnings mode logs but continues" {
         defer result.deinit();
     }
 
-    // Valid INSERT should succeed
+    // Valid INSERT should succeed and return row_id
     var result = try db.execute("INSERT INTO users (id, name) VALUES (1, 'Alice')");
     defer result.deinit();
 
-    try testing.expectEqual(@as(usize, 0), result.rows.items.len);
+    try testing.expectEqual(@as(usize, 1), result.rows.items.len);
 }
 
 // ============================================================================
@@ -1598,10 +1610,12 @@ test "complex: multiple errors in single UPDATE" {
     const col2 = try testing.allocator.dupe(u8, "name");
     const col3 = try testing.allocator.dupe(u8, "name"); // Duplicate
     const col4 = try testing.allocator.dupe(u8, "invalid2");
+    const val2 = try testing.allocator.dupe(u8, "A");
+    const val3 = try testing.allocator.dupe(u8, "B");
 
     try assignments.append(sql.Assignment{ .column = col1, .value = ColumnValue{ .int = 1 } });
-    try assignments.append(sql.Assignment{ .column = col2, .value = ColumnValue{ .text = "A" } });
-    try assignments.append(sql.Assignment{ .column = col3, .value = ColumnValue{ .text = "B" } });
+    try assignments.append(sql.Assignment{ .column = col2, .value = ColumnValue{ .text = val2 } });
+    try assignments.append(sql.Assignment{ .column = col3, .value = ColumnValue{ .text = val3 } });
     try assignments.append(sql.Assignment{ .column = col4, .value = ColumnValue{ .int = 2 } });
 
     const update_cmd = sql.UpdateCmd{

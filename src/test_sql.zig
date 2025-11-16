@@ -1009,7 +1009,8 @@ test "SQL: UPDATE error on non-existent column" {
     // Try to update non-existent column
     const result = db.execute("UPDATE users SET nonexistent = \"value\" WHERE id = 1");
 
-    try testing.expectError(error.ColumnNotFound, result);
+    // Validation now returns ValidationFailed instead of specific error types
+    try testing.expectError(error.ValidationFailed, result);
 }
 
 test "SQL: UPDATE with inequality operators" {
