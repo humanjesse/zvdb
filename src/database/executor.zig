@@ -69,6 +69,9 @@ pub fn execute(db: *Database, query: []const u8) !QueryResult {
         .begin => try transaction_executor.executeBegin(db),
         .commit => try transaction_executor.executeCommit(db),
         .rollback => try transaction_executor.executeRollback(db),
+
+        // Maintenance Commands
+        .vacuum => |vacuum| try command_executor.executeVacuum(db, vacuum),
     };
 }
 

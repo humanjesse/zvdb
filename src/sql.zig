@@ -66,6 +66,7 @@ pub const SqlCommand = union(enum) {
     begin: void,
     commit: void,
     rollback: void,
+    vacuum: VacuumCmd,
 
     pub fn deinit(self: *SqlCommand, allocator: Allocator) void {
         switch (self.*) {
@@ -79,6 +80,7 @@ pub const SqlCommand = union(enum) {
             .begin => {},
             .commit => {},
             .rollback => {},
+            .vacuum => |*cmd| cmd.deinit(allocator),
         }
     }
 };
@@ -122,6 +124,19 @@ pub const DropIndexCmd = struct {
 
     pub fn deinit(self: *DropIndexCmd, allocator: Allocator) void {
         allocator.free(self.index_name);
+    }
+};
+
+/// VACUUM command
+/// Cleans up old row versions to reclaim memory
+pub const VacuumCmd = struct {
+    /// Table name to vacuum (null = vacuum all tables)
+    table_name: ?[]const u8,
+
+    pub fn deinit(self: *VacuumCmd, allocator: Allocator) void {
+        if (self.table_name) |name| {
+            allocator.free(name);
+        }
     }
 };
 
@@ -548,6 +563,8 @@ pub fn parse(allocator: Allocator, sql: []const u8) !SqlCommand {
     } else if (eqlIgnoreCase(first, "ROLLBACK")) {
         // Support both "ROLLBACK" and "ROLLBACK TRANSACTION"
         return SqlCommand{ .rollback = {} };
+    } else if (eqlIgnoreCase(first, "VACUUM")) {
+        return SqlCommand{ .vacuum = try parseVacuum(allocator, tokens.items) };
     }
 
     return SqlError.UnknownCommand;
@@ -653,6 +670,26 @@ fn parseDropIndex(allocator: Allocator, tokens: []const Token) !DropIndexCmd {
     return DropIndexCmd{
         .index_name = index_name,
     };
+}
+
+fn parseVacuum(allocator: Allocator, tokens: []const Token) !VacuumCmd {
+    // VACUUM;              -> vacuum all tables
+    // VACUUM table_name;   -> vacuum specific table
+
+    if (tokens.len == 1) {
+        // VACUUM (all tables)
+        return VacuumCmd{
+            .table_name = null,
+        };
+    } else if (tokens.len == 2) {
+        // VACUUM table_name
+        const table_name = try allocator.dupe(u8, tokens[1].text);
+        return VacuumCmd{
+            .table_name = table_name,
+        };
+    }
+
+    return SqlError.InvalidSyntax;
 }
 
 fn parseInsert(allocator: Allocator, tokens: []const Token) !InsertCmd {

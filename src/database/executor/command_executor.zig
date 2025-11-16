@@ -372,6 +372,9 @@ pub fn executeDelete(db: *Database, cmd: sql.DeleteCmd) !QueryResult {
         }
     }
 
+    // Phase 4: Trigger auto-VACUUM after DELETE operations
+    db.maybeAutoVacuum();
+
     var result = QueryResult.init(db.allocator);
     try result.addColumn("deleted");
     var row = ArrayList(ColumnValue).init(db.allocator);
@@ -629,11 +632,101 @@ pub fn executeUpdate(db: *Database, cmd: sql.UpdateCmd) !QueryResult {
         updated_count += 1;
     }
 
+    // Phase 4: Trigger auto-VACUUM after UPDATE operations
+    db.maybeAutoVacuum();
+
     var result = QueryResult.init(db.allocator);
     try result.addColumn("updated");
     var row = ArrayList(ColumnValue).init(db.allocator);
     try row.append(ColumnValue{ .int = @intCast(updated_count) });
     try result.addRow(row);
+
+    return result;
+}
+
+// ============================================================================
+// Maintenance Commands - VACUUM
+// ============================================================================
+
+/// Execute VACUUM command
+/// Removes old row versions that are no longer visible to any transaction
+/// This frees up memory by cleaning up version chains
+///
+/// Supports:
+/// - VACUUM (all tables)
+/// - VACUUM table_name (specific table)
+pub fn executeVacuum(db: *Database, cmd: sql.VacuumCmd) !QueryResult {
+    var result = QueryResult.init(db.allocator);
+    errdefer result.deinit();
+
+    // Add result columns
+    try result.addColumn("table_name");
+    try result.addColumn("versions_removed");
+    try result.addColumn("total_chains");
+    try result.addColumn("total_versions");
+    try result.addColumn("max_chain_length");
+
+    // Get minimum visible transaction ID
+    // This is the oldest transaction that might still need to see old versions
+    const min_visible_txid = blk: {
+        // Get the minimum transaction ID from all active transactions
+        var min_txid: u64 = std.math.maxInt(u64);
+        var found_any = false;
+
+        db.tx_manager.mutex.lock();
+        defer db.tx_manager.mutex.unlock();
+
+        var it = db.tx_manager.active_txs.valueIterator();
+        while (it.next()) |tx_ptr| {
+            if (tx_ptr.*.id < min_txid) {
+                min_txid = tx_ptr.*.id;
+                found_any = true;
+            }
+        }
+
+        // If no active transactions, use next_tx_id (no one can see old versions)
+        if (!found_any) {
+            min_txid = db.tx_manager.next_tx_id.load(.monotonic);
+        }
+
+        break :blk min_txid;
+    };
+
+    if (cmd.table_name) |table_name| {
+        // VACUUM specific table
+        const table = db.tables.get(table_name) orelse return sql.SqlError.TableNotFound;
+
+        const stats = try table.vacuum(min_visible_txid, &db.tx_manager.clog);
+
+        // Add result row
+        var row = ArrayList(ColumnValue).init(db.allocator);
+        const name_copy = try db.allocator.dupe(u8, table_name);
+        try row.append(ColumnValue{ .text = name_copy });
+        try row.append(ColumnValue{ .int = @intCast(stats.versions_removed) });
+        try row.append(ColumnValue{ .int = @intCast(stats.total_chains) });
+        try row.append(ColumnValue{ .int = @intCast(stats.total_versions) });
+        try row.append(ColumnValue{ .int = @intCast(stats.max_chain_length) });
+        try result.addRow(row);
+    } else {
+        // VACUUM all tables
+        var it = db.tables.iterator();
+        while (it.next()) |entry| {
+            const table_name = entry.key_ptr.*;
+            const table = entry.value_ptr.*;
+
+            const stats = try table.vacuum(min_visible_txid, &db.tx_manager.clog);
+
+            // Add result row
+            var row = ArrayList(ColumnValue).init(db.allocator);
+            const name_copy = try db.allocator.dupe(u8, table_name);
+            try row.append(ColumnValue{ .text = name_copy });
+            try row.append(ColumnValue{ .int = @intCast(stats.versions_removed) });
+            try row.append(ColumnValue{ .int = @intCast(stats.total_chains) });
+            try row.append(ColumnValue{ .int = @intCast(stats.total_versions) });
+            try row.append(ColumnValue{ .int = @intCast(stats.max_chain_length) });
+            try result.addRow(row);
+        }
+    }
 
     return result;
 }

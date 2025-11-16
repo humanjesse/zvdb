@@ -707,6 +707,145 @@ pub const Table = struct {
         return visible_ids.toOwnedSlice();
     }
 
+    // ============================================================================
+    // Phase 4: VACUUM - Garbage Collection for Old Versions
+    // ============================================================================
+
+    /// Statistics about version chain lengths in the table
+    pub const VacuumStats = struct {
+        total_chains: usize,
+        total_versions: usize,
+        max_chain_length: usize,
+        avg_chain_length: f64,
+        versions_removed: usize,
+    };
+
+    /// Get statistics about version chains (useful for deciding when to VACUUM)
+    pub fn getVacuumStats(self: *Table) VacuumStats {
+        var stats = VacuumStats{
+            .total_chains = 0,
+            .total_versions = 0,
+            .max_chain_length = 0,
+            .avg_chain_length = 0.0,
+            .versions_removed = 0,
+        };
+
+        var it = self.version_chains.iterator();
+        while (it.next()) |entry| {
+            stats.total_chains += 1;
+            var chain_length: usize = 0;
+
+            var version: ?*RowVersion = entry.value_ptr.*;
+            while (version) |v| {
+                chain_length += 1;
+                stats.total_versions += 1;
+                version = v.next;
+            }
+
+            if (chain_length > stats.max_chain_length) {
+                stats.max_chain_length = chain_length;
+            }
+        }
+
+        if (stats.total_chains > 0) {
+            stats.avg_chain_length = @as(f64, @floatFromInt(stats.total_versions)) / @as(f64, @floatFromInt(stats.total_chains));
+        }
+
+        return stats;
+    }
+
+    /// VACUUM: Remove old row versions that are no longer visible to any transaction
+    /// This frees up memory by cleaning up old versions from version chains
+    ///
+    /// Algorithm:
+    /// 1. Find versions that are no longer visible to any active transaction
+    /// 2. Remove them from version chains
+    /// 3. Free their memory
+    ///
+    /// Safety rules:
+    /// - Never remove the head (newest version) of a chain
+    /// - Only remove versions where:
+    ///   a) Created by aborted transaction, OR
+    ///   b) Deleted before min_visible_txid and created before min_visible_txid
+    ///
+    /// Parameters:
+    /// - min_visible_txid: Minimum transaction ID of all active transactions
+    ///   (any version created/deleted before this is potentially removable)
+    /// - clog: Commit log to check transaction status
+    ///
+    /// Returns: Statistics about the vacuum operation
+    pub fn vacuum(self: *Table, min_visible_txid: u64, clog: *CommitLog) !VacuumStats {
+        var stats = self.getVacuumStats();
+        const initial_versions = stats.total_versions;
+
+        var it = self.version_chains.iterator();
+        while (it.next()) |entry| {
+            const head = entry.value_ptr.*;
+
+            // Walk the version chain and clean up old versions
+            var current: ?*RowVersion = head.next; // Start from second version (never remove head)
+            var prev: *RowVersion = head;
+
+            while (current) |version| {
+                const next = version.next;
+
+                // Check if this version can be removed
+                const can_remove = blk: {
+                    // Version was created by an aborted transaction - always safe to remove
+                    if (clog.isAborted(version.xmin)) {
+                        break :blk true;
+                    }
+
+                    // Version must be deleted (xmax != 0)
+                    if (version.xmax == 0) {
+                        break :blk false; // Still current version in some chain
+                    }
+
+                    // Deletion must be by a committed transaction
+                    if (!clog.isCommitted(version.xmax)) {
+                        break :blk false; // Deletion not committed yet
+                    }
+
+                    // Both creation and deletion must be before min_visible_txid
+                    if (version.xmin >= min_visible_txid or version.xmax >= min_visible_txid) {
+                        break :blk false; // Might still be visible to some transaction
+                    }
+
+                    // Creation must be committed
+                    if (!clog.isCommitted(version.xmin)) {
+                        break :blk false; // Creating transaction not committed
+                    }
+
+                    // All conditions met - safe to remove
+                    break :blk true;
+                };
+
+                if (can_remove) {
+                    // Remove this version from the chain
+                    prev.next = next;
+
+                    // Free the version
+                    version.deinit(self.allocator);
+                    stats.versions_removed += 1;
+                } else {
+                    // Keep this version, move prev pointer
+                    prev = version;
+                }
+
+                current = next;
+            }
+        }
+
+        // Update stats with final counts
+        const final_stats = self.getVacuumStats();
+        stats.total_chains = final_stats.total_chains;
+        stats.total_versions = final_stats.total_versions;
+        stats.max_chain_length = final_stats.max_chain_length;
+        stats.avg_chain_length = final_stats.avg_chain_length;
+
+        return stats;
+    }
+
     /// Save table to a binary file (.zvdb format)
     /// NOTE: Currently saves only the newest version of each row (no MVCC history)
     /// TODO Phase 4: Save version chains for full MVCC recovery
