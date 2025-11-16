@@ -3,23 +3,23 @@ const core = @import("core.zig");
 const Database = core.Database;
 const HNSW = @import("../hnsw.zig").HNSW;
 
-/// Rebuild HNSW vector index from table data (Phase 2.4)
+/// Rebuild HNSW vector indexes from table data (Phase 2.4)
 ///
-/// After WAL recovery, the HNSW index will be out of sync with table data
+/// After WAL recovery, the HNSW indexes will be out of sync with table data
 /// because HNSW operations are not logged in the WAL. This function scans
-/// all tables for embedding columns and rebuilds the HNSW index.
+/// all tables for embedding columns and rebuilds the per-dimension HNSW indexes.
 ///
 /// Process:
-/// 1. If HNSW is null, skip (no vector search enabled)
-/// 2. Clear existing HNSW index
-/// 3. Scan all tables in the database
-/// 4. For each table, find embedding columns
-/// 5. For each row, extract embedding and insert into HNSW with row_id
+/// 1. Clear all existing HNSW indexes
+/// 2. Scan all tables in the database
+/// 3. For each table, find embedding columns
+/// 4. For each row, extract embedding and determine its dimension
+/// 5. Insert into the appropriate dimension-specific HNSW index
 /// 6. Log progress for large datasets
 ///
 /// This should be called after recoverFromWal() completes.
 ///
-/// Returns: Number of vectors inserted into HNSW index
+/// Returns: Number of vectors inserted into HNSW indexes
 ///
 /// Example usage:
 /// ```
@@ -29,52 +29,44 @@ const HNSW = @import("../hnsw.zig").HNSW;
 ///                 .{recovered_tx, vectors_indexed});
 /// ```
 pub fn rebuildHnswFromTables(db: *Database) !usize {
-    // Phase 2.4: HNSW Index Rebuild Implementation
+    // Phase 2.4: Per-Dimension HNSW Index Rebuild Implementation
 
-    // Step 1: If HNSW is not enabled, skip
-    if (db.hnsw == null) {
-        std.debug.print("HNSW not enabled, skipping index rebuild\n", .{});
-        return 0;
+    // Step 1: Clear all existing HNSW indexes
+    var hnsw_it = db.hnsw_indexes.valueIterator();
+    while (hnsw_it.next()) |h| {
+        h.*.deinit();
+        db.allocator.destroy(h.*);
     }
-
-    // Step 2: Clear and reinitialize HNSW to start fresh
-    // We need to rebuild the entire index from scratch
-    if (db.hnsw) |old_hnsw| {
-        old_hnsw.deinit();
-        db.allocator.destroy(old_hnsw);
-    }
-
-    // Reinitialize with the same parameters (use reasonable defaults if not set)
-    const hnsw_ptr = try db.allocator.create(HNSW(f32));
-    hnsw_ptr.* = HNSW(f32).init(db.allocator, 16, 200);
-    db.hnsw = hnsw_ptr;
-
-    const h = db.hnsw.?;
+    db.hnsw_indexes.clearRetainingCapacity();
 
     var vectors_indexed: usize = 0;
 
-    // Step 3: Scan all tables in the database
+    // Step 2: Scan all tables in the database
     var table_it = db.tables.iterator();
     while (table_it.next()) |table_entry| {
         const table_name = table_entry.key_ptr.*;
         const table = table_entry.value_ptr.*;
 
-        // Step 4: Scan all rows in this table (using newest version)
+        // Step 3: Scan all rows in this table (using newest version)
         var row_it = table.version_chains.iterator();
         while (row_it.next()) |row_entry| {
             const row_id = row_entry.key_ptr.*;
             const version = row_entry.value_ptr.*;
             const row = &version.data;
 
-            // Step 5: Find embedding columns in this row
+            // Step 4: Find embedding columns in this row
             var value_it = row.values.iterator();
             while (value_it.next()) |value_entry| {
                 const col_name = value_entry.key_ptr.*;
                 const value = value_entry.value_ptr.*;
 
-                // Step 6: If this is an embedding column, insert into HNSW
+                // Step 5: If this is an embedding column, insert into appropriate HNSW
                 if (value == .embedding) {
                     const embedding = value.embedding;
+                    const dim = embedding.len;
+
+                    // Get or create HNSW index for this dimension
+                    const h = try db.getOrCreateHnswForDim(dim);
 
                     // Insert into HNSW with row_id as external_id
                     _ = try h.insert(embedding, row_id);

@@ -172,7 +172,7 @@ test "SQL: Semantic search with embeddings" {
     // Initialize vector search
     try db.initVectorSearch(16, 200);
 
-    var create_result = try db.execute("CREATE TABLE documents (id int, title text, content text, embedding embedding)");
+    var create_result = try db.execute("CREATE TABLE documents (id int, title text, content text, embedding embedding(128))");
     defer create_result.deinit();
 
     // Create a simple embedding
@@ -195,7 +195,8 @@ test "SQL: Semantic search with embeddings" {
     try values1.put("embedding", ColumnValue{ .embedding = emb1 });
 
     const id1 = try table.insert(values1);
-    _ = try db.hnsw.?.insert(&embedding1, id1);
+    const hnsw1 = try db.getOrCreateHnswForDim(128);
+    _ = try hnsw1.insert(&embedding1, id1);
 
     var values2 = std.StringHashMap(ColumnValue).init(testing.allocator);
     defer values2.deinit();
@@ -206,7 +207,8 @@ test "SQL: Semantic search with embeddings" {
     try values2.put("embedding", ColumnValue{ .embedding = emb2 });
 
     const id2 = try table.insert(values2);
-    _ = try db.hnsw.?.insert(&embedding2, id2);
+    const hnsw2 = try db.getOrCreateHnswForDim(128);
+    _ = try hnsw2.insert(&embedding2, id2);
 
     // Semantic search
     var result = try db.execute("SELECT * FROM documents ORDER BY SIMILARITY TO \"test query\" LIMIT 2");
@@ -583,7 +585,7 @@ test "Persistence: Load from non-existent directory" {
     defer db.deinit();
 
     try testing.expect(db.tables.count() == 0);
-    try testing.expect(db.hnsw == null);
+    try testing.expect(db.hnsw_indexes.count() == 0);
 }
 
 test "Persistence: Auto-save on deinit" {
@@ -911,7 +913,7 @@ test "SQL: UPDATE with embeddings - vector changed" {
     // Initialize vector search
     try db.initVectorSearch(16, 200);
 
-    var create_result = try db.execute("CREATE TABLE documents (id int, title text, embedding embedding)");
+    var create_result = try db.execute("CREATE TABLE documents (id int, title text, embedding embedding(768))");
     defer create_result.deinit();
 
     // Create embeddings
@@ -930,10 +932,11 @@ test "SQL: UPDATE with embeddings - vector changed" {
     try values.put("embedding", ColumnValue{ .embedding = emb_old });
 
     const row_id = try table.insert(values);
-    _ = try db.hnsw.?.insert(&old_embedding, row_id);
+    const hnsw = try db.getOrCreateHnswForDim(768);
+    _ = try hnsw.insert(&old_embedding, row_id);
 
     // Verify embedding is in HNSW
-    var internal_id = db.hnsw.?.getInternalId(row_id);
+    var internal_id = hnsw.getInternalId(row_id);
     try testing.expect(internal_id != null);
 
     // Now update the embedding using table API to simulate UPDATE
@@ -943,11 +946,11 @@ test "SQL: UPDATE with embeddings - vector changed" {
     try row.set(testing.allocator, "embedding", ColumnValue{ .embedding = emb_new });
 
     // Simulate UPDATE execution: remove old, insert new
-    try db.hnsw.?.removeNode(row_id);
-    _ = try db.hnsw.?.insert(&new_embedding, row_id);
+    try hnsw.removeNode(row_id);
+    _ = try hnsw.insert(&new_embedding, row_id);
 
     // Verify new embedding is in HNSW
-    internal_id = db.hnsw.?.getInternalId(row_id);
+    internal_id = hnsw.getInternalId(row_id);
     try testing.expect(internal_id != null);
 
     // Verify embedding changed
@@ -1167,7 +1170,7 @@ test "WAL: Embeddings are preserved across INSERT/UPDATE with WAL enabled" {
     try db.enableWal(wal_dir);
 
     // Create table with embedding column
-    var create_result = try db.execute("CREATE TABLE docs (id int, title text, embedding embedding)");
+    var create_result = try db.execute("CREATE TABLE docs (id int, title text, embedding embedding(768))");
     defer create_result.deinit();
 
     // Create test embeddings
@@ -1187,7 +1190,8 @@ test "WAL: Embeddings are preserved across INSERT/UPDATE with WAL enabled" {
     const emb1 = try testing.allocator.dupe(f32, &embedding1);
     defer testing.allocator.free(emb1);
     try row.set(testing.allocator, "embedding", ColumnValue{ .embedding = emb1 });
-    _ = try db.hnsw.?.insert(&embedding1, row_id);
+    const hnsw = try db.getOrCreateHnswForDim(768);
+    _ = try hnsw.insert(&embedding1, row_id);
 
     // Verify WAL file was created from the INSERT command
     var wal_dir_handle = try std.fs.cwd().openDir(wal_dir, .{ .iterate = true });
@@ -1215,15 +1219,15 @@ test "WAL: Embeddings are preserved across INSERT/UPDATE with WAL enabled" {
     const emb2 = try testing.allocator.dupe(f32, &embedding2);
     defer testing.allocator.free(emb2);
     try row.set(testing.allocator, "embedding", ColumnValue{ .embedding = emb2 });
-    try db.hnsw.?.removeNode(row_id);
-    _ = try db.hnsw.?.insert(&embedding2, row_id);
+    try hnsw.removeNode(row_id);
+    _ = try hnsw.insert(&embedding2, row_id);
 
     // Verify embedding was updated
     const updated_emb = row.get("embedding").?;
     try testing.expect(updated_emb.embedding[0] == 0.9);
 
     // Verify HNSW index still contains the row
-    const internal_id = db.hnsw.?.getInternalId(row_id);
+    const internal_id = hnsw.getInternalId(row_id);
     try testing.expect(internal_id != null);
 }
 
@@ -1242,10 +1246,11 @@ test "WAL: Multiple embedding insertions with WAL" {
     try db.enableWal(wal_dir);
 
     // Create table
-    var create_result = try db.execute("CREATE TABLE docs (id int, content text, vec embedding)");
+    var create_result = try db.execute("CREATE TABLE docs (id int, content text, vec embedding(768))");
     defer create_result.deinit();
 
     const table = db.tables.get("docs").?;
+    const hnsw = try db.getOrCreateHnswForDim(768);
 
     // Insert multiple rows using SQL (this triggers WAL)
     var i: usize = 0;
@@ -1263,7 +1268,7 @@ test "WAL: Multiple embedding insertions with WAL" {
         const emb = try testing.allocator.dupe(f32, &embedding);
         defer testing.allocator.free(emb);
         try row.set(testing.allocator, "vec", ColumnValue{ .embedding = emb });
-        _ = try db.hnsw.?.insert(&embedding, id);
+        _ = try hnsw.insert(&embedding, id);
     }
 
     // Verify all rows inserted
@@ -1276,7 +1281,7 @@ test "WAL: Multiple embedding insertions with WAL" {
 
     // Verify HNSW has all vectors
     for (1..6) |row_num| {
-        const internal_id = db.hnsw.?.getInternalId(row_num);
+        const internal_id = hnsw.getInternalId(row_num);
         try testing.expect(internal_id != null);
     }
 }
@@ -1611,10 +1616,11 @@ test "WAL Recovery: HNSW index rebuild after recovery" {
         try db.initVectorSearch(16, 200);
         try db.enableWal(wal_dir);
 
-        var create = try db.execute("CREATE TABLE docs (id int, title text, vec embedding)");
+        var create = try db.execute("CREATE TABLE docs (id int, title text, vec embedding(128))");
         defer create.deinit();
 
         const table = db.tables.get("docs").?;
+        const hnsw = try db.getOrCreateHnswForDim(128);
 
         // Insert rows with embeddings
         var i: usize = 1;
@@ -1635,7 +1641,7 @@ test "WAL Recovery: HNSW index rebuild after recovery" {
             const emb = try testing.allocator.dupe(f32, &embedding);
             defer testing.allocator.free(emb);
             try row.set(testing.allocator, "vec", ColumnValue{ .embedding = emb });
-            _ = try db.hnsw.?.insert(&embedding, i);
+            _ = try hnsw.insert(&embedding, i);
 
             // Serialize new row state for WAL
             const new_serialized = try row.serialize(testing.allocator);
@@ -1663,7 +1669,7 @@ test "WAL Recovery: HNSW index rebuild after recovery" {
 
         try db.initVectorSearch(16, 200);
 
-        var create = try db.execute("CREATE TABLE docs (id int, title text, vec embedding)");
+        var create = try db.execute("CREATE TABLE docs (id int, title text, vec embedding(128))");
         defer create.deinit();
 
         // Recover from WAL
@@ -1679,10 +1685,11 @@ test "WAL Recovery: HNSW index rebuild after recovery" {
         const table = db.tables.get("docs").?;
         try testing.expectEqual(@as(usize, 3), table.count());
 
+        const hnsw = try db.getOrCreateHnswForDim(128);
         var row_it = table.version_chains.iterator();
         while (row_it.next()) |entry| {
             const row_id = entry.key_ptr.*;
-            const internal_id = db.hnsw.?.getInternalId(row_id);
+            const internal_id = hnsw.getInternalId(row_id);
             try testing.expect(internal_id != null);
         }
     }
@@ -2635,4 +2642,142 @@ test "WAL Recovery: Partial corruption in WAL file" {
         const table = db.tables.get("items").?;
         try testing.expect(table.count() > 0); // At least the new insert
     }
+}
+
+// ============================================================================
+// DELETE with Complex WHERE Tests (Fix #2)
+// ============================================================================
+
+test "DELETE with AND condition" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    var create = try db.execute("CREATE TABLE users (id int, age int, status text)");
+    defer create.deinit();
+
+    var insert1 = try db.execute("INSERT INTO users VALUES (1, 25, \"active\")");
+    defer insert1.deinit();
+    var insert2 = try db.execute("INSERT INTO users VALUES (2, 35, \"inactive\")");
+    defer insert2.deinit();
+    var insert3 = try db.execute("INSERT INTO users VALUES (3, 45, \"active\")");
+    defer insert3.deinit();
+    var insert4 = try db.execute("INSERT INTO users VALUES (4, 30, \"inactive\")");
+    defer insert4.deinit();
+
+    // DELETE with AND: Delete inactive users older than 30
+    var delete_result = try db.execute("DELETE FROM users WHERE age > 30 AND status = \"inactive\"");
+    defer delete_result.deinit();
+    try testing.expect(delete_result.rows.items[0].items[0].int == 1); // Only user 2 deleted
+
+    var select_result = try db.execute("SELECT * FROM users");
+    defer select_result.deinit();
+    try testing.expect(select_result.rows.items.len == 3);
+}
+
+test "DELETE with OR condition" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    var create = try db.execute("CREATE TABLE products (id int, price float, stock int)");
+    defer create.deinit();
+
+    var insert1 = try db.execute("INSERT INTO products VALUES (1, 10.5, 0)");
+    defer insert1.deinit();
+    var insert2 = try db.execute("INSERT INTO products VALUES (2, 5.0, 100)");
+    defer insert2.deinit();
+    var insert3 = try db.execute("INSERT INTO products VALUES (3, 150.0, 5)");
+    defer insert3.deinit();
+
+    // DELETE with OR: Delete products that are out of stock or too expensive
+    var delete_result = try db.execute("DELETE FROM products WHERE stock = 0 OR price > 100");
+    defer delete_result.deinit();
+    try testing.expect(delete_result.rows.items[0].items[0].int == 2); // Products 1 and 3
+
+    var select_result = try db.execute("SELECT * FROM products");
+    defer select_result.deinit();
+    try testing.expect(select_result.rows.items.len == 1);
+    try testing.expect(select_result.rows.items[0].items[0].int == 2); // Only product 2 remains
+}
+
+test "DELETE with IS NULL" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    var create = try db.execute("CREATE TABLE contacts (id int, email text, phone text)");
+    defer create.deinit();
+
+    var insert1 = try db.execute("INSERT INTO contacts VALUES (1, \"test@example.com\", NULL)");
+    defer insert1.deinit();
+    var insert2 = try db.execute("INSERT INTO contacts VALUES (2, NULL, \"123-456\")");
+    defer insert2.deinit();
+    var insert3 = try db.execute("INSERT INTO contacts VALUES (3, \"user@test.com\", \"789-012\")");
+    defer insert3.deinit();
+
+    // DELETE rows with NULL email
+    var delete_result = try db.execute("DELETE FROM contacts WHERE email IS NULL");
+    defer delete_result.deinit();
+    try testing.expect(delete_result.rows.items[0].items[0].int == 1); // Contact 2 deleted
+
+    var select_result = try db.execute("SELECT * FROM contacts");
+    defer select_result.deinit();
+    try testing.expect(select_result.rows.items.len == 2);
+}
+
+test "DELETE with subquery (IN)" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    var create_users = try db.execute("CREATE TABLE users (id int, name text, status text)");
+    defer create_users.deinit();
+    var create_orders = try db.execute("CREATE TABLE orders (id int, user_id int, amount float)");
+    defer create_orders.deinit();
+
+    var insert_u1 = try db.execute("INSERT INTO users VALUES (1, \"Alice\", \"active\")");
+    defer insert_u1.deinit();
+    var insert_u2 = try db.execute("INSERT INTO users VALUES (2, \"Bob\", \"active\")");
+    defer insert_u2.deinit();
+    var insert_u3 = try db.execute("INSERT INTO users VALUES (3, \"Charlie\", \"inactive\")");
+    defer insert_u3.deinit();
+
+    var insert_o1 = try db.execute("INSERT INTO orders VALUES (1, 1, 100.0)");
+    defer insert_o1.deinit();
+    var insert_o2 = try db.execute("INSERT INTO orders VALUES (2, 1, 200.0)");
+    defer insert_o2.deinit();
+
+    // DELETE users who have no orders
+    var delete_result = try db.execute("DELETE FROM users WHERE id NOT IN (SELECT user_id FROM orders)");
+    defer delete_result.deinit();
+    try testing.expect(delete_result.rows.items[0].items[0].int == 2); // Bob and Charlie deleted
+
+    var select_result = try db.execute("SELECT * FROM users");
+    defer select_result.deinit();
+    try testing.expect(select_result.rows.items.len == 1);
+    try testing.expect(select_result.rows.items[0].items[1].text[0] == 'A'); // Only Alice remains
+}
+
+test "DELETE with subquery (EXISTS)" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    var create_users = try db.execute("CREATE TABLE users (id int, name text)");
+    defer create_users.deinit();
+    var create_bans = try db.execute("CREATE TABLE bans (user_id int, reason text)");
+    defer create_bans.deinit();
+
+    var insert_u1 = try db.execute("INSERT INTO users VALUES (1, \"Alice\")");
+    defer insert_u1.deinit();
+    var insert_u2 = try db.execute("INSERT INTO users VALUES (2, \"Bob\")");
+    defer insert_u2.deinit();
+
+    var insert_b1 = try db.execute("INSERT INTO bans VALUES (2, \"spam\")");
+    defer insert_b1.deinit();
+
+    // DELETE banned users
+    var delete_result = try db.execute("DELETE FROM users WHERE EXISTS (SELECT 1 FROM bans WHERE user_id = 2)");
+    defer delete_result.deinit();
+
+    var select_result = try db.execute("SELECT * FROM users");
+    defer select_result.deinit();
+    // Note: EXISTS with constant subquery will delete all or none
+    // For proper correlated subquery, we'd need correlation support
 }

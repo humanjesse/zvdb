@@ -132,10 +132,20 @@ pub fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
     // Handle ORDER BY SIMILARITY TO "text"
     if (!use_index) {
         if (cmd.order_by_similarity) |similarity_text| {
-            if (db.hnsw == null) return sql.SqlError.InvalidSyntax;
+            // Find embedding column in table to get its dimension
+            var embedding_dim: ?usize = null;
+            for (table.columns.items) |col| {
+                if (col.col_type == .embedding) {
+                    embedding_dim = col.embedding_dim;
+                    break;
+                }
+            }
+
+            if (embedding_dim == null) return sql.SqlError.InvalidSyntax;
+            const dim = embedding_dim.?;
 
             // For semantic search, we need to generate an embedding from the text
-            const query_embedding = try db.allocator.alloc(f32, 128);
+            const query_embedding = try db.allocator.alloc(f32, dim);
             defer db.allocator.free(query_embedding);
 
             // Simple hash-based embedding (in real use, you'd use an actual embedding model)
@@ -145,7 +155,9 @@ pub fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
                 val.* = @as(f32, @floatFromInt(seed & 0xFF)) / 255.0;
             }
 
-            const search_results = try db.hnsw.?.search(query_embedding, cmd.limit orelse 10);
+            // Get or create HNSW index for this dimension
+            const hnsw = try db.getOrCreateHnswForDim(dim);
+            const search_results = try hnsw.search(query_embedding, cmd.limit orelse 10);
             defer db.allocator.free(search_results);
 
             row_ids = try db.allocator.alloc(u64, search_results.len);

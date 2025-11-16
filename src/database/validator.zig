@@ -770,45 +770,28 @@ pub fn validateDelete(
     var result = ValidationResult.init(allocator);
     errdefer result.deinit();
 
-    // Validate WHERE column if present (simple WHERE clause)
-    if (cmd.where_column) |col_name| {
-        // Check if column exists in table schema
-        var column_exists = false;
-        for (table.columns.items) |schema_col| {
-            if (std.mem.eql(u8, col_name, schema_col.name)) {
-                column_exists = true;
-                break;
-            }
-        }
+    // Validate WHERE clause if present (using full expression validation like UPDATE)
+    if (cmd.where_expr) |expr| {
+        // Build column resolver for WHERE validation
+        var resolver = try ColumnResolver.init(allocator, table);
+        defer resolver.deinit();
 
-        if (!column_exists) {
-            const msg = try std.fmt.allocPrint(
-                allocator,
-                "column \"{s}\" does not exist in table \"{s}\"",
-                .{ col_name, table.name },
-            );
+        var where_ctx = ValidationContext.init(allocator, .where);
+        defer where_ctx.deinit();
+        where_ctx.resolver = &resolver;
+
+        // Validate WHERE expression
+        validateExpression(&where_ctx, expr) catch |err| {
+            const msg = try formatErrorMessage(allocator, err, null);
             defer allocator.free(msg);
 
-            // Try to find a similar column name for suggestion
-            const hint = if (findSimilarColumnInTable(col_name, table, 2)) |similar|
-                try std.fmt.allocPrint(
-                    allocator,
-                    "Did you mean \"{s}\"?",
-                    .{similar},
-                )
-            else
-                null;
-
             try result.addError(
-                ValidationError.ColumnNotFound,
-                col_name,
+                err,
+                null,
                 msg,
-                hint,
+                "Check that all columns in WHERE clause exist in the table",
             );
-
-            // Free hint if allocated
-            if (hint) |h| allocator.free(h);
-        }
+        };
     }
 
     return result;
@@ -1262,7 +1245,7 @@ test "validateUpdate: duplicate assignments" {
 // DELETE Validation Tests
 // ============================================================================
 
-test "validateDelete: valid delete" {
+test "validateDelete: invalid column in WHERE expression" {
     const ColumnValue = @import("../table.zig").ColumnValue;
 
     var table = try Table.init(testing.allocator, "users");
@@ -1270,33 +1253,17 @@ test "validateDelete: valid delete" {
     try table.addColumn("id", ColumnType.int);
     try table.addColumn("name", ColumnType.text);
 
-    // Create a valid DELETE command
-    const delete_cmd = sql.DeleteCmd{
-        .table_name = "users",
-        .where_column = "id",
-        .where_value = ColumnValue{ .int = 1 },
+    // Build WHERE expression: invalid_col = 1
+    var binary_expr = sql.BinaryExpr{
+        .op = .eq,
+        .left = sql.Expr{ .column = "invalid_col" },
+        .right = sql.Expr{ .literal = ColumnValue{ .int = 1 } },
     };
+    const where_expr = sql.Expr{ .binary = &binary_expr };
 
-    var result = try validateDelete(testing.allocator, &delete_cmd, &table);
-    defer result.deinit();
-
-    try testing.expect(result.valid);
-    try testing.expectEqual(@as(usize, 0), result.errors.items.len);
-}
-
-test "validateDelete: column not found" {
-    const ColumnValue = @import("../table.zig").ColumnValue;
-
-    var table = try Table.init(testing.allocator, "users");
-    defer table.deinit();
-    try table.addColumn("id", ColumnType.int);
-    try table.addColumn("name", ColumnType.text);
-
-    // Create DELETE with invalid column
-    const delete_cmd = sql.DeleteCmd{
+    var delete_cmd = sql.DeleteCmd{
         .table_name = "users",
-        .where_column = "invalid_col",
-        .where_value = ColumnValue{ .int = 1 },
+        .where_expr = where_expr,
     };
 
     var result = try validateDelete(testing.allocator, &delete_cmd, &table);
@@ -1305,6 +1272,46 @@ test "validateDelete: column not found" {
     try testing.expect(!result.valid);
     try testing.expect(result.errors.items.len > 0);
     try testing.expectEqual(ValidationError.ColumnNotFound, result.errors.items[0].error_type);
+}
+
+test "validateDelete: valid complex WHERE expression" {
+    const ColumnValue = @import("../table.zig").ColumnValue;
+
+    var table = try Table.init(testing.allocator, "users");
+    defer table.deinit();
+    try table.addColumn("id", ColumnType.int);
+    try table.addColumn("status", ColumnType.text);
+
+    // Build WHERE expression: id > 10 AND status = 'active'
+    var id_gt_10 = sql.BinaryExpr{
+        .op = .gt,
+        .left = sql.Expr{ .column = "id" },
+        .right = sql.Expr{ .literal = ColumnValue{ .int = 10 } },
+    };
+
+    var status_eq_active = sql.BinaryExpr{
+        .op = .eq,
+        .left = sql.Expr{ .column = "status" },
+        .right = sql.Expr{ .literal = ColumnValue{ .text = "active" } },
+    };
+
+    var and_expr = sql.BinaryExpr{
+        .op = .and_op,
+        .left = sql.Expr{ .binary = &id_gt_10 },
+        .right = sql.Expr{ .binary = &status_eq_active },
+    };
+    const where_expr = sql.Expr{ .binary = &and_expr };
+
+    var delete_cmd = sql.DeleteCmd{
+        .table_name = "users",
+        .where_expr = where_expr,
+    };
+
+    var result = try validateDelete(testing.allocator, &delete_cmd, &table);
+    defer result.deinit();
+
+    try testing.expect(result.valid);
+    try testing.expectEqual(@as(usize, 0), result.errors.items.len);
 }
 
 // ============================================================================

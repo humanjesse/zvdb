@@ -110,7 +110,7 @@ pub fn executeCreateTable(db: *Database, cmd: sql.CreateTableCmd) !QueryResult {
     table_ptr.* = try Table.init(db.allocator, cmd.table_name);
 
     for (cmd.columns.items) |col_def| {
-        try table_ptr.addColumn(col_def.name, col_def.col_type);
+        try table_ptr.addColumnWithDim(col_def.name, col_def.col_type, col_def.embedding_dim);
     }
 
     const owned_name = try db.allocator.dupe(u8, cmd.table_name);
@@ -246,24 +246,24 @@ pub fn executeInsert(db: *Database, cmd: sql.InsertCmd) !QueryResult {
     try table.insertWithId(row_id, values_map, tx_id);
     const final_row_id = row_id;
 
-    // If there's an embedding column and vector search is enabled, add to index
-    if (db.hnsw) |h| {
-        // Use null snapshot/clog to bypass MVCC and get the row we just inserted
-        const row = table.get(final_row_id, null, null).?;
-        var it = row.values.iterator();
-        while (it.next()) |entry| {
-            if (entry.value_ptr.* == .embedding) {
-                const embedding = entry.value_ptr.embedding;
-                _ = try h.insert(embedding, final_row_id);
-                break;
-            }
+    // If there's an embedding column, add to the appropriate dimension-specific HNSW index
+    // Use null snapshot/clog to bypass MVCC and get the row we just inserted
+    const row = table.get(final_row_id, null, null).?;
+    var it = row.values.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* == .embedding) {
+            const embedding = entry.value_ptr.embedding;
+            const dim = embedding.len;
+            // Get or create HNSW index for this dimension
+            const h = try db.getOrCreateHnswForDim(dim);
+            _ = try h.insert(embedding, final_row_id);
+            break;
         }
     }
 
     // Phase 1: Update B-tree indexes automatically
-    // Use null snapshot/clog to bypass MVCC and get the row we just inserted
-    const inserted_row = table.get(final_row_id, null, null).?;
-    try db.index_manager.onInsert(cmd.table_name, final_row_id, inserted_row);
+    // Reuse the row we already fetched above
+    try db.index_manager.onInsert(cmd.table_name, final_row_id, row);
 
     // Track operation in transaction if one is active
     if (db.tx_manager.getCurrentTx()) |tx| {
@@ -279,9 +279,9 @@ pub fn executeInsert(db: *Database, cmd: sql.InsertCmd) !QueryResult {
 
     var result = QueryResult.init(db.allocator);
     try result.addColumn("row_id");
-    var row = ArrayList(ColumnValue).init(db.allocator);
-    try row.append(ColumnValue{ .int = @intCast(final_row_id) });
-    try result.addRow(row);
+    var result_row = ArrayList(ColumnValue).init(db.allocator);
+    try result_row.append(ColumnValue{ .int = @intCast(final_row_id) });
+    try result.addRow(result_row);
 
     return result;
 }
@@ -315,18 +315,10 @@ pub fn executeDelete(db: *Database, cmd: sql.DeleteCmd) !QueryResult {
     for (row_ids) |row_id| {
         const row = table.get(row_id, snapshot, clog) orelse continue;
 
-        // Apply WHERE filter
+        // Apply WHERE filter using expression evaluator (like UPDATE)
         var should_delete = true;
-        if (cmd.where_column) |where_col| {
-            if (cmd.where_value) |where_val| {
-                const row_val = row.get(where_col) orelse {
-                    should_delete = false;
-                    continue;
-                };
-                if (!valuesEqual(row_val, where_val)) {
-                    should_delete = false;
-                }
-            }
+        if (cmd.where_expr) |expr| {
+            should_delete = try evaluateExprWithSubqueries(db, expr, row.values);
         }
 
         if (should_delete) {
@@ -409,11 +401,13 @@ pub fn executeUpdate(db: *Database, cmd: sql.UpdateCmd) !QueryResult {
     for (cmd.assignments.items) |assignment| {
         var found = false;
         var col_type: ColumnType = undefined;
+        var embedding_dim: ?usize = null;
 
         for (table.columns.items) |col| {
             if (std.mem.eql(u8, col.name, assignment.column)) {
                 found = true;
                 col_type = col.col_type;
+                embedding_dim = col.embedding_dim;
                 break;
             }
         }
@@ -431,8 +425,8 @@ pub fn executeUpdate(db: *Database, cmd: sql.UpdateCmd) !QueryResult {
             .embedding => blk: {
                 if (assignment.value == .null_value) break :blk true;
                 if (assignment.value != .embedding) break :blk false;
-                // Validate dimension
-                const expected_dim: usize = 768; // TODO: Make this configurable
+                // Validate dimension matches schema
+                const expected_dim = embedding_dim orelse return sql.SqlError.TypeMismatch;
                 break :blk assignment.value.embedding.len == expected_dim;
             },
         };
@@ -482,15 +476,13 @@ pub fn executeUpdate(db: *Database, cmd: sql.UpdateCmd) !QueryResult {
         defer if (old_embedding_backup) |emb| db.allocator.free(emb);
 
         // Find old embedding if it exists
-        if (db.hnsw != null) {
-            var it = row.values.iterator();
-            while (it.next()) |entry| {
-                if (entry.value_ptr.* == .embedding) {
-                    old_embedding = entry.value_ptr.embedding;
-                    // Clone for potential rollback
-                    old_embedding_backup = try db.allocator.dupe(f32, old_embedding.?);
-                    break;
-                }
+        var it = row.values.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* == .embedding) {
+                old_embedding = entry.value_ptr.embedding;
+                // Clone for potential rollback
+                old_embedding_backup = try db.allocator.dupe(f32, old_embedding.?);
+                break;
             }
         }
 
@@ -559,23 +551,28 @@ pub fn executeUpdate(db: *Database, cmd: sql.UpdateCmd) !QueryResult {
         }
 
         // Handle HNSW index updates BEFORE applying row updates
-        if (embedding_changed and db.hnsw != null) {
-            const h = db.hnsw.?;
-
-            // Remove old vector from HNSW (if it existed)
-            if (old_embedding_backup != null) {
-                h.removeNode(row_id) catch |err| {
-                    std.debug.print("Error removing node from HNSW: {}\n", .{err});
-                    return err;
-                };
+        if (embedding_changed) {
+            // Remove old vector from its dimension-specific HNSW (if it existed)
+            if (old_embedding_backup) |old_emb| {
+                const old_dim = old_emb.len;
+                if (db.hnsw_indexes.get(old_dim)) |h| {
+                    h.removeNode(row_id) catch |err| {
+                        std.debug.print("Error removing node from HNSW: {}\n", .{err});
+                        return err;
+                    };
+                }
             }
 
-            // Insert new vector with same row_id
+            // Insert new vector to its dimension-specific HNSW
             if (new_embedding) |new_emb| {
+                const new_dim = new_emb.len;
+                const h = try db.getOrCreateHnswForDim(new_dim);
                 _ = h.insert(new_emb, row_id) catch |err| {
                     // Rollback: Re-insert old embedding to restore HNSW state
                     if (old_embedding_backup) |old_clone| {
-                        _ = h.insert(old_clone, row_id) catch {
+                        const old_dim = old_clone.len;
+                        const old_h = try db.getOrCreateHnswForDim(old_dim);
+                        _ = old_h.insert(old_clone, row_id) catch {
                             std.debug.print("CRITICAL: Failed to rollback HNSW state after insert failure\n", .{});
                         };
                     }

@@ -80,6 +80,7 @@ pub const ColumnType = enum {
 pub const Column = struct {
     name: []const u8,
     col_type: ColumnType,
+    embedding_dim: ?usize, // Dimension for embedding columns (null for non-embedding types)
 
     pub fn init(allocator: Allocator, name: []const u8, col_type: ColumnType) !Column {
         const owned_name = try allocator.alloc(u8, name.len);
@@ -87,6 +88,17 @@ pub const Column = struct {
         return Column{
             .name = owned_name,
             .col_type = col_type,
+            .embedding_dim = if (col_type == .embedding) 768 else null, // Default to 768 for backward compatibility
+        };
+    }
+
+    pub fn initWithDim(allocator: Allocator, name: []const u8, col_type: ColumnType, dim: ?usize) !Column {
+        const owned_name = try allocator.alloc(u8, name.len);
+        @memcpy(owned_name, name);
+        return Column{
+            .name = owned_name,
+            .col_type = col_type,
+            .embedding_dim = dim,
         };
     }
 
@@ -480,6 +492,11 @@ pub const Table = struct {
         try self.columns.append(column);
     }
 
+    pub fn addColumnWithDim(self: *Table, name: []const u8, col_type: ColumnType, embedding_dim: ?usize) !void {
+        const column = try Column.initWithDim(self.allocator, name, col_type, embedding_dim);
+        try self.columns.append(column);
+    }
+
     /// Insert a new row (generates ID automatically)
     /// For MVCC compatibility, uses transaction ID 0 (bootstrap transaction)
     /// TODO Phase 3: Accept transaction ID parameter
@@ -687,7 +704,7 @@ pub const Table = struct {
 
         // Write header
         const magic: u32 = 0x5456_4442; // "TVDB" in hex
-        const version: u32 = 1;
+        const version: u32 = 2; // Incremented for embedding_dim support
         try utils.writeInt(file, u32, magic);
         try utils.writeInt(file, u32, version);
 
@@ -702,6 +719,11 @@ pub const Table = struct {
             try utils.writeInt(file, u64, col.name.len);
             try file.writeAll(col.name);
             try utils.writeInt(file, u8, @intFromEnum(col.col_type));
+            // Write embedding dimension for embedding type (version 2+)
+            if (col.col_type == .embedding) {
+                const dim = col.embedding_dim orelse 768; // Default to 768 if not set
+                try utils.writeInt(file, u64, dim);
+            }
         }
 
         // Write rows (newest version only)
@@ -760,7 +782,7 @@ pub const Table = struct {
         if (magic != 0x5456_4442) return error.InvalidFileFormat;
 
         const version = try utils.readInt(file, u32);
-        if (version != 1) return error.UnsupportedVersion;
+        if (version != 1 and version != 2) return error.UnsupportedVersion;
 
         // Read metadata
         const name_len = try utils.readInt(file, u64);
@@ -797,9 +819,21 @@ pub const Table = struct {
             const col_type_int = try utils.readInt(file, u8);
             const col_type: ColumnType = @enumFromInt(col_type_int);
 
+            // Read embedding dimension for version 2+
+            var embedding_dim: ?usize = null;
+            if (col_type == .embedding) {
+                if (version >= 2) {
+                    embedding_dim = try utils.readInt(file, u64);
+                } else {
+                    // Version 1: default to 768
+                    embedding_dim = 768;
+                }
+            }
+
             try table.columns.append(Column{
                 .name = col_name,
                 .col_type = col_type,
+                .embedding_dim = embedding_dim,
             });
         }
 

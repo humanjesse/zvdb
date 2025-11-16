@@ -29,12 +29,16 @@ pub fn saveAll(db: *Database, dir_path: []const u8) !void {
         try table.save(file_path);
     }
 
-    // Save HNSW index if it exists
-    if (db.hnsw) |h| {
+    // Save all per-dimension HNSW indexes
+    var hnsw_it = db.hnsw_indexes.iterator();
+    while (hnsw_it.next()) |entry| {
+        const dim = entry.key_ptr.*;
+        const h = entry.value_ptr.*;
+
         const hnsw_path = try std.fmt.allocPrint(
             db.allocator,
-            "{s}/vectors.hnsw",
-            .{dir_path},
+            "{s}/vectors_{d}.hnsw",
+            .{ dir_path, dim },
         );
         defer db.allocator.free(hnsw_path);
 
@@ -86,8 +90,14 @@ pub fn loadAll(allocator: Allocator, dir_path: []const u8) !Database {
 
             // Add to database
             try db.tables.put(table_name_key, table_ptr);
-        } else if (std.mem.eql(u8, entry.name, "vectors.hnsw")) {
-            // Load HNSW index
+        } else if (std.mem.startsWith(u8, entry.name, "vectors_") and std.mem.endsWith(u8, entry.name, ".hnsw")) {
+            // Load per-dimension HNSW index
+            // Parse dimension from filename: vectors_{dim}.hnsw
+            const prefix_len = "vectors_".len;
+            const suffix_len = ".hnsw".len;
+            const dim_str = entry.name[prefix_len .. entry.name.len - suffix_len];
+            const dim = try std.fmt.parseInt(usize, dim_str, 10);
+
             const file_path = try std.fmt.allocPrint(
                 allocator,
                 "{s}/{s}",
@@ -97,7 +107,19 @@ pub fn loadAll(allocator: Allocator, dir_path: []const u8) !Database {
 
             const hnsw = try allocator.create(HNSW(f32));
             hnsw.* = try HNSW(f32).load(allocator, file_path);
-            db.hnsw = hnsw;
+            try db.hnsw_indexes.put(dim, hnsw);
+        } else if (std.mem.eql(u8, entry.name, "vectors.hnsw")) {
+            // Legacy: Load old single HNSW index as 768-dimensional for backward compatibility
+            const file_path = try std.fmt.allocPrint(
+                allocator,
+                "{s}/{s}",
+                .{ dir_path, entry.name },
+            );
+            defer allocator.free(file_path);
+
+            const hnsw = try allocator.create(HNSW(f32));
+            hnsw.* = try HNSW(f32).load(allocator, file_path);
+            try db.hnsw_indexes.put(768, hnsw);
         }
     }
 
