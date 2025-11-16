@@ -87,9 +87,8 @@ pub fn writeWalRecord(
 ) !u64 {
     const w = db.wal orelse return error.WalNotEnabled;
 
-    // Get transaction ID and increment
-    const tx_id = db.current_tx_id;
-    db.current_tx_id += 1;
+    // Get transaction ID and increment atomically from TransactionManager (single source of truth)
+    const tx_id = db.tx_manager.next_tx_id.fetchAdd(1, .monotonic);
 
     // Create WAL record (writeRecord makes its own copy of table_name and data)
     const table_name_owned = try db.allocator.dupe(u8, table_name);
@@ -331,9 +330,9 @@ pub fn recoverFromWal(db: *Database, wal_dir: []const u8) !usize {
         std.debug.print("WAL Recovery complete: {} transactions, {} operations applied\n", .{ recovered_count, applied_operations });
     }
 
-    // Update current_tx_id to prevent ID reuse in future transactions
+    // Update TransactionManager to prevent ID reuse in future transactions
     if (max_tx_id > 0) {
-        db.current_tx_id = max_tx_id + 1;
+        db.tx_manager.next_tx_id.store(max_tx_id + 1, .monotonic);
     }
 
     return recovered_count;
@@ -352,18 +351,22 @@ fn replayInsert(db: *Database, record: *const WalRecord) !void {
     errdefer row.deinit(db.allocator);
 
     // Check if row already exists (idempotency - may have been partially recovered)
-    if (table.rows.contains(row.id)) {
+    if (table.version_chains.contains(row.id)) {
         // Row already exists, skip (recovery is idempotent)
         row.deinit(db.allocator);
         return;
     }
 
-    // Insert the row into the table
-    try table.rows.put(row.id, row);
+    // Create version for recovered row (tx_id = 0 for bootstrap/recovery)
+    const version = try @import("../table.zig").RowVersion.init(db.allocator, row.id, 0, row);
+    try table.version_chains.put(row.id, version);
 
-    // Update next_id to prevent ID conflicts with future inserts
-    if (row.id >= table.next_id) {
-        table.next_id = row.id + 1;
+    // Update next_id to prevent ID conflicts with future inserts (atomic CAS loop)
+    const desired_next = row.id + 1;
+    while (true) {
+        const current = table.next_id.load(.monotonic);
+        if (current >= desired_next) break;
+        _ = table.next_id.cmpxchgWeak(current, desired_next, .monotonic, .monotonic) orelse break;
     }
 }
 
@@ -375,10 +378,12 @@ fn replayDelete(db: *Database, record: *const WalRecord) !void {
         return;
     };
 
-    // Remove the row if it exists (idempotent)
-    if (table.rows.fetchRemove(record.row_id)) |entry| {
-        var row = entry.value;
-        row.deinit(db.allocator);
+    // For MVCC: Mark the version as deleted (tx_id = 0 for recovery)
+    // In Phase 4, we'll properly handle WAL with transaction IDs
+    // For now, we physically remove during recovery (non-MVCC behavior)
+    if (table.version_chains.fetchRemove(record.row_id)) |entry| {
+        const version = entry.value;
+        version.deinitChain(db.allocator);
     }
 }
 
@@ -411,19 +416,23 @@ fn replayUpdate(db: *Database, record: *const WalRecord) !void {
     var updated_row = try Row.deserialize(new_data, db.allocator);
     errdefer updated_row.deinit(db.allocator);
 
-    // Remove old row if it exists
-    if (table.rows.fetchRemove(record.row_id)) |old_entry| {
-        // Call deinit directly on the returned value to avoid extra copies
-        // We can't use |*old_entry| because it's const
-        var temp_row = old_entry.value;
-        temp_row.deinit(db.allocator);
+    // For MVCC: Remove old version chain and create new one
+    // In Phase 4, we'll properly handle this with version chains
+    // For now during recovery, we replace the version chain with the latest state
+    if (table.version_chains.fetchRemove(record.row_id)) |old_entry| {
+        const old_version = old_entry.value;
+        old_version.deinitChain(db.allocator);
     }
 
-    // Insert the updated row
-    try table.rows.put(updated_row.id, updated_row);
+    // Create new version for updated row (tx_id = 0 for recovery)
+    const version = try @import("../table.zig").RowVersion.init(db.allocator, updated_row.id, 0, updated_row);
+    try table.version_chains.put(updated_row.id, version);
 
-    // Update next_id to prevent ID conflicts with future inserts
-    if (updated_row.id >= table.next_id) {
-        table.next_id = updated_row.id + 1;
+    // Update next_id to prevent ID conflicts with future inserts (atomic CAS loop)
+    const desired_next = updated_row.id + 1;
+    while (true) {
+        const current = table.next_id.load(.monotonic);
+        if (current >= desired_next) break;
+        _ = table.next_id.cmpxchgWeak(current, desired_next, .monotonic, .monotonic) orelse break;
     }
 }

@@ -494,7 +494,7 @@ test "Persistence: Row IDs preserved" {
 
         // Capture row IDs
         const table = db.tables.get("tracking").?;
-        const ids = try table.getAllRows(testing.allocator);
+        const ids = try table.getAllRows(testing.allocator, null, null);
         defer testing.allocator.free(ids);
         @memcpy(&original_ids, ids);
 
@@ -507,7 +507,7 @@ test "Persistence: Row IDs preserved" {
         defer db.deinit();
 
         const table = db.tables.get("tracking").?;
-        const loaded_ids = try table.getAllRows(testing.allocator);
+        const loaded_ids = try table.getAllRows(testing.allocator, null, null);
         defer testing.allocator.free(loaded_ids);
 
         try testing.expect(loaded_ids.len == original_ids.len);
@@ -557,15 +557,15 @@ test "Persistence: Next ID counter preserved" {
         defer db.deinit();
 
         const table_before = db.tables.get("sequences").?;
-        const next_id_before = table_before.next_id;
+        const next_id_before = table_before.next_id.load(.monotonic);
 
         var insert3 = try db.execute("INSERT INTO sequences VALUES (3, 300)");
         defer insert3.deinit();
 
         // Verify new row got expected ID
         const table_after = db.tables.get("sequences").?;
-        try testing.expect(table_after.rows.count() == 3);
-        try testing.expect(table_after.next_id == next_id_before + 1);
+        try testing.expect(table_after.version_chains.count() == 3);
+        try testing.expect(table_after.next_id.load(.monotonic) == next_id_before + 1);
     }
 
     // Clean up
@@ -937,7 +937,7 @@ test "SQL: UPDATE with embeddings - vector changed" {
     try testing.expect(internal_id != null);
 
     // Now update the embedding using table API to simulate UPDATE
-    const row = table.get(row_id).?;
+    const row = table.get(row_id, null, null).?;
     const emb_new = try testing.allocator.dupe(f32, &new_embedding);
     defer testing.allocator.free(emb_new);
     try row.set(testing.allocator, "embedding", ColumnValue{ .embedding = emb_new });
@@ -951,7 +951,7 @@ test "SQL: UPDATE with embeddings - vector changed" {
     try testing.expect(internal_id != null);
 
     // Verify embedding changed
-    const updated_row = table.get(row_id).?;
+    const updated_row = table.get(row_id, null, null).?;
     const updated_emb = updated_row.get("embedding").?;
     try testing.expect(updated_emb.embedding[0] == 0.9);
 }
@@ -1104,23 +1104,23 @@ test "WAL: Transaction ID increments" {
     var create_result = try db.execute("CREATE TABLE test (id int, value int)");
     defer create_result.deinit();
 
-    // Transaction ID should start at 0
-    try testing.expect(db.current_tx_id == 0);
+    // Transaction ID should start at 1 (TransactionManager initializes to 1)
+    try testing.expect(db.tx_manager.next_tx_id.load(.monotonic) == 1);
 
-    // Perform INSERT - should increment tx_id
+    // Perform INSERT - should increment tx_id (WAL write gets ID 1, counter becomes 2)
     var insert1 = try db.execute("INSERT INTO test VALUES (1, 100)");
     defer insert1.deinit();
-    try testing.expect(db.current_tx_id == 1);
+    try testing.expect(db.tx_manager.next_tx_id.load(.monotonic) == 2);
 
-    // Perform UPDATE - should increment tx_id again
+    // Perform UPDATE - should increment tx_id again (WAL write gets ID 2, counter becomes 3)
     var update1 = try db.execute("UPDATE test SET value = 200 WHERE id = 1");
     defer update1.deinit();
-    try testing.expect(db.current_tx_id == 2);
+    try testing.expect(db.tx_manager.next_tx_id.load(.monotonic) == 3);
 
-    // Perform DELETE - should increment tx_id again
+    // Perform DELETE - should increment tx_id again (WAL write gets ID 3, counter becomes 4)
     var delete1 = try db.execute("DELETE FROM test WHERE id = 1");
     defer delete1.deinit();
-    try testing.expect(db.current_tx_id == 3);
+    try testing.expect(db.tx_manager.next_tx_id.load(.monotonic) == 4);
 }
 
 test "WAL: Database works without WAL (optional)" {
@@ -1181,7 +1181,7 @@ test "WAL: Embeddings are preserved across INSERT/UPDATE with WAL enabled" {
     // (SQL parser doesn't support embedding array literals, so we use table API for embeddings only)
     const table = db.tables.get("docs").?;
     const row_id: u64 = 1;
-    const row = table.get(row_id).?;
+    const row = table.get(row_id, null, null).?;
 
     const emb1 = try testing.allocator.dupe(f32, &embedding1);
     defer testing.allocator.free(emb1);
@@ -1258,7 +1258,7 @@ test "WAL: Multiple embedding insertions with WAL" {
 
         // Now add the embedding manually (parser doesn't support embedding literals)
         var embedding = [_]f32{@as(f32, @floatFromInt(i)) * 0.1} ** 768;
-        const row = table.get(id).?;
+        const row = table.get(id, null, null).?;
         const emb = try testing.allocator.dupe(f32, &embedding);
         defer testing.allocator.free(emb);
         try row.set(testing.allocator, "vec", ColumnValue{ .embedding = emb });
@@ -1270,8 +1270,8 @@ test "WAL: Multiple embedding insertions with WAL" {
 
     // Verify transaction IDs incremented for each insert
     // Since we have WAL enabled, each INSERT command incremented the tx_id
-    // We inserted 5 rows, so tx_id should now be 5 (started at 0)
-    try testing.expect(db.current_tx_id == 5);
+    // We inserted 5 rows, so tx_id should now be 6 (started at 1, each insert consumed one ID)
+    try testing.expect(db.tx_manager.next_tx_id.load(.monotonic) == 6);
 
     // Verify HNSW has all vectors
     for (1..6) |row_num| {
@@ -1498,9 +1498,9 @@ test "WAL Recovery: DELETE operations" {
         try testing.expectEqual(@as(usize, 2), table.count());
 
         // Verify record 2 was deleted
-        try testing.expect(table.get(2) == null);
-        try testing.expect(table.get(1) != null);
-        try testing.expect(table.get(3) != null);
+        try testing.expect(table.get(2, null, null) == null);
+        try testing.expect(table.get(1, null, null) != null);
+        try testing.expect(table.get(3, null, null) != null);
     }
 }
 
@@ -1625,7 +1625,7 @@ test "WAL Recovery: HNSW index rebuild after recovery" {
 
             // Add embedding manually and log to WAL
             var embedding = [_]f32{@as(f32, @floatFromInt(i)) * 0.1} ** 128;
-            const row = table.get(i).?;
+            const row = table.get(i, null, null).?;
 
             // Serialize old row state for WAL
             const old_serialized = try row.serialize(testing.allocator);
@@ -1678,7 +1678,7 @@ test "WAL Recovery: HNSW index rebuild after recovery" {
         const table = db.tables.get("docs").?;
         try testing.expectEqual(@as(usize, 3), table.count());
 
-        var row_it = table.rows.iterator();
+        var row_it = table.version_chains.iterator();
         while (row_it.next()) |entry| {
             const row_id = entry.key_ptr.*;
             const internal_id = db.hnsw.?.getInternalId(row_id);
@@ -1787,8 +1787,8 @@ test "WAL Crash: Mid-transaction crash (no commit)" {
         try testing.expectEqual(@as(usize, 1), table.count());
 
         // Verify row 2 from uncommitted transaction was NOT recovered
-        try testing.expect(table.get(2) == null);
-        try testing.expect(table.get(1) != null);
+        try testing.expect(table.get(2, null, null) == null);
+        try testing.expect(table.get(1, null, null) != null);
     }
 }
 
@@ -1956,9 +1956,9 @@ test "WAL Crash: Large transaction recovery" {
         try testing.expectEqual(@as(usize, num_records), table.count());
 
         // Verify some random records (row_ids start at 1, so records are 1-1000)
-        try testing.expect(table.get(1) != null);
-        try testing.expect(table.get(num_records / 2 + 1) != null);
-        try testing.expect(table.get(num_records) != null);
+        try testing.expect(table.get(1, null, null) != null);
+        try testing.expect(table.get(num_records / 2 + 1, null, null) != null);
+        try testing.expect(table.get(num_records, null, null) != null);
     }
 }
 
@@ -2020,10 +2020,10 @@ test "WAL Crash: Interleaved INSERT/UPDATE/DELETE" {
         try testing.expectEqual(@as(usize, 3), table.count()); // 4 inserted - 1 deleted = 3
 
         // Verify final state
-        try testing.expect(table.get(1) != null); // Updated to 150
-        try testing.expect(table.get(2) == null); // Deleted
-        try testing.expect(table.get(3) != null); // Original
-        try testing.expect(table.get(4) != null); // Updated to "shipped"
+        try testing.expect(table.get(1, null, null) != null); // Updated to 150
+        try testing.expect(table.get(2, null, null) == null); // Deleted
+        try testing.expect(table.get(3, null, null) != null); // Original
+        try testing.expect(table.get(4, null, null) != null); // Updated to "shipped"
 
         // Verify values
         var select1 = try db.execute("SELECT * FROM inventory WHERE id = 1");
