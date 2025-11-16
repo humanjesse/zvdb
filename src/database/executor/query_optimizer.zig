@@ -1,4 +1,5 @@
 const std = @import("std");
+const ArrayList = std.array_list.Managed;
 const core = @import("../core.zig");
 const Database = core.Database;
 const Table = @import("../../table.zig").Table;
@@ -180,11 +181,11 @@ pub const QueryOptimizer = struct {
     fn optimizeComplexWhere(
         self: *QueryOptimizer,
         table_name: []const u8,
-        expr: sql.WhereExpr,
+        expr: sql.Expr,
         total_rows: usize,
     ) !?QueryPlan {
         switch (expr) {
-            .binary_op => |bin_op| {
+            .binary => |bin_op| {
                 // Handle range queries: col > value, col < value, col >= value, col <= value
                 if (bin_op.left == .column and bin_op.right == .literal) {
                     const column = bin_op.left.column;
@@ -204,12 +205,12 @@ pub const QueryOptimizer = struct {
                 }
 
                 // Handle BETWEEN: (col >= min) AND (col <= max)
-                if (bin_op.op == .@"and") {
+                if (bin_op.op == .and_op) {
                     return try self.optimizeBetween(table_name, bin_op, total_rows);
                 }
 
                 // Handle OR: (col = val1) OR (col = val2)
-                if (bin_op.op == .@"or") {
+                if (bin_op.op == .or_op) {
                     return try self.optimizeOr(table_name, bin_op, total_rows);
                 }
             },
@@ -289,13 +290,13 @@ pub const QueryOptimizer = struct {
     fn optimizeBetween(
         self: *QueryOptimizer,
         table_name: []const u8,
-        and_expr: sql.BinaryOpExpr,
+        and_expr: *sql.BinaryExpr,
         total_rows: usize,
     ) !?QueryPlan {
         // Try to detect pattern: (col >= min) AND (col <= max)
-        if (and_expr.left.* == .binary_op and and_expr.right.* == .binary_op) {
-            const left = and_expr.left.binary_op;
-            const right = and_expr.right.binary_op;
+        if (and_expr.left == .binary and and_expr.right == .binary) {
+            const left = and_expr.left.binary;
+            const right = and_expr.right.binary;
 
             // Check if both sides reference the same column
             if (left.left == .column and right.left == .column and
@@ -350,7 +351,7 @@ pub const QueryOptimizer = struct {
     fn optimizeOr(
         self: *QueryOptimizer,
         table_name: []const u8,
-        or_expr: sql.BinaryOpExpr,
+        or_expr: *sql.BinaryExpr,
         total_rows: usize,
     ) !?QueryPlan {
         _ = self;
@@ -419,7 +420,7 @@ pub fn executeWithPlan(
         },
         .multi_index_scan => |multi| {
             // Union results from multiple index scans
-            var all_results = std.ArrayList(u64).init(allocator);
+            var all_results = ArrayList(u64).init(allocator);
             errdefer all_results.deinit();
 
             for (multi.scans) |scan| {

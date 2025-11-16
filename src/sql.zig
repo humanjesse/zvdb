@@ -22,8 +22,8 @@ pub const SqlError = error{
     TypeMismatch,
     InvalidCharacter,
     Overflow,
-    HavingWithoutGroupBy,  // HAVING used without GROUP BY
-    ValidationFailed,       // Query validation failed (semantic errors)
+    HavingWithoutGroupBy, // HAVING used without GROUP BY
+    ValidationFailed, // Query validation failed (semantic errors)
 };
 
 /// ORDER BY direction
@@ -159,7 +159,7 @@ pub const SelectCmd = struct {
     order_by_vibes: bool, // Fun parody feature!
     order_by: ?OrderByClause, // Generic ORDER BY clause
     group_by: ArrayList([]const u8), // GROUP BY columns
-    having_expr: ?Expr,  // HAVING clause for filtering grouped results
+    having_expr: ?Expr, // HAVING clause for filtering grouped results
     limit: ?usize,
 
     pub fn deinit(self: *SelectCmd, allocator: Allocator) void {

@@ -244,7 +244,7 @@ test "Query Optimizer: Range query < (less than)" {
     // Insert temperatures
     var i: u32 = 1;
     while (i <= 150) : (i += 1) {
-        const temp = i - 50; // Range: -49 to 100
+        const temp: i32 = @as(i32, @intCast(i)) - 50; // Range: -49 to 100
         const sql = try std.fmt.allocPrint(testing.allocator, "INSERT INTO temps VALUES ({d}, {d})", .{ i, temp });
         defer testing.allocator.free(sql);
 

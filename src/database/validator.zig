@@ -820,7 +820,7 @@ pub fn levenshteinDistance(a: []const u8, b: []const u8) usize {
 
     // Use stack allocation for small strings
     var matrix_buffer: [256]usize = undefined;
-    var matrix_slice = matrix_buffer[0..rows * cols];
+    var matrix_slice = matrix_buffer[0 .. rows * cols];
 
     // Initialize first row and column
     for (0..rows) |i| {
