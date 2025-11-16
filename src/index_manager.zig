@@ -124,11 +124,13 @@ pub const IndexManager = struct {
     fn buildIndexFromTable(self: *IndexManager, info: *IndexInfo, table: *Table) !void {
         _ = self;
 
-        // Iterate through all rows in the table
-        var row_it = table.rows.iterator();
+        // Iterate through all rows in the table (using version chains)
+        // Note: For index building, we use the newest version of each row
+        var row_it = table.version_chains.iterator();
         while (row_it.next()) |entry| {
             const row_id = entry.key_ptr.*;
-            const row = entry.value_ptr.*;
+            const version = entry.value_ptr.*;
+            const row = &version.data;
 
             // Get the indexed column value
             if (row.get(info.column_name)) |value| {
@@ -394,7 +396,8 @@ test "IndexManager: automatic index updates on insert" {
     const row_id = try table.insert(values);
 
     // Update index
-    const row = table.get(row_id).?;
+    // TODO Phase 3: Pass snapshot for MVCC visibility
+    const row = table.get(row_id, null, null).?;
     try mgr.onInsert("users", row_id, row);
 
     // Query index
@@ -424,9 +427,11 @@ test "IndexManager: automatic index updates on delete" {
     try mgr.createIndex("idx_users_id", "users", "id", &table);
 
     // Delete row and update index
-    const row = table.get(row_id).?;
+    // TODO Phase 3: Pass snapshot for MVCC visibility
+    const row = table.get(row_id, null, null).?;
     try mgr.onDelete("users", row_id, row);
-    _ = table.delete(row_id);
+    // TODO Phase 3: Pass transaction ID
+    try table.delete(row_id, 0);
 
     // Query index - should be empty
     const results = try mgr.query("idx_users_id", ColumnValue{ .int = 42 });

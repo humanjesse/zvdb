@@ -59,11 +59,12 @@ pub fn rebuildHnswFromTables(db: *Database) !usize {
         const table_name = table_entry.key_ptr.*;
         const table = table_entry.value_ptr.*;
 
-        // Step 4: Scan all rows in this table
-        var row_it = table.rows.iterator();
+        // Step 4: Scan all rows in this table (using newest version)
+        var row_it = table.version_chains.iterator();
         while (row_it.next()) |row_entry| {
             const row_id = row_entry.key_ptr.*;
-            const row = row_entry.value_ptr.*;
+            const version = row_entry.value_ptr.*;
+            const row = &version.data;
 
             // Step 5: Find embedding columns in this row
             var value_it = row.values.iterator();

@@ -4,6 +4,9 @@ const ArrayList = std.array_list.Managed;
 const StringHashMap = std.StringHashMap;
 const AutoHashMap = std.AutoHashMap;
 const utils = @import("utils.zig");
+const transaction = @import("transaction.zig");
+const Snapshot = transaction.Snapshot;
+const CommitLog = transaction.CommitLog;
 
 // ============================================================================
 // Data Types
@@ -135,6 +138,22 @@ pub const Row = struct {
 
     pub fn get(self: *const Row, column: []const u8) ?ColumnValue {
         return self.values.get(column);
+    }
+
+    /// Clone a row (deep copy of all values)
+    pub fn clone(self: *const Row, allocator: Allocator) !Row {
+        var new_row = Row.init(allocator, self.id);
+        errdefer new_row.deinit(allocator);
+
+        var it = self.values.iterator();
+        while (it.next()) |entry| {
+            const key = try allocator.dupe(u8, entry.key_ptr.*);
+            errdefer allocator.free(key);
+            const value = try entry.value_ptr.clone(allocator);
+            try new_row.values.put(key, value);
+        }
+
+        return new_row;
     }
 
     /// Serialize row to bytes for WAL storage
@@ -342,11 +361,87 @@ pub const Row = struct {
     }
 };
 
-/// A table with schema and rows
+// ============================================================================
+// MVCC - Multi-Version Storage
+// ============================================================================
+
+/// A single version of a row in MVCC storage
+/// Each row can have multiple versions forming a chain from newest to oldest
+pub const RowVersion = struct {
+    /// Row ID (shared across all versions of the same row)
+    row_id: u64,
+
+    /// Transaction ID that created this version (xmin)
+    xmin: u64,
+
+    /// Transaction ID that deleted/updated this version (0 = still current)
+    xmax: u64,
+
+    /// The actual row data for this version
+    data: Row,
+
+    /// Pointer to next older version (linked list)
+    next: ?*RowVersion,
+
+    /// Create a new row version
+    pub fn init(allocator: Allocator, row_id: u64, tx_id: u64, data: Row) !*RowVersion {
+        const version = try allocator.create(RowVersion);
+        version.* = .{
+            .row_id = row_id,
+            .xmin = tx_id,
+            .xmax = 0, // 0 means "not deleted yet"
+            .data = data,
+            .next = null,
+        };
+        return version;
+    }
+
+    /// Check if this version is visible to a given snapshot
+    /// This is the CORE visibility logic for MVCC
+    pub fn isVisible(self: *const RowVersion, snapshot: *const Snapshot, clog: *CommitLog) bool {
+        // Version created by a transaction that started after our snapshot?
+        if (self.xmin >= snapshot.txid) return false;
+
+        // Version created by a transaction that was active when we took snapshot?
+        if (snapshot.wasActive(self.xmin)) return false;
+
+        // Version created by aborted transaction?
+        if (clog.isAborted(self.xmin)) return false;
+
+        // Check if version has been deleted/updated
+        if (self.xmax != 0) {
+            // Deleted by transaction that committed before our snapshot?
+            if (self.xmax < snapshot.txid and clog.isCommitted(self.xmax)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// Deinitialize a single version (does not follow chain)
+    pub fn deinit(self: *RowVersion, allocator: Allocator) void {
+        self.data.deinit(allocator);
+        allocator.destroy(self);
+    }
+
+    /// Deinitialize entire version chain
+    pub fn deinitChain(self: *RowVersion, allocator: Allocator) void {
+        var current: ?*RowVersion = self;
+        while (current) |version| {
+            const next = version.next;
+            version.deinit(allocator);
+            current = next;
+        }
+    }
+};
+
+/// A table with schema and rows (MVCC-enabled)
 pub const Table = struct {
     name: []const u8,
     columns: ArrayList(Column),
-    rows: AutoHashMap(u64, Row),
+    /// MVCC: Version chains (row_id -> newest version)
+    version_chains: AutoHashMap(u64, *RowVersion),
     next_id: std.atomic.Value(u64),
     allocator: Allocator,
 
@@ -357,7 +452,7 @@ pub const Table = struct {
         return Table{
             .name = owned_name,
             .columns = ArrayList(Column).init(allocator),
-            .rows = AutoHashMap(u64, Row).init(allocator),
+            .version_chains = AutoHashMap(u64, *RowVersion).init(allocator),
             .next_id = std.atomic.Value(u64).init(1),
             .allocator = allocator,
         };
@@ -371,11 +466,13 @@ pub const Table = struct {
         }
         self.columns.deinit();
 
-        var it = self.rows.iterator();
+        // MVCC: Clean up all version chains
+        var it = self.version_chains.iterator();
         while (it.next()) |entry| {
-            entry.value_ptr.deinit(self.allocator);
+            const chain_head = entry.value_ptr.*;
+            chain_head.deinitChain(self.allocator);
         }
-        self.rows.deinit();
+        self.version_chains.deinit();
     }
 
     pub fn addColumn(self: *Table, name: []const u8, col_type: ColumnType) !void {
@@ -383,29 +480,31 @@ pub const Table = struct {
         try self.columns.append(column);
     }
 
+    /// Insert a new row (generates ID automatically)
+    /// For MVCC compatibility, uses transaction ID 0 (bootstrap transaction)
+    /// TODO Phase 3: Accept transaction ID parameter
     pub fn insert(self: *Table, values: StringHashMap(ColumnValue)) !u64 {
         const id = self.next_id.fetchAdd(1, .monotonic);
-
-        var row = Row.init(self.allocator, id);
-
-        var it = values.iterator();
-        while (it.next()) |entry| {
-            try row.set(self.allocator, entry.key_ptr.*, entry.value_ptr.*);
-        }
-
-        try self.rows.put(id, row);
+        try self.insertWithId(id, values, 0); // tx_id = 0 for bootstrap
         return id;
     }
 
-    pub fn insertWithId(self: *Table, id: u64, values: StringHashMap(ColumnValue)) !void {
+    /// Insert a row with specific ID (MVCC-enabled)
+    /// Creates the first version of the row with given transaction ID
+    pub fn insertWithId(self: *Table, id: u64, values: StringHashMap(ColumnValue), tx_id: u64) !void {
+        // Create Row data
         var row = Row.init(self.allocator, id);
+        errdefer row.deinit(self.allocator);
 
+        // Copy values into row
         var it = values.iterator();
         while (it.next()) |entry| {
             try row.set(self.allocator, entry.key_ptr.*, entry.value_ptr.*);
         }
 
-        try self.rows.put(id, row);
+        // Create first version for this row
+        const version = try RowVersion.init(self.allocator, id, tx_id, row);
+        try self.version_chains.put(id, version);
 
         // Atomically update next_id if needed (ensure it's at least id + 1)
         const desired_next = id + 1;
@@ -416,35 +515,119 @@ pub const Table = struct {
         }
     }
 
-    pub fn get(self: *Table, id: u64) ?*Row {
-        return self.rows.getPtr(id);
-    }
+    /// Get a row by ID (MVCC-enabled)
+    /// Walks the version chain to find the visible version
+    /// For non-MVCC mode (snapshot=null), returns the newest version
+    pub fn get(self: *Table, id: u64, snapshot: ?*const Snapshot, clog: ?*CommitLog) ?*Row {
+        const chain_head = self.version_chains.get(id) orelse return null;
 
-    pub fn delete(self: *Table, id: u64) bool {
-        if (self.rows.fetchRemove(id)) |entry| {
-            var row = entry.value;
-            row.deinit(self.allocator);
-            return true;
+        // Non-MVCC mode: return newest version
+        if (snapshot == null or clog == null) {
+            return &chain_head.data;
         }
-        return false;
+
+        // MVCC mode: Walk version chain from newest to oldest
+        var current: ?*RowVersion = chain_head;
+        while (current) |version| {
+            if (version.isVisible(snapshot.?, clog.?)) {
+                return &version.data;
+            }
+            current = version.next;
+        }
+
+        return null; // No visible version found
     }
 
+    /// Delete a row by ID (MVCC-enabled)
+    /// Marks the current version as deleted (sets xmax) instead of physically removing it
+    /// For non-MVCC mode (tx_id=0), uses maxInt(u64) as sentinel for "deleted"
+    pub fn delete(self: *Table, id: u64, tx_id: u64) !void {
+        const chain_head = self.version_chains.get(id) orelse return error.RowNotFound;
+
+        // Mark the current version as deleted
+        // Use maxInt as sentinel for immediate deletion (backward compatibility)
+        chain_head.xmax = if (tx_id == 0) std.math.maxInt(u64) else tx_id;
+
+        // Don't physically remove - old snapshots may still need to see it!
+    }
+
+    /// Update a row by creating a new version (MVCC-enabled)
+    /// Creates a new version with the updated value and chains it to the old version
+    pub fn update(self: *Table, row_id: u64, column: []const u8, new_value: ColumnValue, tx_id: u64) !void {
+        const old_version = self.version_chains.get(row_id) orelse return error.RowNotFound;
+
+        // Mark old version as superseded by this transaction
+        old_version.xmax = tx_id;
+
+        // Clone old row data
+        var new_row = try old_version.data.clone(self.allocator);
+        errdefer new_row.deinit(self.allocator);
+
+        // Apply the update
+        try new_row.set(self.allocator, column, new_value);
+
+        // Create new version
+        const new_version = try RowVersion.init(self.allocator, row_id, tx_id, new_row);
+
+        // Link new version to old version (new_version is now the head)
+        new_version.next = old_version;
+
+        // Update the chain head
+        try self.version_chains.put(row_id, new_version);
+    }
+
+    /// Count number of non-deleted rows
+    /// Returns count of rows where the newest version is not deleted (xmax == 0)
     pub fn count(self: *Table) usize {
-        return self.rows.count();
+        var count_active: usize = 0;
+        var it = self.version_chains.iterator();
+        while (it.next()) |entry| {
+            const head_version = entry.value_ptr.*;
+            // Count row if newest version is not deleted
+            if (head_version.xmax == 0) {
+                count_active += 1;
+            }
+        }
+        return count_active;
     }
 
-    pub fn getAllRows(self: *Table, allocator: Allocator) ![]u64 {
-        var ids = try allocator.alloc(u64, self.rows.count());
-        var it = self.rows.keyIterator();
-        var i: usize = 0;
-        while (it.next()) |id| {
-            ids[i] = id.*;
-            i += 1;
+    /// Get all visible row IDs (MVCC-enabled)
+    /// Filters rows by visibility according to the snapshot
+    /// For non-MVCC mode (snapshot=null), returns all row IDs
+    pub fn getAllRows(self: *Table, allocator: Allocator, snapshot: ?*const Snapshot, clog: ?*CommitLog) ![]u64 {
+        var visible_ids = ArrayList(u64).init(allocator);
+        defer visible_ids.deinit();
+
+        var it = self.version_chains.iterator();
+        while (it.next()) |entry| {
+            const row_id = entry.key_ptr.*;
+            const head_version = entry.value_ptr.*;
+
+            // Non-MVCC mode: include non-deleted rows (xmax == 0)
+            if (snapshot == null or clog == null) {
+                if (head_version.xmax == 0) {
+                    try visible_ids.append(row_id);
+                }
+                continue;
+            }
+
+            // MVCC mode: Walk version chain to find visible version
+            var version: ?*RowVersion = entry.value_ptr.*;
+            while (version) |v| {
+                if (v.isVisible(snapshot.?, clog.?)) {
+                    try visible_ids.append(row_id);
+                    break; // Found visible version, move to next row
+                }
+                version = v.next;
+            }
         }
-        return ids;
+
+        return visible_ids.toOwnedSlice();
     }
 
     /// Save table to a binary file (.zvdb format)
+    /// NOTE: Currently saves only the newest version of each row (no MVCC history)
+    /// TODO Phase 4: Save version chains for full MVCC recovery
     pub fn save(self: *Table, path: []const u8) !void {
         // Ensure parent directory exists
         if (std.fs.path.dirname(path)) |dir_path| {
@@ -476,12 +659,13 @@ pub const Table = struct {
             try utils.writeInt(file, u8, @intFromEnum(col.col_type));
         }
 
-        // Write rows
-        try utils.writeInt(file, u64, self.rows.count());
-        var it = self.rows.iterator();
+        // Write rows (newest version only)
+        try utils.writeInt(file, u64, self.version_chains.count());
+        var it = self.version_chains.iterator();
         while (it.next()) |entry| {
             const row_id = entry.key_ptr.*;
-            const row = entry.value_ptr.*;
+            const row_version = entry.value_ptr.*;
+            const row = row_version.data;
 
             try utils.writeInt(file, u64, row_id);
             try utils.writeInt(file, u64, row.values.count());
@@ -520,6 +704,8 @@ pub const Table = struct {
     }
 
     /// Load table from a binary file (.zvdb format)
+    /// NOTE: Loads rows as single versions with tx_id=0 (bootstrap)
+    /// TODO Phase 4: Load version chains for full MVCC recovery
     pub fn load(allocator: Allocator, path: []const u8) !Table {
         const file = try std.fs.cwd().openFile(path, .{});
         defer file.close();
@@ -549,7 +735,7 @@ pub const Table = struct {
         var table = Table{
             .name = name,
             .columns = ArrayList(Column).init(allocator),
-            .rows = AutoHashMap(u64, Row).init(allocator),
+            .version_chains = AutoHashMap(u64, *RowVersion).init(allocator),
             .next_id = std.atomic.Value(u64).init(next_id),
             .allocator = allocator,
         };
@@ -625,7 +811,9 @@ pub const Table = struct {
                 try row.values.put(col_name, value);
             }
 
-            try table.rows.put(row_id, row);
+            // Create version for loaded row (tx_id = 0 for bootstrap)
+            const row_version = try RowVersion.init(allocator, row_id, 0, row);
+            try table.version_chains.put(row_id, row_version);
         }
 
         return table;

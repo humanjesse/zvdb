@@ -890,12 +890,14 @@ fn executeInsert(db: *Database, cmd: sql.InsertCmd) !QueryResult {
     }
 
     // Insert the row using the pre-determined row_id (needed for WAL-Ahead protocol)
-    try table.insertWithId(row_id, values_map);
+    // TODO Phase 3: Pass actual transaction ID
+    try table.insertWithId(row_id, values_map, 0);
     const final_row_id = row_id;
 
     // If there's an embedding column and vector search is enabled, add to index
     if (db.hnsw) |h| {
-        const row = table.get(final_row_id).?;
+        // TODO Phase 3: Pass snapshot for MVCC visibility
+        const row = table.get(final_row_id, null, null).?;
         var it = row.values.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.* == .embedding) {
@@ -907,7 +909,8 @@ fn executeInsert(db: *Database, cmd: sql.InsertCmd) !QueryResult {
     }
 
     // Phase 1: Update B-tree indexes automatically
-    const inserted_row = table.get(final_row_id).?;
+    // TODO Phase 3: Pass snapshot for MVCC visibility
+    const inserted_row = table.get(final_row_id, null, null).?;
     try db.index_manager.onInsert(cmd.table_name, final_row_id, inserted_row);
 
     // Track operation in transaction if one is active
@@ -1224,7 +1227,7 @@ fn emitNestedLoopJoinRow(
 fn estimateTableSize(table: *Table, allocator: Allocator) !usize {
     // Simple estimation: count all rows
     // In the future, we could track this in table metadata for O(1) access
-    const row_ids = try table.getAllRows(allocator);
+    const row_ids = try table.getAllRows(allocator, null, null);
     defer allocator.free(row_ids);
     return row_ids.len;
 }
@@ -1549,10 +1552,10 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
     }
 
     // Get all rows from both tables
-    const base_row_ids = try base_table.getAllRows(db.allocator);
+    const base_row_ids = try base_table.getAllRows(db.allocator, null, null);
     defer db.allocator.free(base_row_ids);
 
-    const join_row_ids = try join_table.getAllRows(db.allocator);
+    const join_row_ids = try join_table.getAllRows(db.allocator, null, null);
     defer db.allocator.free(join_row_ids);
 
     // Perform nested loop join
@@ -1560,11 +1563,11 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
         .inner => {
             // INNER JOIN: Only include matching rows
             for (base_row_ids) |base_id| {
-                const base_row = base_table.get(base_id) orelse continue;
+                const base_row = base_table.get(base_id, null, null) orelse continue;
                 const left_val = base_row.get(left_parts.column) orelse continue;
 
                 for (join_row_ids) |join_id| {
-                    const join_row = join_table.get(join_id) orelse continue;
+                    const join_row = join_table.get(join_id, null, null) orelse continue;
                     const right_val = join_row.get(right_parts.column) orelse continue;
 
                     // Check join condition
@@ -1589,7 +1592,7 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
         .left => {
             // LEFT JOIN: Include all rows from base table, with NULLs for unmatched join table rows
             for (base_row_ids) |base_id| {
-                const base_row = base_table.get(base_id) orelse continue;
+                const base_row = base_table.get(base_id, null, null) orelse continue;
                 const left_val = base_row.get(left_parts.column) orelse {
                     // Base row has NULL in join column - still include with NULLs for join table
                     try emitNestedLoopJoinRow(
@@ -1610,7 +1613,7 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
                 var matched = false;
 
                 for (join_row_ids) |join_id| {
-                    const join_row = join_table.get(join_id) orelse continue;
+                    const join_row = join_table.get(join_id, null, null) orelse continue;
                     const right_val = join_row.get(right_parts.column) orelse continue;
 
                     if (valuesEqual(left_val, right_val)) {
@@ -1652,7 +1655,7 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
             // RIGHT JOIN: Include all rows from join table, with NULLs for unmatched base table rows
             // This is similar to LEFT JOIN but with tables swapped
             for (join_row_ids) |join_id| {
-                const join_row = join_table.get(join_id) orelse continue;
+                const join_row = join_table.get(join_id, null, null) orelse continue;
                 const right_val = join_row.get(right_parts.column) orelse {
                     // Join row has NULL in join column - still include with NULLs for base table
                     try emitNestedLoopJoinRow(
@@ -1673,7 +1676,7 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
                 var matched = false;
 
                 for (base_row_ids) |base_id| {
-                    const base_row = base_table.get(base_id) orelse continue;
+                    const base_row = base_table.get(base_id, null, null) orelse continue;
                     const left_val = base_row.get(left_parts.column) orelse continue;
 
                     if (valuesEqual(left_val, right_val)) {
@@ -1744,11 +1747,11 @@ fn executeMultiTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) 
     }
 
     // Get all rows from base table and add to intermediate
-    const base_row_ids = try base_table.getAllRows(db.allocator);
+    const base_row_ids = try base_table.getAllRows(db.allocator, null, null);
     defer db.allocator.free(base_row_ids);
 
     for (base_row_ids) |row_id| {
-        const base_row = base_table.get(row_id) orelse continue;
+        const base_row = base_table.get(row_id, null, null) orelse continue;
         var row_values = ArrayList(ColumnValue).init(db.allocator);
 
         for (base_table.columns.items) |col| {
@@ -1810,7 +1813,7 @@ fn executeJoinStage(
     const right_parts = splitQualifiedColumn(join_clause.right_column);
 
     // Get all rows from right table
-    const right_row_ids = try right_table.getAllRows(allocator);
+    const right_row_ids = try right_table.getAllRows(allocator, null, null);
     defer allocator.free(right_row_ids);
 
     // Execute join based on type
@@ -1827,7 +1830,7 @@ fn executeJoinStage(
 
                 // Find matching right rows
                 for (right_row_ids) |right_id| {
-                    const right_row = right_table.get(right_id) orelse continue;
+                    const right_row = right_table.get(right_id, null, null) orelse continue;
                     const right_val = right_row.get(right_parts.column) orelse continue;
 
                     if (valuesEqual(left_val, right_val)) {
@@ -1863,7 +1866,7 @@ fn executeJoinStage(
                         if (left_val != .null_value) {
                             // Try to find matches
                             for (right_row_ids) |right_id| {
-                                const right_row = right_table.get(right_id) orelse continue;
+                                const right_row = right_table.get(right_id, null, null) orelse continue;
                                 const right_val = right_row.get(right_parts.column) orelse continue;
 
                                 if (valuesEqual(left_val, right_val)) {
@@ -1905,7 +1908,7 @@ fn executeJoinStage(
 
             // First pass: emit all matches
             for (right_row_ids) |right_id| {
-                const right_row = right_table.get(right_id) orelse continue;
+                const right_row = right_table.get(right_id, null, null) orelse continue;
                 const right_val = right_row.get(right_parts.column);
                 var this_right_matched = false;
 
@@ -1942,7 +1945,7 @@ fn executeJoinStage(
             for (right_row_ids) |right_id| {
                 if (matched_right.contains(right_id)) continue;
 
-                const right_row = right_table.get(right_id) orelse continue;
+                const right_row = right_table.get(right_id, null, null) orelse continue;
                 var combined = ArrayList(ColumnValue).init(allocator);
 
                 // NULLs for all left columns
@@ -2122,7 +2125,7 @@ fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
             }
         } else if (cmd.order_by_vibes) {
             // Fun parody feature: random order!
-            row_ids = try table.getAllRows(db.allocator);
+            row_ids = try table.getAllRows(db.allocator, null, null);
             var prng = std.Random.DefaultPrng.init(@intCast(std.time.timestamp()));
             const random = prng.random();
 
@@ -2135,7 +2138,7 @@ fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
             }
         } else {
             // Fallback to full table scan (no index available)
-            row_ids = try table.getAllRows(db.allocator);
+            row_ids = try table.getAllRows(db.allocator, null, null);
         }
     }
 
@@ -2154,7 +2157,7 @@ fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
     for (row_ids) |row_id| {
         if (count >= max_rows) break;
 
-        const row = table.get(row_id) orelse continue;
+        const row = table.get(row_id, null, null) orelse continue;
 
         // Apply WHERE filter (skip if we already used an index to filter)
         if (!use_index) {
@@ -2287,11 +2290,11 @@ fn executeAggregateSelect(db: *Database, table: *Table, cmd: sql.SelectCmd) !Que
     }
 
     // Scan all rows and accumulate
-    const row_ids = try table.getAllRows(db.allocator);
+    const row_ids = try table.getAllRows(db.allocator, null, null);
     defer db.allocator.free(row_ids);
 
     for (row_ids) |row_id| {
-        const row = table.get(row_id) orelse continue;
+        const row = table.get(row_id, null, null) orelse continue;
 
         // Apply WHERE filter
         if (cmd.where_column) |where_col| {
@@ -2396,11 +2399,11 @@ fn executeGroupBySelect(db: *Database, table: *Table, cmd: sql.SelectCmd) !Query
     }
 
     // Scan rows and build groups
-    const row_ids = try table.getAllRows(db.allocator);
+    const row_ids = try table.getAllRows(db.allocator, null, null);
     defer db.allocator.free(row_ids);
 
     for (row_ids) |row_id| {
-        const row = table.get(row_id) orelse continue;
+        const row = table.get(row_id, null, null) orelse continue;
 
         // Apply WHERE filter
         if (cmd.where_column) |where_col| {
@@ -2505,11 +2508,11 @@ fn executeDelete(db: *Database, cmd: sql.DeleteCmd) !QueryResult {
     const table = db.tables.get(cmd.table_name) orelse return sql.SqlError.TableNotFound;
 
     var deleted_count: usize = 0;
-    const row_ids = try table.getAllRows(db.allocator);
+    const row_ids = try table.getAllRows(db.allocator, null, null);
     defer db.allocator.free(row_ids);
 
     for (row_ids) |row_id| {
-        const row = table.get(row_id) orelse continue;
+        const row = table.get(row_id, null, null) orelse continue;
 
         // Apply WHERE filter
         var should_delete = true;
@@ -2552,7 +2555,8 @@ fn executeDelete(db: *Database, cmd: sql.DeleteCmd) !QueryResult {
             // Phase 1: Update B-tree indexes before deletion (need row data)
             try db.index_manager.onDelete(cmd.table_name, row_id, row);
 
-            _ = table.delete(row_id);
+            // TODO Phase 3: Pass actual transaction ID from active transaction
+            _ = table.delete(row_id, 0) catch {};
             deleted_count += 1;
 
             // Track operation in transaction if one is active
@@ -2620,11 +2624,11 @@ fn executeUpdate(db: *Database, cmd: sql.UpdateCmd) !QueryResult {
     }
 
     var updated_count: usize = 0;
-    const row_ids = try table.getAllRows(db.allocator);
+    const row_ids = try table.getAllRows(db.allocator, null, null);
     defer db.allocator.free(row_ids);
 
     for (row_ids) |row_id| {
-        var row = table.get(row_id) orelse continue;
+        var row = table.get(row_id, null, null) orelse continue;
 
         // Apply WHERE filter using expression evaluator with subquery support
         var should_update = true;
@@ -2913,10 +2917,11 @@ fn undoOperation(db: *Database, op: Operation) !void {
         .insert => |ins| {
             // Undo INSERT: delete the inserted row
             const table = db.tables.get(ins.table_name) orelse return error.TableNotFound;
-            _ = table.delete(ins.row_id);
+            // TODO Phase 3: Pass actual transaction ID
+            _ = table.delete(ins.row_id, 0) catch {};
 
             // Update indexes
-            const row = table.get(ins.row_id);
+            const row = table.get(ins.row_id, null, null);
             if (row) |r| {
                 try db.index_manager.onDelete(ins.table_name, ins.row_id, r);
             }
@@ -2935,10 +2940,11 @@ fn undoOperation(db: *Database, op: Operation) !void {
             }
 
             // Insert the row back with its original ID
-            try table.insertWithId(del.row_id, values_map);
+            // TODO Phase 3: Pass actual transaction ID
+            try table.insertWithId(del.row_id, values_map, 0);
 
             // Update indexes
-            const row = table.get(del.row_id);
+            const row = table.get(del.row_id, null, null);
             if (row) |r| {
                 try db.index_manager.onInsert(del.table_name, del.row_id, r);
             }
@@ -2946,7 +2952,7 @@ fn undoOperation(db: *Database, op: Operation) !void {
         .update => |upd| {
             // Undo UPDATE: restore the old values
             const table = db.tables.get(upd.table_name) orelse return error.TableNotFound;
-            const row = table.get(upd.row_id) orelse return error.RowNotFound;
+            const row = table.get(upd.row_id, null, null) orelse return error.RowNotFound;
 
             // Save current row state for index update
             var old_row_for_index = Row.init(db.allocator, upd.row_id);

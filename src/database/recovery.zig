@@ -351,14 +351,15 @@ fn replayInsert(db: *Database, record: *const WalRecord) !void {
     errdefer row.deinit(db.allocator);
 
     // Check if row already exists (idempotency - may have been partially recovered)
-    if (table.rows.contains(row.id)) {
+    if (table.version_chains.contains(row.id)) {
         // Row already exists, skip (recovery is idempotent)
         row.deinit(db.allocator);
         return;
     }
 
-    // Insert the row into the table
-    try table.rows.put(row.id, row);
+    // Create version for recovered row (tx_id = 0 for bootstrap/recovery)
+    const version = try @import("../table.zig").RowVersion.init(db.allocator, row.id, 0, row);
+    try table.version_chains.put(row.id, version);
 
     // Update next_id to prevent ID conflicts with future inserts (atomic CAS loop)
     const desired_next = row.id + 1;
@@ -377,10 +378,12 @@ fn replayDelete(db: *Database, record: *const WalRecord) !void {
         return;
     };
 
-    // Remove the row if it exists (idempotent)
-    if (table.rows.fetchRemove(record.row_id)) |entry| {
-        var row = entry.value;
-        row.deinit(db.allocator);
+    // For MVCC: Mark the version as deleted (tx_id = 0 for recovery)
+    // In Phase 4, we'll properly handle WAL with transaction IDs
+    // For now, we physically remove during recovery (non-MVCC behavior)
+    if (table.version_chains.fetchRemove(record.row_id)) |entry| {
+        const version = entry.value;
+        version.deinitChain(db.allocator);
     }
 }
 
@@ -413,16 +416,17 @@ fn replayUpdate(db: *Database, record: *const WalRecord) !void {
     var updated_row = try Row.deserialize(new_data, db.allocator);
     errdefer updated_row.deinit(db.allocator);
 
-    // Remove old row if it exists
-    if (table.rows.fetchRemove(record.row_id)) |old_entry| {
-        // Call deinit directly on the returned value to avoid extra copies
-        // We can't use |*old_entry| because it's const
-        var temp_row = old_entry.value;
-        temp_row.deinit(db.allocator);
+    // For MVCC: Remove old version chain and create new one
+    // In Phase 4, we'll properly handle this with version chains
+    // For now during recovery, we replace the version chain with the latest state
+    if (table.version_chains.fetchRemove(record.row_id)) |old_entry| {
+        const old_version = old_entry.value;
+        old_version.deinitChain(db.allocator);
     }
 
-    // Insert the updated row
-    try table.rows.put(updated_row.id, updated_row);
+    // Create new version for updated row (tx_id = 0 for recovery)
+    const version = try @import("../table.zig").RowVersion.init(db.allocator, updated_row.id, 0, updated_row);
+    try table.version_chains.put(updated_row.id, version);
 
     // Update next_id to prevent ID conflicts with future inserts (atomic CAS loop)
     const desired_next = updated_row.id + 1;
