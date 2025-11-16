@@ -22,7 +22,6 @@ const validator = @import("database/validator.zig");
 const Database = @import("database/core.zig").Database;
 const ValidationMode = @import("database/core.zig").ValidationMode;
 const Table = @import("table.zig").Table;
-const TableSchema = @import("table.zig").TableSchema;
 const ColumnType = @import("table.zig").ColumnType;
 const ColumnValue = @import("table.zig").ColumnValue;
 const sql = @import("sql.zig");
@@ -32,37 +31,26 @@ const sql = @import("sql.zig");
 // ============================================================================
 
 fn createTestTable(allocator: std.mem.Allocator, name: []const u8) !Table {
-    var schema = TableSchema.init(allocator);
-    try schema.addColumn("id", ColumnType.int);
-    try schema.addColumn("name", ColumnType.text);
-    try schema.addColumn("email", ColumnType.text);
-    try schema.addColumn("age", ColumnType.int);
-
-    return Table{
-        .name = name,
-        .schema = schema,
-        .rows = std.ArrayList(std.ArrayList(ColumnValue)).init(allocator),
-        .allocator = allocator,
-    };
+    var table = try Table.init(allocator, name);
+    try table.addColumn("id", ColumnType.int);
+    try table.addColumn("name", ColumnType.text);
+    try table.addColumn("email", ColumnType.text);
+    try table.addColumn("age", ColumnType.int);
+    return table;
 }
 
 fn createTestTableLargeSchema(allocator: std.mem.Allocator, name: []const u8, num_columns: usize) !Table {
-    var schema = TableSchema.init(allocator);
+    var table = try Table.init(allocator, name);
 
     // Create many columns
     var i: usize = 0;
     while (i < num_columns) : (i += 1) {
         const col_name = try std.fmt.allocPrint(allocator, "col_{d}", .{i});
         defer allocator.free(col_name);
-        try schema.addColumn(col_name, ColumnType.int);
+        try table.addColumn(col_name, ColumnType.int);
     }
 
-    return Table{
-        .name = name,
-        .schema = schema,
-        .rows = std.ArrayList(std.ArrayList(ColumnValue)).init(allocator),
-        .allocator = allocator,
-    };
+    return table;
 }
 
 // ============================================================================
@@ -71,15 +59,12 @@ fn createTestTableLargeSchema(allocator: std.mem.Allocator, name: []const u8, nu
 
 test "validateInsert: empty column list" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var columns = std.ArrayList([]const u8).init(testing.allocator);
+    var columns = std.array_list.Managed([]const u8).init(testing.allocator);
     defer columns.deinit();
 
-    var values = std.ArrayList(ColumnValue).init(testing.allocator);
+    var values = std.array_list.Managed(ColumnValue).init(testing.allocator);
     defer values.deinit();
 
     const insert_cmd = sql.InsertCmd{
@@ -98,18 +83,15 @@ test "validateInsert: empty column list" {
 
 test "validateInsert: column count mismatch - more columns than values" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var columns = std.ArrayList([]const u8).init(testing.allocator);
+    var columns = std.array_list.Managed([]const u8).init(testing.allocator);
     defer columns.deinit();
     try columns.append("id");
     try columns.append("name");
     try columns.append("email");
 
-    var values = std.ArrayList(ColumnValue).init(testing.allocator);
+    var values = std.array_list.Managed(ColumnValue).init(testing.allocator);
     defer values.deinit();
     try values.append(ColumnValue{ .int = 1 });
     try values.append(ColumnValue{ .text = "Alice" });
@@ -130,17 +112,14 @@ test "validateInsert: column count mismatch - more columns than values" {
 
 test "validateInsert: column count mismatch - more values than columns" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var columns = std.ArrayList([]const u8).init(testing.allocator);
+    var columns = std.array_list.Managed([]const u8).init(testing.allocator);
     defer columns.deinit();
     try columns.append("id");
     try columns.append("name");
 
-    var values = std.ArrayList(ColumnValue).init(testing.allocator);
+    var values = std.array_list.Managed(ColumnValue).init(testing.allocator);
     defer values.deinit();
     try values.append(ColumnValue{ .int = 1 });
     try values.append(ColumnValue{ .text = "Alice" });
@@ -162,17 +141,14 @@ test "validateInsert: column count mismatch - more values than columns" {
 
 test "validateInsert: single column not found" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var columns = std.ArrayList([]const u8).init(testing.allocator);
+    var columns = std.array_list.Managed([]const u8).init(testing.allocator);
     defer columns.deinit();
     try columns.append("id");
     try columns.append("invalid_column");
 
-    var values = std.ArrayList(ColumnValue).init(testing.allocator);
+    var values = std.array_list.Managed(ColumnValue).init(testing.allocator);
     defer values.deinit();
     try values.append(ColumnValue{ .int = 1 });
     try values.append(ColumnValue{ .text = "test" });
@@ -193,18 +169,15 @@ test "validateInsert: single column not found" {
 
 test "validateInsert: multiple columns not found" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var columns = std.ArrayList([]const u8).init(testing.allocator);
+    var columns = std.array_list.Managed([]const u8).init(testing.allocator);
     defer columns.deinit();
     try columns.append("invalid1");
     try columns.append("invalid2");
     try columns.append("invalid3");
 
-    var values = std.ArrayList(ColumnValue).init(testing.allocator);
+    var values = std.array_list.Managed(ColumnValue).init(testing.allocator);
     defer values.deinit();
     try values.append(ColumnValue{ .int = 1 });
     try values.append(ColumnValue{ .text = "test1" });
@@ -230,18 +203,15 @@ test "validateInsert: multiple columns not found" {
 
 test "validateInsert: single duplicate column" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var columns = std.ArrayList([]const u8).init(testing.allocator);
+    var columns = std.array_list.Managed([]const u8).init(testing.allocator);
     defer columns.deinit();
     try columns.append("id");
     try columns.append("name");
     try columns.append("id"); // Duplicate
 
-    var values = std.ArrayList(ColumnValue).init(testing.allocator);
+    var values = std.array_list.Managed(ColumnValue).init(testing.allocator);
     defer values.deinit();
     try values.append(ColumnValue{ .int = 1 });
     try values.append(ColumnValue{ .text = "Alice" });
@@ -263,19 +233,16 @@ test "validateInsert: single duplicate column" {
 
 test "validateInsert: multiple duplicate columns" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var columns = std.ArrayList([]const u8).init(testing.allocator);
+    var columns = std.array_list.Managed([]const u8).init(testing.allocator);
     defer columns.deinit();
     try columns.append("id");
     try columns.append("name");
     try columns.append("id"); // Duplicate
     try columns.append("name"); // Duplicate
 
-    var values = std.ArrayList(ColumnValue).init(testing.allocator);
+    var values = std.array_list.Managed(ColumnValue).init(testing.allocator);
     defer values.deinit();
     try values.append(ColumnValue{ .int = 1 });
     try values.append(ColumnValue{ .text = "Alice" });
@@ -297,16 +264,13 @@ test "validateInsert: multiple duplicate columns" {
 
 test "validateInsert: column with special characters" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var columns = std.ArrayList([]const u8).init(testing.allocator);
+    var columns = std.array_list.Managed([]const u8).init(testing.allocator);
     defer columns.deinit();
     try columns.append("id@#$%");
 
-    var values = std.ArrayList(ColumnValue).init(testing.allocator);
+    var values = std.array_list.Managed(ColumnValue).init(testing.allocator);
     defer values.deinit();
     try values.append(ColumnValue{ .int = 1 });
 
@@ -326,17 +290,14 @@ test "validateInsert: column with special characters" {
 
 test "validateInsert: case sensitivity - wrong case column" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var columns = std.ArrayList([]const u8).init(testing.allocator);
+    var columns = std.array_list.Managed([]const u8).init(testing.allocator);
     defer columns.deinit();
     try columns.append("ID"); // Should be "id"
     try columns.append("NAME"); // Should be "name"
 
-    var values = std.ArrayList(ColumnValue).init(testing.allocator);
+    var values = std.array_list.Managed(ColumnValue).init(testing.allocator);
     defer values.deinit();
     try values.append(ColumnValue{ .int = 1 });
     try values.append(ColumnValue{ .text = "Alice" });
@@ -361,18 +322,15 @@ test "validateInsert: case sensitivity - wrong case column" {
 
 test "validateInsert: very long column name" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
     const long_name = "this_is_a_very_long_column_name_that_definitely_does_not_exist_in_the_table_schema_and_should_cause_an_error";
 
-    var columns = std.ArrayList([]const u8).init(testing.allocator);
+    var columns = std.array_list.Managed([]const u8).init(testing.allocator);
     defer columns.deinit();
     try columns.append(long_name);
 
-    var values = std.ArrayList(ColumnValue).init(testing.allocator);
+    var values = std.array_list.Managed(ColumnValue).init(testing.allocator);
     defer values.deinit();
     try values.append(ColumnValue{ .int = 1 });
 
@@ -392,16 +350,13 @@ test "validateInsert: very long column name" {
 
 test "validateInsert: numeric column name" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var columns = std.ArrayList([]const u8).init(testing.allocator);
+    var columns = std.array_list.Managed([]const u8).init(testing.allocator);
     defer columns.deinit();
     try columns.append("123");
 
-    var values = std.ArrayList(ColumnValue).init(testing.allocator);
+    var values = std.array_list.Managed(ColumnValue).init(testing.allocator);
     defer values.deinit();
     try values.append(ColumnValue{ .int = 1 });
 
@@ -421,16 +376,13 @@ test "validateInsert: numeric column name" {
 
 test "validateInsert: whitespace in column name" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var columns = std.ArrayList([]const u8).init(testing.allocator);
+    var columns = std.array_list.Managed([]const u8).init(testing.allocator);
     defer columns.deinit();
     try columns.append("user name"); // Has space
 
-    var values = std.ArrayList(ColumnValue).init(testing.allocator);
+    var values = std.array_list.Managed(ColumnValue).init(testing.allocator);
     defer values.deinit();
     try values.append(ColumnValue{ .text = "Alice" });
 
@@ -450,19 +402,16 @@ test "validateInsert: whitespace in column name" {
 
 test "validateInsert: mixed valid and invalid columns" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var columns = std.ArrayList([]const u8).init(testing.allocator);
+    var columns = std.array_list.Managed([]const u8).init(testing.allocator);
     defer columns.deinit();
     try columns.append("id"); // Valid
     try columns.append("invalid1"); // Invalid
     try columns.append("name"); // Valid
     try columns.append("invalid2"); // Invalid
 
-    var values = std.ArrayList(ColumnValue).init(testing.allocator);
+    var values = std.array_list.Managed(ColumnValue).init(testing.allocator);
     defer values.deinit();
     try values.append(ColumnValue{ .int = 1 });
     try values.append(ColumnValue{ .text = "test" });
@@ -484,16 +433,13 @@ test "validateInsert: mixed valid and invalid columns" {
 
 test "validateInsert: column with trailing/leading spaces" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var columns = std.ArrayList([]const u8).init(testing.allocator);
+    var columns = std.array_list.Managed([]const u8).init(testing.allocator);
     defer columns.deinit();
     try columns.append(" id "); // Spaces around column name
 
-    var values = std.ArrayList(ColumnValue).init(testing.allocator);
+    var values = std.array_list.Managed(ColumnValue).init(testing.allocator);
     defer values.deinit();
     try values.append(ColumnValue{ .int = 1 });
 
@@ -517,12 +463,9 @@ test "validateInsert: column with trailing/leading spaces" {
 
 test "validateUpdate: empty assignments list" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var assignments = std.ArrayList(sql.Assignment).init(testing.allocator);
+    var assignments = std.array_list.Managed(sql.Assignment).init(testing.allocator);
     defer assignments.deinit();
 
     const update_cmd = sql.UpdateCmd{
@@ -541,12 +484,9 @@ test "validateUpdate: empty assignments list" {
 
 test "validateUpdate: single assignment column not found" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var assignments = std.ArrayList(sql.Assignment).init(testing.allocator);
+    var assignments = std.array_list.Managed(sql.Assignment).init(testing.allocator);
     defer {
         for (assignments.items) |*assign| {
             testing.allocator.free(assign.column);
@@ -578,12 +518,9 @@ test "validateUpdate: single assignment column not found" {
 
 test "validateUpdate: multiple assignment columns not found" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var assignments = std.ArrayList(sql.Assignment).init(testing.allocator);
+    var assignments = std.array_list.Managed(sql.Assignment).init(testing.allocator);
     defer {
         for (assignments.items) |*assign| {
             testing.allocator.free(assign.column);
@@ -625,12 +562,9 @@ test "validateUpdate: multiple assignment columns not found" {
 
 test "validateUpdate: single duplicate assignment" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var assignments = std.ArrayList(sql.Assignment).init(testing.allocator);
+    var assignments = std.array_list.Managed(sql.Assignment).init(testing.allocator);
     defer {
         for (assignments.items) |*assign| {
             testing.allocator.free(assign.column);
@@ -668,12 +602,9 @@ test "validateUpdate: single duplicate assignment" {
 
 test "validateUpdate: multiple duplicate assignments" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var assignments = std.ArrayList(sql.Assignment).init(testing.allocator);
+    var assignments = std.array_list.Managed(sql.Assignment).init(testing.allocator);
     defer {
         for (assignments.items) |*assign| {
             testing.allocator.free(assign.column);
@@ -708,12 +639,9 @@ test "validateUpdate: multiple duplicate assignments" {
 
 test "validateUpdate: assignment with case mismatch" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var assignments = std.ArrayList(sql.Assignment).init(testing.allocator);
+    var assignments = std.array_list.Managed(sql.Assignment).init(testing.allocator);
     defer {
         for (assignments.items) |*assign| {
             testing.allocator.free(assign.column);
@@ -745,12 +673,9 @@ test "validateUpdate: assignment with case mismatch" {
 
 test "validateUpdate: assignment with special characters" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var assignments = std.ArrayList(sql.Assignment).init(testing.allocator);
+    var assignments = std.array_list.Managed(sql.Assignment).init(testing.allocator);
     defer {
         for (assignments.items) |*assign| {
             testing.allocator.free(assign.column);
@@ -782,12 +707,9 @@ test "validateUpdate: assignment with special characters" {
 
 test "validateUpdate: assignment with whitespace column" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var assignments = std.ArrayList(sql.Assignment).init(testing.allocator);
+    var assignments = std.array_list.Managed(sql.Assignment).init(testing.allocator);
     defer {
         for (assignments.items) |*assign| {
             testing.allocator.free(assign.column);
@@ -819,12 +741,9 @@ test "validateUpdate: assignment with whitespace column" {
 
 test "validateUpdate: very long assignment column name" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var assignments = std.ArrayList(sql.Assignment).init(testing.allocator);
+    var assignments = std.array_list.Managed(sql.Assignment).init(testing.allocator);
     defer {
         for (assignments.items) |*assign| {
             testing.allocator.free(assign.column);
@@ -856,12 +775,9 @@ test "validateUpdate: very long assignment column name" {
 
 test "validateUpdate: numeric assignment column name" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var assignments = std.ArrayList(sql.Assignment).init(testing.allocator);
+    var assignments = std.array_list.Managed(sql.Assignment).init(testing.allocator);
     defer {
         for (assignments.items) |*assign| {
             testing.allocator.free(assign.column);
@@ -893,12 +809,9 @@ test "validateUpdate: numeric assignment column name" {
 
 test "validateUpdate: mixed valid and invalid assignments" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var assignments = std.ArrayList(sql.Assignment).init(testing.allocator);
+    var assignments = std.array_list.Managed(sql.Assignment).init(testing.allocator);
     defer {
         for (assignments.items) |*assign| {
             testing.allocator.free(assign.column);
@@ -933,12 +846,9 @@ test "validateUpdate: mixed valid and invalid assignments" {
 
 test "validateUpdate: empty assignment column name" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var assignments = std.ArrayList(sql.Assignment).init(testing.allocator);
+    var assignments = std.array_list.Managed(sql.Assignment).init(testing.allocator);
     defer {
         for (assignments.items) |*assign| {
             testing.allocator.free(assign.column);
@@ -969,12 +879,9 @@ test "validateUpdate: empty assignment column name" {
 
 test "validateUpdate: assignment and duplicate in same command" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var assignments = std.ArrayList(sql.Assignment).init(testing.allocator);
+    var assignments = std.array_list.Managed(sql.Assignment).init(testing.allocator);
     defer {
         for (assignments.items) |*assign| {
             testing.allocator.free(assign.column);
@@ -1006,12 +913,9 @@ test "validateUpdate: assignment and duplicate in same command" {
 
 test "validateUpdate: assignment triple duplicate" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var assignments = std.ArrayList(sql.Assignment).init(testing.allocator);
+    var assignments = std.array_list.Managed(sql.Assignment).init(testing.allocator);
     defer {
         for (assignments.items) |*assign| {
             testing.allocator.free(assign.column);
@@ -1048,10 +952,7 @@ test "validateUpdate: assignment triple duplicate" {
 
 test "validateDelete: WHERE column not found" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
     const delete_cmd = sql.DeleteCmd{
         .table_name = "users",
@@ -1069,10 +970,7 @@ test "validateDelete: WHERE column not found" {
 
 test "validateDelete: WHERE column with case mismatch" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
     const delete_cmd = sql.DeleteCmd{
         .table_name = "users",
@@ -1090,10 +988,7 @@ test "validateDelete: WHERE column with case mismatch" {
 
 test "validateDelete: WHERE column with special characters" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
     const delete_cmd = sql.DeleteCmd{
         .table_name = "users",
@@ -1111,10 +1006,7 @@ test "validateDelete: WHERE column with special characters" {
 
 test "validateDelete: WHERE column with whitespace" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
     const delete_cmd = sql.DeleteCmd{
         .table_name = "users",
@@ -1132,10 +1024,7 @@ test "validateDelete: WHERE column with whitespace" {
 
 test "validateDelete: WHERE very long column name" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
     const delete_cmd = sql.DeleteCmd{
         .table_name = "users",
@@ -1153,10 +1042,7 @@ test "validateDelete: WHERE very long column name" {
 
 test "validateDelete: WHERE numeric column name" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
     const delete_cmd = sql.DeleteCmd{
         .table_name = "users",
@@ -1174,10 +1060,7 @@ test "validateDelete: WHERE numeric column name" {
 
 test "validateDelete: WHERE empty column name" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
     const delete_cmd = sql.DeleteCmd{
         .table_name = "users",
@@ -1195,10 +1078,7 @@ test "validateDelete: WHERE empty column name" {
 
 test "validateDelete: WHERE column with unicode" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
     const delete_cmd = sql.DeleteCmd{
         .table_name = "users",
@@ -1216,10 +1096,7 @@ test "validateDelete: WHERE column with unicode" {
 
 test "validateDelete: WHERE null column reference" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
     const delete_cmd = sql.DeleteCmd{
         .table_name = "users",
@@ -1237,10 +1114,7 @@ test "validateDelete: WHERE null column reference" {
 
 test "validateDelete: WHERE column with tab character" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
     const delete_cmd = sql.DeleteCmd{
         .table_name = "users",
@@ -1676,19 +1550,16 @@ test "fuzzy matching: unicode characters" {
 
 test "complex: multiple errors in single INSERT" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var columns = std.ArrayList([]const u8).init(testing.allocator);
+    var columns = std.array_list.Managed([]const u8).init(testing.allocator);
     defer columns.deinit();
     try columns.append("invalid1");
     try columns.append("id"); // duplicate below
     try columns.append("invalid2");
     try columns.append("id"); // duplicate
 
-    var values = std.ArrayList(ColumnValue).init(testing.allocator);
+    var values = std.array_list.Managed(ColumnValue).init(testing.allocator);
     defer values.deinit();
     try values.append(ColumnValue{ .int = 1 });
     try values.append(ColumnValue{ .int = 2 });
@@ -1711,12 +1582,9 @@ test "complex: multiple errors in single INSERT" {
 
 test "complex: multiple errors in single UPDATE" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var assignments = std.ArrayList(sql.Assignment).init(testing.allocator);
+    var assignments = std.array_list.Managed(sql.Assignment).init(testing.allocator);
     defer {
         for (assignments.items) |*assign| {
             testing.allocator.free(assign.column);
@@ -1751,12 +1619,9 @@ test "complex: multiple errors in single UPDATE" {
 
 test "complex: large number of columns - 100 columns" {
     var table = try createTestTableLargeSchema(testing.allocator, "large_table", 100);
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var columns = std.ArrayList([]const u8).init(testing.allocator);
+    var columns = std.array_list.Managed([]const u8).init(testing.allocator);
     defer columns.deinit();
 
     // Try to insert with some invalid columns
@@ -1765,7 +1630,7 @@ test "complex: large number of columns - 100 columns" {
     try columns.append("invalid_col");
     try columns.append("col_99");
 
-    var values = std.ArrayList(ColumnValue).init(testing.allocator);
+    var values = std.array_list.Managed(ColumnValue).init(testing.allocator);
     defer values.deinit();
     try values.append(ColumnValue{ .int = 1 });
     try values.append(ColumnValue{ .int = 2 });
@@ -1787,15 +1652,12 @@ test "complex: large number of columns - 100 columns" {
 
 test "complex: large number of invalid columns - 50 invalid" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var columns = std.ArrayList([]const u8).init(testing.allocator);
+    var columns = std.array_list.Managed([]const u8).init(testing.allocator);
     defer columns.deinit();
 
-    var values = std.ArrayList(ColumnValue).init(testing.allocator);
+    var values = std.array_list.Managed(ColumnValue).init(testing.allocator);
     defer values.deinit();
 
     // Add 50 invalid columns
@@ -1822,15 +1684,12 @@ test "complex: large number of invalid columns - 50 invalid" {
 
 test "complex: all valid columns in large schema" {
     var table = try createTestTableLargeSchema(testing.allocator, "large_table", 50);
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var columns = std.ArrayList([]const u8).init(testing.allocator);
+    var columns = std.array_list.Managed([]const u8).init(testing.allocator);
     defer columns.deinit();
 
-    var values = std.ArrayList(ColumnValue).init(testing.allocator);
+    var values = std.array_list.Managed(ColumnValue).init(testing.allocator);
     defer values.deinit();
 
     // Add all 50 valid columns
@@ -1857,12 +1716,9 @@ test "complex: all valid columns in large schema" {
 
 test "complex: mixed valid invalid and duplicates" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var columns = std.ArrayList([]const u8).init(testing.allocator);
+    var columns = std.array_list.Managed([]const u8).init(testing.allocator);
     defer columns.deinit();
     try columns.append("id"); // Valid
     try columns.append("invalid"); // Invalid
@@ -1870,7 +1726,7 @@ test "complex: mixed valid invalid and duplicates" {
     try columns.append("id"); // Duplicate
     try columns.append("another_invalid"); // Invalid
 
-    var values = std.ArrayList(ColumnValue).init(testing.allocator);
+    var values = std.array_list.Managed(ColumnValue).init(testing.allocator);
     defer values.deinit();
     try values.append(ColumnValue{ .int = 1 });
     try values.append(ColumnValue{ .int = 2 });
@@ -1894,12 +1750,9 @@ test "complex: mixed valid invalid and duplicates" {
 
 test "complex: UPDATE with many assignments" {
     var table = try createTestTableLargeSchema(testing.allocator, "large_table", 100);
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var assignments = std.ArrayList(sql.Assignment).init(testing.allocator);
+    var assignments = std.array_list.Managed(sql.Assignment).init(testing.allocator);
     defer {
         for (assignments.items) |*assign| {
             testing.allocator.free(assign.column);
@@ -1934,19 +1787,16 @@ test "complex: UPDATE with many assignments" {
 
 test "complex: INSERT all duplicates of valid column" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var columns = std.ArrayList([]const u8).init(testing.allocator);
+    var columns = std.array_list.Managed([]const u8).init(testing.allocator);
     defer columns.deinit();
     try columns.append("id");
     try columns.append("id");
     try columns.append("id");
     try columns.append("id");
 
-    var values = std.ArrayList(ColumnValue).init(testing.allocator);
+    var values = std.array_list.Managed(ColumnValue).init(testing.allocator);
     defer values.deinit();
     try values.append(ColumnValue{ .int = 1 });
     try values.append(ColumnValue{ .int = 2 });
@@ -1969,16 +1819,13 @@ test "complex: INSERT all duplicates of valid column" {
 
 test "complex: validation with hints - typo detection" {
     var table = try createTestTable(testing.allocator, "users");
-    defer {
-        table.schema.deinit();
-        table.rows.deinit();
-    }
+    defer table.deinit();
 
-    var columns = std.ArrayList([]const u8).init(testing.allocator);
+    var columns = std.array_list.Managed([]const u8).init(testing.allocator);
     defer columns.deinit();
     try columns.append("nane"); // Typo: should be "name"
 
-    var values = std.ArrayList(ColumnValue).init(testing.allocator);
+    var values = std.array_list.Managed(ColumnValue).init(testing.allocator);
     defer values.deinit();
     try values.append(ColumnValue{ .text = "Alice" });
 

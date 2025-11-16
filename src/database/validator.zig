@@ -127,8 +127,8 @@ pub const ValidationResult = struct {
     pub fn init(allocator: Allocator) ValidationResult {
         return ValidationResult{
             .valid = true,
-            .errors = std.ArrayList(ValidationIssue).init(allocator),
-            .warnings = std.ArrayList(ValidationIssue).init(allocator),
+            .errors = .{},
+            .warnings = .{},
             .allocator = allocator,
         };
     }
@@ -137,12 +137,12 @@ pub const ValidationResult = struct {
         for (self.errors.items) |*err| {
             err.deinit();
         }
-        self.errors.deinit();
+        self.errors.deinit(self.allocator);
 
         for (self.warnings.items) |*warn| {
             warn.deinit();
         }
-        self.warnings.deinit();
+        self.warnings.deinit(self.allocator);
     }
 
     /// Add an error to the result
@@ -160,7 +160,7 @@ pub const ValidationResult = struct {
             message,
             hint,
         );
-        try self.errors.append(issue);
+        try self.errors.append(self.allocator, issue);
         self.valid = false;
     }
 
@@ -179,7 +179,7 @@ pub const ValidationResult = struct {
             message,
             hint,
         );
-        try self.warnings.append(issue);
+        try self.warnings.append(self.allocator, issue);
     }
 
     /// Check if there are any errors
@@ -589,7 +589,7 @@ pub fn validateInsert(
 
         // Check if column exists in table schema
         var column_exists = false;
-        for (table.schema.columns.items) |schema_col| {
+        for (table.columns.items) |schema_col| {
             if (std.mem.eql(u8, col_name, schema_col.name)) {
                 column_exists = true;
                 break;
@@ -682,7 +682,7 @@ pub fn validateUpdate(
 
         // Check if column exists in table schema
         var column_exists = false;
-        for (table.schema.columns.items) |schema_col| {
+        for (table.columns.items) |schema_col| {
             if (std.mem.eql(u8, col_name, schema_col.name)) {
                 column_exists = true;
                 break;
@@ -763,7 +763,7 @@ pub fn validateDelete(
     if (cmd.where_column) |col_name| {
         // Check if column exists in table schema
         var column_exists = false;
-        for (table.schema.columns.items) |schema_col| {
+        for (table.columns.items) |schema_col| {
             if (std.mem.eql(u8, col_name, schema_col.name)) {
                 column_exists = true;
                 break;
@@ -888,12 +888,12 @@ pub fn findSimilarColumnInTable(
     table: *Table,
     max_distance: usize,
 ) ?[]const u8 {
-    if (table.schema.columns.items.len == 0) return null;
+    if (table.columns.items.len == 0) return null;
 
     var best_match: ?[]const u8 = null;
     var best_distance: usize = max_distance + 1;
 
-    for (table.schema.columns.items) |col_def| {
+    for (table.columns.items) |col_def| {
         const distance = levenshteinDistance(needle, col_def.name);
 
         if (distance < best_distance) {
@@ -1023,31 +1023,20 @@ test "formatErrorMessage: ambiguous column" {
 // ============================================================================
 
 test "validateInsert: valid insert" {
-    const ColumnDef = @import("../table.zig").ColumnDef;
-    const ColumnType = @import("../table.zig").ColumnType;
-    const TableSchema = @import("../table.zig").TableSchema;
     const ColumnValue = @import("../table.zig").ColumnValue;
 
-    var schema = TableSchema.init(testing.allocator);
-    defer schema.deinit();
-    try schema.addColumn("id", ColumnType.int);
-    try schema.addColumn("name", ColumnType.text);
-
-    var table = Table{
-        .name = "users",
-        .schema = schema,
-        .rows = std.ArrayList(std.ArrayList(ColumnValue)).init(testing.allocator),
-        .allocator = testing.allocator,
-    };
-    defer table.rows.deinit();
+    var table = try Table.init(testing.allocator, "users");
+    defer table.deinit();
+    try table.addColumn("id", ColumnType.int);
+    try table.addColumn("name", ColumnType.text);
 
     // Create a valid INSERT command
-    var columns = std.ArrayList([]const u8).init(testing.allocator);
+    var columns = std.array_list.Managed([]const u8).init(testing.allocator);
     defer columns.deinit();
     try columns.append("id");
     try columns.append("name");
 
-    var values = std.ArrayList(ColumnValue).init(testing.allocator);
+    var values = std.array_list.Managed(ColumnValue).init(testing.allocator);
     defer values.deinit();
     try values.append(ColumnValue{ .int = 1 });
     try values.append(ColumnValue{ .text = "Alice" });
@@ -1066,31 +1055,20 @@ test "validateInsert: valid insert" {
 }
 
 test "validateInsert: column not found" {
-    const ColumnDef = @import("../table.zig").ColumnDef;
-    const ColumnType = @import("../table.zig").ColumnType;
-    const TableSchema = @import("../table.zig").TableSchema;
     const ColumnValue = @import("../table.zig").ColumnValue;
 
-    var schema = TableSchema.init(testing.allocator);
-    defer schema.deinit();
-    try schema.addColumn("id", ColumnType.int);
-    try schema.addColumn("name", ColumnType.text);
-
-    var table = Table{
-        .name = "users",
-        .schema = schema,
-        .rows = std.ArrayList(std.ArrayList(ColumnValue)).init(testing.allocator),
-        .allocator = testing.allocator,
-    };
-    defer table.rows.deinit();
+    var table = try Table.init(testing.allocator, "users");
+    defer table.deinit();
+    try table.addColumn("id", ColumnType.int);
+    try table.addColumn("name", ColumnType.text);
 
     // Create INSERT with invalid column
-    var columns = std.ArrayList([]const u8).init(testing.allocator);
+    var columns = std.array_list.Managed([]const u8).init(testing.allocator);
     defer columns.deinit();
     try columns.append("id");
     try columns.append("invalid_col");
 
-    var values = std.ArrayList(ColumnValue).init(testing.allocator);
+    var values = std.array_list.Managed(ColumnValue).init(testing.allocator);
     defer values.deinit();
     try values.append(ColumnValue{ .int = 1 });
     try values.append(ColumnValue{ .text = "Alice" });
@@ -1110,31 +1088,20 @@ test "validateInsert: column not found" {
 }
 
 test "validateInsert: duplicate columns" {
-    const ColumnDef = @import("../table.zig").ColumnDef;
-    const ColumnType = @import("../table.zig").ColumnType;
-    const TableSchema = @import("../table.zig").TableSchema;
     const ColumnValue = @import("../table.zig").ColumnValue;
 
-    var schema = TableSchema.init(testing.allocator);
-    defer schema.deinit();
-    try schema.addColumn("id", ColumnType.int);
-    try schema.addColumn("name", ColumnType.text);
-
-    var table = Table{
-        .name = "users",
-        .schema = schema,
-        .rows = std.ArrayList(std.ArrayList(ColumnValue)).init(testing.allocator),
-        .allocator = testing.allocator,
-    };
-    defer table.rows.deinit();
+    var table = try Table.init(testing.allocator, "users");
+    defer table.deinit();
+    try table.addColumn("id", ColumnType.int);
+    try table.addColumn("name", ColumnType.text);
 
     // Create INSERT with duplicate column
-    var columns = std.ArrayList([]const u8).init(testing.allocator);
+    var columns = std.array_list.Managed([]const u8).init(testing.allocator);
     defer columns.deinit();
     try columns.append("id");
     try columns.append("id"); // Duplicate!
 
-    var values = std.ArrayList(ColumnValue).init(testing.allocator);
+    var values = std.array_list.Managed(ColumnValue).init(testing.allocator);
     defer values.deinit();
     try values.append(ColumnValue{ .int = 1 });
     try values.append(ColumnValue{ .int = 2 });
@@ -1153,31 +1120,20 @@ test "validateInsert: duplicate columns" {
 }
 
 test "validateInsert: column count mismatch" {
-    const ColumnDef = @import("../table.zig").ColumnDef;
-    const ColumnType = @import("../table.zig").ColumnType;
-    const TableSchema = @import("../table.zig").TableSchema;
     const ColumnValue = @import("../table.zig").ColumnValue;
 
-    var schema = TableSchema.init(testing.allocator);
-    defer schema.deinit();
-    try schema.addColumn("id", ColumnType.int);
-    try schema.addColumn("name", ColumnType.text);
-
-    var table = Table{
-        .name = "users",
-        .schema = schema,
-        .rows = std.ArrayList(std.ArrayList(ColumnValue)).init(testing.allocator),
-        .allocator = testing.allocator,
-    };
-    defer table.rows.deinit();
+    var table = try Table.init(testing.allocator, "users");
+    defer table.deinit();
+    try table.addColumn("id", ColumnType.int);
+    try table.addColumn("name", ColumnType.text);
 
     // Create INSERT with mismatched counts
-    var columns = std.ArrayList([]const u8).init(testing.allocator);
+    var columns = std.array_list.Managed([]const u8).init(testing.allocator);
     defer columns.deinit();
     try columns.append("id");
     try columns.append("name");
 
-    var values = std.ArrayList(ColumnValue).init(testing.allocator);
+    var values = std.array_list.Managed(ColumnValue).init(testing.allocator);
     defer values.deinit();
     try values.append(ColumnValue{ .int = 1 }); // Only one value!
 
@@ -1199,26 +1155,15 @@ test "validateInsert: column count mismatch" {
 // ============================================================================
 
 test "validateUpdate: valid update" {
-    const ColumnDef = @import("../table.zig").ColumnDef;
-    const ColumnType = @import("../table.zig").ColumnType;
-    const TableSchema = @import("../table.zig").TableSchema;
     const ColumnValue = @import("../table.zig").ColumnValue;
 
-    var schema = TableSchema.init(testing.allocator);
-    defer schema.deinit();
-    try schema.addColumn("id", ColumnType.int);
-    try schema.addColumn("name", ColumnType.text);
-
-    var table = Table{
-        .name = "users",
-        .schema = schema,
-        .rows = std.ArrayList(std.ArrayList(ColumnValue)).init(testing.allocator),
-        .allocator = testing.allocator,
-    };
-    defer table.rows.deinit();
+    var table = try Table.init(testing.allocator, "users");
+    defer table.deinit();
+    try table.addColumn("id", ColumnType.int);
+    try table.addColumn("name", ColumnType.text);
 
     // Create a valid UPDATE command
-    var assignments = std.ArrayList(sql.Assignment).init(testing.allocator);
+    var assignments = std.array_list.Managed(sql.Assignment).init(testing.allocator);
     defer assignments.deinit();
     try assignments.append(sql.Assignment{
         .column = "name",
@@ -1239,26 +1184,15 @@ test "validateUpdate: valid update" {
 }
 
 test "validateUpdate: column not found" {
-    const ColumnDef = @import("../table.zig").ColumnDef;
-    const ColumnType = @import("../table.zig").ColumnType;
-    const TableSchema = @import("../table.zig").TableSchema;
     const ColumnValue = @import("../table.zig").ColumnValue;
 
-    var schema = TableSchema.init(testing.allocator);
-    defer schema.deinit();
-    try schema.addColumn("id", ColumnType.int);
-    try schema.addColumn("name", ColumnType.text);
-
-    var table = Table{
-        .name = "users",
-        .schema = schema,
-        .rows = std.ArrayList(std.ArrayList(ColumnValue)).init(testing.allocator),
-        .allocator = testing.allocator,
-    };
-    defer table.rows.deinit();
+    var table = try Table.init(testing.allocator, "users");
+    defer table.deinit();
+    try table.addColumn("id", ColumnType.int);
+    try table.addColumn("name", ColumnType.text);
 
     // Create UPDATE with invalid column
-    var assignments = std.ArrayList(sql.Assignment).init(testing.allocator);
+    var assignments = std.array_list.Managed(sql.Assignment).init(testing.allocator);
     defer assignments.deinit();
     try assignments.append(sql.Assignment{
         .column = "invalid_col",
@@ -1280,26 +1214,15 @@ test "validateUpdate: column not found" {
 }
 
 test "validateUpdate: duplicate assignments" {
-    const ColumnDef = @import("../table.zig").ColumnDef;
-    const ColumnType = @import("../table.zig").ColumnType;
-    const TableSchema = @import("../table.zig").TableSchema;
     const ColumnValue = @import("../table.zig").ColumnValue;
 
-    var schema = TableSchema.init(testing.allocator);
-    defer schema.deinit();
-    try schema.addColumn("id", ColumnType.int);
-    try schema.addColumn("name", ColumnType.text);
-
-    var table = Table{
-        .name = "users",
-        .schema = schema,
-        .rows = std.ArrayList(std.ArrayList(ColumnValue)).init(testing.allocator),
-        .allocator = testing.allocator,
-    };
-    defer table.rows.deinit();
+    var table = try Table.init(testing.allocator, "users");
+    defer table.deinit();
+    try table.addColumn("id", ColumnType.int);
+    try table.addColumn("name", ColumnType.text);
 
     // Create UPDATE with duplicate assignments
-    var assignments = std.ArrayList(sql.Assignment).init(testing.allocator);
+    var assignments = std.array_list.Managed(sql.Assignment).init(testing.allocator);
     defer assignments.deinit();
     try assignments.append(sql.Assignment{
         .column = "name",
@@ -1328,23 +1251,12 @@ test "validateUpdate: duplicate assignments" {
 // ============================================================================
 
 test "validateDelete: valid delete" {
-    const ColumnDef = @import("../table.zig").ColumnDef;
-    const ColumnType = @import("../table.zig").ColumnType;
-    const TableSchema = @import("../table.zig").TableSchema;
     const ColumnValue = @import("../table.zig").ColumnValue;
 
-    var schema = TableSchema.init(testing.allocator);
-    defer schema.deinit();
-    try schema.addColumn("id", ColumnType.int);
-    try schema.addColumn("name", ColumnType.text);
-
-    var table = Table{
-        .name = "users",
-        .schema = schema,
-        .rows = std.ArrayList(std.ArrayList(ColumnValue)).init(testing.allocator),
-        .allocator = testing.allocator,
-    };
-    defer table.rows.deinit();
+    var table = try Table.init(testing.allocator, "users");
+    defer table.deinit();
+    try table.addColumn("id", ColumnType.int);
+    try table.addColumn("name", ColumnType.text);
 
     // Create a valid DELETE command
     const delete_cmd = sql.DeleteCmd{
@@ -1361,23 +1273,12 @@ test "validateDelete: valid delete" {
 }
 
 test "validateDelete: column not found" {
-    const ColumnDef = @import("../table.zig").ColumnDef;
-    const ColumnType = @import("../table.zig").ColumnType;
-    const TableSchema = @import("../table.zig").TableSchema;
     const ColumnValue = @import("../table.zig").ColumnValue;
 
-    var schema = TableSchema.init(testing.allocator);
-    defer schema.deinit();
-    try schema.addColumn("id", ColumnType.int);
-    try schema.addColumn("name", ColumnType.text);
-
-    var table = Table{
-        .name = "users",
-        .schema = schema,
-        .rows = std.ArrayList(std.ArrayList(ColumnValue)).init(testing.allocator),
-        .allocator = testing.allocator,
-    };
-    defer table.rows.deinit();
+    var table = try Table.init(testing.allocator, "users");
+    defer table.deinit();
+    try table.addColumn("id", ColumnType.int);
+    try table.addColumn("name", ColumnType.text);
 
     // Create DELETE with invalid column
     const delete_cmd = sql.DeleteCmd{
@@ -1467,23 +1368,11 @@ test "findSimilarColumn: picks closest match" {
 }
 
 test "findSimilarColumnInTable: finds similar column" {
-    const ColumnType = @import("../table.zig").ColumnType;
-    const TableSchema = @import("../table.zig").TableSchema;
-    const ColumnValue = @import("../table.zig").ColumnValue;
-
-    var schema = TableSchema.init(testing.allocator);
-    defer schema.deinit();
-    try schema.addColumn("id", ColumnType.int);
-    try schema.addColumn("user_name", ColumnType.text);
-    try schema.addColumn("email", ColumnType.text);
-
-    var table = Table{
-        .name = "users",
-        .schema = schema,
-        .rows = std.ArrayList(std.ArrayList(ColumnValue)).init(testing.allocator),
-        .allocator = testing.allocator,
-    };
-    defer table.rows.deinit();
+    var table = try Table.init(testing.allocator, "users");
+    defer table.deinit();
+    try table.addColumn("id", ColumnType.int);
+    try table.addColumn("user_name", ColumnType.text);
+    try table.addColumn("email", ColumnType.text);
 
     // "usr_name" should match "user_name"
     const result = findSimilarColumnInTable("usr_name", &table, 2);
@@ -1492,30 +1381,20 @@ test "findSimilarColumnInTable: finds similar column" {
 }
 
 test "validateInsert: fuzzy matching hint" {
-    const ColumnType = @import("../table.zig").ColumnType;
-    const TableSchema = @import("../table.zig").TableSchema;
     const ColumnValue = @import("../table.zig").ColumnValue;
 
-    var schema = TableSchema.init(testing.allocator);
-    defer schema.deinit();
-    try schema.addColumn("id", ColumnType.int);
-    try schema.addColumn("user_name", ColumnType.text);
-
-    var table = Table{
-        .name = "users",
-        .schema = schema,
-        .rows = std.ArrayList(std.ArrayList(ColumnValue)).init(testing.allocator),
-        .allocator = testing.allocator,
-    };
-    defer table.rows.deinit();
+    var table = try Table.init(testing.allocator, "users");
+    defer table.deinit();
+    try table.addColumn("id", ColumnType.int);
+    try table.addColumn("user_name", ColumnType.text);
 
     // Create INSERT with typo in column name
-    var columns = std.ArrayList([]const u8).init(testing.allocator);
+    var columns = std.array_list.Managed([]const u8).init(testing.allocator);
     defer columns.deinit();
     try columns.append("id");
     try columns.append("usr_name"); // Typo: missing "e"
 
-    var values = std.ArrayList(ColumnValue).init(testing.allocator);
+    var values = std.array_list.Managed(ColumnValue).init(testing.allocator);
     defer values.deinit();
     try values.append(ColumnValue{ .int = 1 });
     try values.append(ColumnValue{ .text = "Alice" });
