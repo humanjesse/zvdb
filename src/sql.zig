@@ -23,6 +23,7 @@ pub const SqlError = error{
     InvalidCharacter,
     Overflow,
     HavingWithoutGroupBy,  // HAVING used without GROUP BY
+    ValidationFailed,       // Query validation failed (semantic errors)
 };
 
 /// ORDER BY direction

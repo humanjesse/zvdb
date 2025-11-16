@@ -20,8 +20,11 @@ const std = @import("std");
 const core = @import("../core.zig");
 const Database = core.Database;
 const QueryResult = core.QueryResult;
+const ValidationMode = core.ValidationMode;
 const valuesEqual = core.valuesEqual;
 const recovery = @import("../recovery.zig");
+const validator = @import("../validator.zig");
+const ValidationResult = validator.ValidationResult;
 const Table = @import("../../table.zig").Table;
 const ColumnValue = @import("../../table.zig").ColumnValue;
 const ColumnType = @import("../../table.zig").ColumnType;
@@ -40,6 +43,61 @@ const Allocator = std.mem.Allocator;
 // Forward declaration for expression evaluation (still in main executor)
 // This will be moved to expr_evaluator once that module is fully extracted
 const evaluateExprWithSubqueries = @import("../executor.zig").evaluateExprWithSubqueries;
+
+// ============================================================================
+// Validation Helpers
+// ============================================================================
+
+/// Handle validation result based on database validation mode
+/// Returns error.ValidationFailed in strict mode if validation fails
+/// Logs warnings in warnings mode
+/// Does nothing in disabled mode
+fn handleValidationResult(db: *Database, validation_result: *ValidationResult) !void {
+    // If validation passed, nothing to do
+    if (validation_result.valid) {
+        return;
+    }
+
+    // Get validation mode
+    const mode = db.getValidationMode();
+
+    switch (mode) {
+        .strict => {
+            // In strict mode, validation errors block execution
+            // Log the errors for user feedback
+            if (validation_result.hasErrors()) {
+                std.debug.print("\n=== VALIDATION ERRORS ===\n", .{});
+                for (validation_result.errors.items) |*err| {
+                    std.debug.print("ERROR: {s}\n", .{err.message});
+                    if (err.hint) |hint| {
+                        std.debug.print("HINT: {s}\n", .{hint});
+                    }
+                }
+                std.debug.print("=========================\n\n", .{});
+            }
+            return sql.SqlError.ValidationFailed;
+        },
+
+        .warnings => {
+            // In warnings mode, log but continue execution
+            if (validation_result.hasErrors()) {
+                std.debug.print("\n=== VALIDATION WARNINGS ===\n", .{});
+                for (validation_result.errors.items) |*err| {
+                    std.debug.print("WARNING: {s}\n", .{err.message});
+                    if (err.hint) |hint| {
+                        std.debug.print("HINT: {s}\n", .{hint});
+                    }
+                }
+                std.debug.print("===========================\n\n", .{});
+            }
+            // Continue execution despite errors
+        },
+
+        .disabled => {
+            // Validation disabled, do nothing
+        },
+    }
+}
 
 // ============================================================================
 // DDL Commands - Table and Index Management
@@ -122,12 +180,21 @@ pub fn executeDropIndex(db: *Database, cmd: sql.DropIndexCmd) !QueryResult {
 
 /// Execute INSERT command
 /// Inserts a new row into the specified table with proper:
+/// - Semantic validation (column existence, type checking)
 /// - WAL logging for crash recovery
 /// - MVCC versioning for transaction isolation
 /// - Index updates (B-tree and HNSW vector indexes)
 /// - Transaction tracking for rollback support
 pub fn executeInsert(db: *Database, cmd: sql.InsertCmd) !QueryResult {
     const table = db.tables.get(cmd.table_name) orelse return sql.SqlError.TableNotFound;
+
+    // Phase 4: Validate query before execution (if validation enabled)
+    if (db.isValidationEnabled()) {
+        var validation_result = try validator.validateInsert(db.allocator, &cmd, table);
+        defer validation_result.deinit();
+
+        try handleValidationResult(db, &validation_result);
+    }
 
     var values_map = StringHashMap(ColumnValue).init(db.allocator);
     defer values_map.deinit();
@@ -221,12 +288,21 @@ pub fn executeInsert(db: *Database, cmd: sql.InsertCmd) !QueryResult {
 
 /// Execute DELETE command
 /// Deletes rows matching the WHERE clause with proper:
+/// - Semantic validation (WHERE clause column existence)
 /// - MVCC snapshot isolation for consistent reads
 /// - WAL logging for crash recovery
 /// - Index updates (B-tree removal)
 /// - Transaction tracking for rollback support
 pub fn executeDelete(db: *Database, cmd: sql.DeleteCmd) !QueryResult {
     const table = db.tables.get(cmd.table_name) orelse return sql.SqlError.TableNotFound;
+
+    // Phase 4: Validate query before execution (if validation enabled)
+    if (db.isValidationEnabled()) {
+        var validation_result = try validator.validateDelete(db.allocator, &cmd, table);
+        defer validation_result.deinit();
+
+        try handleValidationResult(db, &validation_result);
+    }
 
     // Phase 3: Get MVCC context for snapshot isolation
     const snapshot = db.getCurrentSnapshot();
@@ -311,6 +387,7 @@ pub fn executeDelete(db: *Database, cmd: sql.DeleteCmd) !QueryResult {
 
 /// Execute UPDATE command
 /// Updates rows matching the WHERE clause with proper:
+/// - Semantic validation (column existence, WHERE clause validation)
 /// - Column type validation
 /// - MVCC versioning for transaction isolation
 /// - WAL logging for crash recovery (stores both old and new state)
@@ -319,6 +396,14 @@ pub fn executeDelete(db: *Database, cmd: sql.DeleteCmd) !QueryResult {
 /// - Atomic updates for embedding columns with rollback on failure
 pub fn executeUpdate(db: *Database, cmd: sql.UpdateCmd) !QueryResult {
     const table = db.tables.get(cmd.table_name) orelse return sql.SqlError.TableNotFound;
+
+    // Phase 4: Validate query before execution (if validation enabled)
+    if (db.isValidationEnabled()) {
+        var validation_result = try validator.validateUpdate(db.allocator, &cmd, table);
+        defer validation_result.deinit();
+
+        try handleValidationResult(db, &validation_result);
+    }
 
     // Validate all SET columns exist in table and have correct types
     for (cmd.assignments.items) |assignment| {
