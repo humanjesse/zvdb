@@ -25,7 +25,10 @@ const Allocator = std.mem.Allocator;
 // Import evaluateExprWithSubqueries from main executor
 const executor = @import("../executor.zig");
 const evaluateExprWithSubqueries = executor.evaluateExprWithSubqueries;
-const applyOrderBy = executor.applyOrderBy;
+
+// Import applyOrderBy from sort executor
+const sort_executor = @import("sort_executor.zig");
+const applyOrderBy = sort_executor.applyOrderBy;
 
 // ============================================================================
 // JOIN Support
