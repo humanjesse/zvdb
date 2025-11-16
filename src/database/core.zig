@@ -8,6 +8,8 @@ const HNSW = @import("../hnsw.zig").HNSW;
 const WalWriter = @import("../wal.zig").WalWriter;
 const IndexManager = @import("../index_manager.zig").IndexManager;
 const TransactionManager = @import("../transaction.zig").TransactionManager;
+const Snapshot = @import("../transaction.zig").Snapshot;
+const CommitLog = @import("../transaction.zig").CommitLog;
 
 /// Query result set
 pub const QueryResult = struct {
@@ -209,6 +211,33 @@ pub const Database = struct {
     pub fn rebuildHnswFromTables(self: *Database) !usize {
         const vector_ops = @import("vector_ops.zig");
         return vector_ops.rebuildHnswFromTables(self);
+    }
+
+    // ========================================================================
+    // MVCC Transaction Context Helpers (Phase 3)
+    // ========================================================================
+
+    /// Get current transaction ID (returns 0 if no active transaction - bootstrap mode)
+    pub fn getCurrentTxId(self: *Database) u64 {
+        if (self.tx_manager.getCurrentTx()) |tx| {
+            return tx.id;
+        }
+        return 0; // Bootstrap transaction for backward compatibility
+    }
+
+    /// Get current transaction's snapshot (returns null if no active transaction)
+    pub fn getCurrentSnapshot(self: *Database) ?*const Snapshot {
+        if (self.tx_manager.getCurrentTx()) |tx| {
+            if (tx.snapshot) |*snapshot| {
+                return snapshot;
+            }
+        }
+        return null;
+    }
+
+    /// Get CLOG (Commit Log) for visibility checks
+    pub fn getClog(self: *Database) *CommitLog {
+        return &self.tx_manager.clog;
     }
 };
 

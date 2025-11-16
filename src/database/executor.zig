@@ -890,14 +890,18 @@ fn executeInsert(db: *Database, cmd: sql.InsertCmd) !QueryResult {
     }
 
     // Insert the row using the pre-determined row_id (needed for WAL-Ahead protocol)
-    // TODO Phase 3: Pass actual transaction ID
-    try table.insertWithId(row_id, values_map, 0);
+    // Phase 3: Use actual transaction ID from active transaction (or 0 for bootstrap)
+    const tx_id = db.getCurrentTxId();
+    try table.insertWithId(row_id, values_map, tx_id);
     const final_row_id = row_id;
+
+    // Phase 3: Get MVCC context for visibility checks
+    const snapshot = db.getCurrentSnapshot();
+    const clog = db.getClog();
 
     // If there's an embedding column and vector search is enabled, add to index
     if (db.hnsw) |h| {
-        // TODO Phase 3: Pass snapshot for MVCC visibility
-        const row = table.get(final_row_id, null, null).?;
+        const row = table.get(final_row_id, snapshot, clog).?;
         var it = row.values.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.* == .embedding) {
@@ -909,8 +913,7 @@ fn executeInsert(db: *Database, cmd: sql.InsertCmd) !QueryResult {
     }
 
     // Phase 1: Update B-tree indexes automatically
-    // TODO Phase 3: Pass snapshot for MVCC visibility
-    const inserted_row = table.get(final_row_id, null, null).?;
+    const inserted_row = table.get(final_row_id, snapshot, clog).?;
     try db.index_manager.onInsert(cmd.table_name, final_row_id, inserted_row);
 
     // Track operation in transaction if one is active
@@ -1224,10 +1227,10 @@ fn emitNestedLoopJoinRow(
 }
 
 /// Estimate the number of rows in a table
-fn estimateTableSize(table: *Table, allocator: Allocator) !usize {
+fn estimateTableSize(table: *Table, allocator: Allocator, snapshot: ?*const Snapshot, clog: ?*CommitLog) !usize {
     // Simple estimation: count all rows
     // In the future, we could track this in table metadata for O(1) access
-    const row_ids = try table.getAllRows(allocator, null, null);
+    const row_ids = try table.getAllRows(allocator, snapshot, clog);
     defer allocator.free(row_ids);
     return row_ids.len;
 }
@@ -1462,6 +1465,10 @@ fn executeJoinSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
 fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !QueryResult {
     var result = QueryResult.init(db.allocator);
 
+    // Phase 3: Get MVCC context for snapshot isolation
+    const snapshot = db.getCurrentSnapshot();
+    const clog = db.getClog();
+
     const join = cmd.joins.items[0];
     const join_table = db.tables.get(join.table_name) orelse return sql.SqlError.TableNotFound;
 
@@ -1470,8 +1477,8 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
     const right_parts = splitQualifiedColumn(join.right_column);
 
     // Cost-based optimizer: decide whether to use hash join or nested loop
-    const base_size = try estimateTableSize(base_table, db.allocator);
-    const join_size = try estimateTableSize(join_table, db.allocator);
+    const base_size = try estimateTableSize(base_table, db.allocator, snapshot, clog);
+    const join_size = try estimateTableSize(join_table, db.allocator, snapshot, clog);
 
     if (shouldUseHashJoin(base_size, join_size)) {
         // Use hash join for better performance on large tables
@@ -1493,6 +1500,8 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
             right_parts.column,
             join_with_all_columns or select_all, // Include all columns if WHERE needs them
             if (join_with_all_columns) &[_]sql.SelectColumn{} else cmd.columns.items,
+            snapshot,
+            clog,
         );
 
         // Apply WHERE clause filter if present
@@ -2083,6 +2092,10 @@ fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
         }
     }
 
+    // Phase 3: Get MVCC context for snapshot isolation
+    const snapshot = db.getCurrentSnapshot();
+    const clog = db.getClog();
+
     // Get rows to process
     var row_ids: []u64 = undefined;
     const should_free_ids = true;
@@ -2125,7 +2138,7 @@ fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
             }
         } else if (cmd.order_by_vibes) {
             // Fun parody feature: random order!
-            row_ids = try table.getAllRows(db.allocator, null, null);
+            row_ids = try table.getAllRows(db.allocator, snapshot, clog);
             var prng = std.Random.DefaultPrng.init(@intCast(std.time.timestamp()));
             const random = prng.random();
 
@@ -2138,7 +2151,7 @@ fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
             }
         } else {
             // Fallback to full table scan (no index available)
-            row_ids = try table.getAllRows(db.allocator, null, null);
+            row_ids = try table.getAllRows(db.allocator, snapshot, clog);
         }
     }
 
@@ -2157,7 +2170,7 @@ fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
     for (row_ids) |row_id| {
         if (count >= max_rows) break;
 
-        const row = table.get(row_id, null, null) orelse continue;
+        const row = table.get(row_id, snapshot, clog) orelse continue;
 
         // Apply WHERE filter (skip if we already used an index to filter)
         if (!use_index) {
@@ -2289,12 +2302,16 @@ fn executeAggregateSelect(db: *Database, table: *Table, cmd: sql.SelectCmd) !Que
         }
     }
 
+    // Phase 3: Get MVCC context for snapshot isolation
+    const snapshot = db.getCurrentSnapshot();
+    const clog = db.getClog();
+
     // Scan all rows and accumulate
-    const row_ids = try table.getAllRows(db.allocator, null, null);
+    const row_ids = try table.getAllRows(db.allocator, snapshot, clog);
     defer db.allocator.free(row_ids);
 
     for (row_ids) |row_id| {
-        const row = table.get(row_id, null, null) orelse continue;
+        const row = table.get(row_id, snapshot, clog) orelse continue;
 
         // Apply WHERE filter
         if (cmd.where_column) |where_col| {
@@ -2398,12 +2415,16 @@ fn executeGroupBySelect(db: *Database, table: *Table, cmd: sql.SelectCmd) !Query
         }
     }
 
+    // Phase 3: Get MVCC context for snapshot isolation
+    const snapshot = db.getCurrentSnapshot();
+    const clog = db.getClog();
+
     // Scan rows and build groups
-    const row_ids = try table.getAllRows(db.allocator, null, null);
+    const row_ids = try table.getAllRows(db.allocator, snapshot, clog);
     defer db.allocator.free(row_ids);
 
     for (row_ids) |row_id| {
-        const row = table.get(row_id, null, null) orelse continue;
+        const row = table.get(row_id, snapshot, clog) orelse continue;
 
         // Apply WHERE filter
         if (cmd.where_column) |where_col| {
@@ -2507,12 +2528,16 @@ fn executeGroupBySelect(db: *Database, table: *Table, cmd: sql.SelectCmd) !Query
 fn executeDelete(db: *Database, cmd: sql.DeleteCmd) !QueryResult {
     const table = db.tables.get(cmd.table_name) orelse return sql.SqlError.TableNotFound;
 
+    // Phase 3: Get MVCC context for snapshot isolation
+    const snapshot = db.getCurrentSnapshot();
+    const clog = db.getClog();
+
     var deleted_count: usize = 0;
-    const row_ids = try table.getAllRows(db.allocator, null, null);
+    const row_ids = try table.getAllRows(db.allocator, snapshot, clog);
     defer db.allocator.free(row_ids);
 
     for (row_ids) |row_id| {
-        const row = table.get(row_id, null, null) orelse continue;
+        const row = table.get(row_id, snapshot, clog) orelse continue;
 
         // Apply WHERE filter
         var should_delete = true;
@@ -2555,8 +2580,9 @@ fn executeDelete(db: *Database, cmd: sql.DeleteCmd) !QueryResult {
             // Phase 1: Update B-tree indexes before deletion (need row data)
             try db.index_manager.onDelete(cmd.table_name, row_id, row);
 
-            // TODO Phase 3: Pass actual transaction ID from active transaction
-            _ = table.delete(row_id, 0) catch {};
+            // Phase 3: Pass actual transaction ID from active transaction
+            const tx_id = db.getCurrentTxId();
+            _ = table.delete(row_id, tx_id) catch {};
             deleted_count += 1;
 
             // Track operation in transaction if one is active
@@ -2623,12 +2649,17 @@ fn executeUpdate(db: *Database, cmd: sql.UpdateCmd) !QueryResult {
         }
     }
 
+    // Phase 3: Get MVCC context for snapshot isolation
+    const snapshot = db.getCurrentSnapshot();
+    const clog = db.getClog();
+    const tx_id = db.getCurrentTxId();
+
     var updated_count: usize = 0;
-    const row_ids = try table.getAllRows(db.allocator, null, null);
+    const row_ids = try table.getAllRows(db.allocator, snapshot, clog);
     defer db.allocator.free(row_ids);
 
     for (row_ids) |row_id| {
-        var row = table.get(row_id, null, null) orelse continue;
+        var row = table.get(row_id, snapshot, clog) orelse continue;
 
         // Apply WHERE filter using expression evaluator with subquery support
         var should_update = true;
@@ -2774,13 +2805,19 @@ fn executeUpdate(db: *Database, cmd: sql.UpdateCmd) !QueryResult {
         }
         errdefer if (tx_old_values) |*tov| tov.deinit();
 
-        // Now apply all SET assignments to the row
+        // Phase 3: Apply all SET assignments using table.update() to create new versions
+        // This creates one new version with all updates applied
+        // Note: We call update() for each column which creates multiple versions
+        // TODO Phase 4: Optimize to create single version for multi-column updates
         for (cmd.assignments.items) |assignment| {
-            try row.set(db.allocator, assignment.column, assignment.value);
+            try table.update(row_id, assignment.column, assignment.value, tx_id);
         }
 
+        // Get the updated row for index updates
+        const updated_row = table.get(row_id, snapshot, clog).?;
+
         // Phase 1: Update B-tree indexes after row mutation
-        try db.index_manager.onUpdate(cmd.table_name, row_id, &old_row_for_index, row);
+        try db.index_manager.onUpdate(cmd.table_name, row_id, &old_row_for_index, updated_row);
 
         // Track operation in transaction if one is active
         if (db.tx_manager.getCurrentTx()) |tx| {

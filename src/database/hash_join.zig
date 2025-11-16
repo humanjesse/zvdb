@@ -12,6 +12,8 @@ const SelectColumn = sql.SelectColumn;
 const Allocator = std.mem.Allocator;
 const ArrayList = std.array_list.Managed;
 const AutoHashMap = std.AutoHashMap;
+const Snapshot = @import("../transaction.zig").Snapshot;
+const CommitLog = @import("../transaction.zig").CommitLog;
 
 // ============================================================================
 // Hash Function for Join Keys
@@ -138,18 +140,20 @@ pub fn buildHashTable(
     allocator: Allocator,
     table: *Table,
     join_column: []const u8,
+    snapshot: ?*const Snapshot,
+    clog: ?*CommitLog,
 ) !JoinHashTable {
     var hash_table = JoinHashTable.init(allocator);
     errdefer hash_table.deinit();
 
     // Get all rows from the build table
-    // TODO Phase 3: Pass snapshot for MVCC visibility
-    const row_ids = try table.getAllRows(allocator, null, null);
+    // Phase 3: Pass snapshot for MVCC visibility
+    const row_ids = try table.getAllRows(allocator, snapshot, clog);
     defer allocator.free(row_ids);
 
     for (row_ids) |row_id| {
-        // TODO Phase 3: Pass snapshot for MVCC visibility
-        const row = table.get(row_id, null, null) orelse continue;
+        // Phase 3: Pass snapshot for MVCC visibility
+        const row = table.get(row_id, snapshot, clog) orelse continue;
         const key_value = row.get(join_column) orelse continue;
 
         // Skip NULL keys (NULL doesn't match NULL in SQL)
@@ -271,6 +275,8 @@ pub fn executeHashJoin(
     right_column: []const u8,
     select_all: bool,
     columns: []const SelectColumn,
+    snapshot: ?*const Snapshot,
+    clog: ?*CommitLog,
 ) !QueryResult {
     var result = QueryResult.init(allocator);
 
@@ -320,6 +326,8 @@ pub fn executeHashJoin(
                 select_all,
                 columns,
                 &result,
+                snapshot,
+                clog,
             );
         },
         .left => {
@@ -335,6 +343,8 @@ pub fn executeHashJoin(
                 select_all,
                 columns,
                 &result,
+                snapshot,
+                clog,
             );
         },
         .right => {
@@ -350,6 +360,8 @@ pub fn executeHashJoin(
                 select_all,
                 columns,
                 &result,
+                snapshot,
+                clog,
             );
         },
     }
@@ -372,19 +384,21 @@ fn executeInnerHashJoin(
     select_all: bool,
     columns: []const SelectColumn,
     result: *QueryResult,
+    snapshot: ?*const Snapshot,
+    clog: ?*CommitLog,
 ) !void {
     // Build phase: hash the join table (build table)
-    var build_hash = try buildHashTable(allocator, join_table, right_column);
+    var build_hash = try buildHashTable(allocator, join_table, right_column, snapshot, clog);
     defer build_hash.deinit();
 
     // Probe phase: scan the base table (probe table)
-    // TODO Phase 3: Pass snapshot for MVCC visibility
-    const base_row_ids = try base_table.getAllRows(allocator, null, null);
+    // Phase 3: Pass snapshot for MVCC visibility
+    const base_row_ids = try base_table.getAllRows(allocator, snapshot, clog);
     defer allocator.free(base_row_ids);
 
     for (base_row_ids) |base_id| {
-        // TODO Phase 3: Pass snapshot for MVCC visibility
-        const base_row = base_table.get(base_id, null, null) orelse continue;
+        // Phase 3: Pass snapshot for MVCC visibility
+        const base_row = base_table.get(base_id, snapshot, clog) orelse continue;
         const probe_key = base_row.get(left_column) orelse continue;
 
         // Skip NULL keys (NULL doesn't match NULL in SQL)
@@ -396,7 +410,7 @@ fn executeInnerHashJoin(
         if (build_hash.probe(probe_hash)) |matching_ids| {
             // Found potential matches - verify with actual equality check
             for (matching_ids) |join_id| {
-                const join_row = join_table.get(join_id, null, null) orelse continue;
+                const join_row = join_table.get(join_id, snapshot, clog) orelse continue;
                 const right_val = join_row.get(right_column) orelse continue;
 
                 // Double-check equality to handle hash collisions
@@ -435,9 +449,11 @@ fn executeLeftHashJoin(
     select_all: bool,
     columns: []const SelectColumn,
     result: *QueryResult,
+    snapshot: ?*const Snapshot,
+    clog: ?*CommitLog,
 ) !void {
     // Build phase: hash the join table
-    var build_hash = try buildHashTable(allocator, join_table, right_column);
+    var build_hash = try buildHashTable(allocator, join_table, right_column, snapshot, clog);
     defer build_hash.deinit();
 
     // Track which base rows were matched
@@ -445,12 +461,12 @@ fn executeLeftHashJoin(
     defer matched_base_rows.deinit();
 
     // Probe phase: scan the base table
-    const base_row_ids = try base_table.getAllRows(allocator, null, null);
+    const base_row_ids = try base_table.getAllRows(allocator, snapshot, clog);
     defer allocator.free(base_row_ids);
 
     for (base_row_ids) |base_id| {
-        // TODO Phase 3: Pass snapshot for MVCC visibility
-        const base_row = base_table.get(base_id, null, null) orelse continue;
+        // Phase 3: Pass snapshot for MVCC visibility
+        const base_row = base_table.get(base_id, snapshot, clog) orelse continue;
         const probe_key = base_row.get(left_column) orelse {
             // Base row has NULL in join column - emit with NULLs for join table
             try emitJoinedRow(
@@ -491,7 +507,7 @@ fn executeLeftHashJoin(
 
         if (build_hash.probe(probe_hash)) |matching_ids| {
             for (matching_ids) |join_id| {
-                const join_row = join_table.get(join_id, null, null) orelse continue;
+                const join_row = join_table.get(join_id, snapshot, clog) orelse continue;
                 const right_val = join_row.get(right_column) orelse continue;
 
                 if (valuesEqual(probe_key, right_val)) {
@@ -522,8 +538,8 @@ fn executeLeftHashJoin(
     // Emit unmatched base rows with NULLs for join table
     for (base_row_ids) |base_id| {
         if (!matched_base_rows.contains(base_id)) {
-            // TODO Phase 3: Pass snapshot for MVCC visibility
-            const base_row = base_table.get(base_id, null, null) orelse continue;
+            // Phase 3: Pass snapshot for MVCC visibility
+            const base_row = base_table.get(base_id, snapshot, clog) orelse continue;
 
             // Check if this row has a NULL key (already emitted above)
             const key_val = base_row.get(left_column);
@@ -560,9 +576,11 @@ fn executeRightHashJoin(
     select_all: bool,
     columns: []const SelectColumn,
     result: *QueryResult,
+    snapshot: ?*const Snapshot,
+    clog: ?*CommitLog,
 ) !void {
     // Build phase: hash the base table (reversed)
-    var build_hash = try buildHashTable(allocator, base_table, left_column);
+    var build_hash = try buildHashTable(allocator, base_table, left_column, snapshot, clog);
     defer build_hash.deinit();
 
     // Track which join rows were matched
@@ -570,11 +588,11 @@ fn executeRightHashJoin(
     defer matched_join_rows.deinit();
 
     // Probe phase: scan the join table (reversed)
-    const join_row_ids = try join_table.getAllRows(allocator, null, null);
+    const join_row_ids = try join_table.getAllRows(allocator, snapshot, clog);
     defer allocator.free(join_row_ids);
 
     for (join_row_ids) |join_id| {
-        const join_row = join_table.get(join_id, null, null) orelse continue;
+        const join_row = join_table.get(join_id, snapshot, clog) orelse continue;
         const probe_key = join_row.get(right_column) orelse {
             // Join row has NULL in join column - emit with NULLs for base table
             try emitJoinedRow(
@@ -615,8 +633,8 @@ fn executeRightHashJoin(
 
         if (build_hash.probe(probe_hash)) |matching_ids| {
             for (matching_ids) |base_id| {
-                // TODO Phase 3: Pass snapshot for MVCC visibility
-                const base_row = base_table.get(base_id, null, null) orelse continue;
+                // Phase 3: Pass snapshot for MVCC visibility
+                const base_row = base_table.get(base_id, snapshot, clog) orelse continue;
                 const left_val = base_row.get(left_column) orelse continue;
 
                 if (valuesEqual(left_val, probe_key)) {
@@ -647,7 +665,7 @@ fn executeRightHashJoin(
     // Emit unmatched join rows with NULLs for base table
     for (join_row_ids) |join_id| {
         if (!matched_join_rows.contains(join_id)) {
-            const join_row = join_table.get(join_id, null, null) orelse continue;
+            const join_row = join_table.get(join_id, snapshot, clog) orelse continue;
 
             // Check if this row has a NULL key (already emitted above)
             const key_val = join_row.get(right_column);
