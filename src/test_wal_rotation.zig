@@ -40,11 +40,9 @@ test "WAL Rotation: Basic rotation maintains integrity" {
     try std.fs.cwd().makePath(test_dir);
 
     // Create WAL with small max file size to trigger rotation
-    var wal = try WalWriter.init(.{
-        .allocator = allocator,
-        .wal_dir = test_dir,
+    var wal = try WalWriter.initWithOptions(allocator, test_dir, .{
         .page_size = 4096,
-        .max_file_size = 8192, // Small size to force rotation
+        .max_file_size = 2048, // Small size to force rotation (100 records * 45 bytes = 4500 bytes)
     });
     defer wal.deinit();
 
@@ -59,10 +57,10 @@ test "WAL Rotation: Basic rotation maintains integrity" {
             .lsn = 0,
             .row_id = i,
             .table_name = "test_table",
-            .column_name = "test_col",
-            .value = ColumnValue{ .int = @as(i64, @intCast(i)) },
+            .data = "",
+            .checksum = 0,
         };
-        try wal.writeRecord(record);
+        _ = try wal.writeRecord(record);
 
         // Check if rotation occurred
         if (wal.sequence > initial_sequence) {
@@ -80,10 +78,10 @@ test "WAL Rotation: Basic rotation maintains integrity" {
         .lsn = 0,
         .row_id = 9999,
         .table_name = "test_table",
-        .column_name = "test_col",
-        .value = ColumnValue{ .int = 9999 },
+        .data = "",
+        .checksum = 0,
     };
-    try wal.writeRecord(post_rotation_record);
+    _ = try wal.writeRecord(post_rotation_record);
 
     // Flush to ensure data is written
     try wal.flush();
@@ -97,9 +95,7 @@ test "WAL Rotation: Rapid rotation stress test" {
     try std.fs.cwd().makePath(test_dir);
 
     // Create WAL with very small max file size to force many rotations
-    var wal = try WalWriter.init(.{
-        .allocator = allocator,
-        .wal_dir = test_dir,
+    var wal = try WalWriter.initWithOptions(allocator, test_dir, .{
         .page_size = 4096,
         .max_file_size = 6000, // Very small to force frequent rotation
     });
@@ -117,10 +113,10 @@ test "WAL Rotation: Rapid rotation stress test" {
             .lsn = 0,
             .row_id = i,
             .table_name = "stress_test_table",
-            .column_name = "data",
-            .value = ColumnValue{ .int = @as(i64, @intCast(i)) },
+            .data = "",
+            .checksum = 0,
         };
-        try wal.writeRecord(record);
+        _ = try wal.writeRecord(record);
     }
 
     // Verify multiple rotations occurred
@@ -135,10 +131,10 @@ test "WAL Rotation: Rapid rotation stress test" {
         .lsn = 0,
         .row_id = 0,
         .table_name = "",
-        .column_name = "",
-        .value = ColumnValue.null_value,
+        .data = "",
+        .checksum = 0,
     };
-    try wal.writeRecord(final_record);
+    _ = try wal.writeRecord(final_record);
     try wal.flush();
 }
 
@@ -149,9 +145,7 @@ test "WAL Rotation: Checkpoint after rotation" {
 
     try std.fs.cwd().makePath(test_dir);
 
-    var wal = try WalWriter.init(.{
-        .allocator = allocator,
-        .wal_dir = test_dir,
+    var wal = try WalWriter.initWithOptions(allocator, test_dir, .{
         .page_size = 4096,
         .max_file_size = 8192,
     });
@@ -166,10 +160,10 @@ test "WAL Rotation: Checkpoint after rotation" {
             .lsn = 0,
             .row_id = i,
             .table_name = "test_table",
-            .column_name = "col",
-            .value = ColumnValue{ .int = @as(i64, @intCast(i)) },
+            .data = "",
+            .checksum = 0,
         };
-        try wal.writeRecord(record);
+        _ = try wal.writeRecord(record);
     }
 
     // Write checkpoint after rotation
@@ -183,10 +177,10 @@ test "WAL Rotation: Checkpoint after rotation" {
         .lsn = 0,
         .row_id = 1000,
         .table_name = "test_table",
-        .column_name = "col",
-        .value = ColumnValue{ .int = 1000 },
+        .data = "",
+        .checksum = 0,
     };
-    try wal.writeRecord(post_checkpoint_record);
+    _ = try wal.writeRecord(post_checkpoint_record);
 }
 
 test "WAL Rotation: Recovery after rotation" {
@@ -201,9 +195,7 @@ test "WAL Rotation: Recovery after rotation" {
 
     // Write records and force rotation
     {
-        var wal = try WalWriter.init(.{
-            .allocator = allocator,
-            .wal_dir = test_dir,
+        var wal = try WalWriter.initWithOptions(allocator, test_dir, .{
             .page_size = 4096,
             .max_file_size = 8192,
         });
@@ -217,10 +209,10 @@ test "WAL Rotation: Recovery after rotation" {
                 .lsn = 0,
                 .row_id = i,
                 .table_name = "recovery_test",
-                .column_name = "data",
-                .value = ColumnValue{ .int = @as(i64, @intCast(i)) },
+                .data = "",
+                .checksum = 0,
             };
-            try wal.writeRecord(record);
+            _ = try wal.writeRecord(record);
         }
 
         // Write more records after rotation
@@ -232,24 +224,43 @@ test "WAL Rotation: Recovery after rotation" {
                 .lsn = 0,
                 .row_id = i,
                 .table_name = "recovery_test",
-                .column_name = "data",
-                .value = ColumnValue{ .int = @as(i64, @intCast(i)) },
+                .data = "",
+                .checksum = 0,
             };
-            try wal.writeRecord(record);
+            _ = try wal.writeRecord(record);
         }
 
         try wal.flush();
     }
 
     // Now read all WAL files to verify recovery works
-    var reader = try WalReader.init(allocator, test_dir);
-    defer reader.deinit();
-
+    // We need to iterate through each WAL file (wal.000000, wal.000001, etc.)
     var recovered_count: usize = 0;
-    while (try reader.readRecord()) |record| {
-        if (record.record_type == .insert_row) {
-            recovered_count += 1;
+    var seq: u64 = 0;
+
+    while (true) {
+        const wal_path = try std.fmt.allocPrint(allocator, "{s}/wal.{d:0>6}", .{ test_dir, seq });
+        defer allocator.free(wal_path);
+
+        // Try to open this WAL file
+        var reader = WalReader.init(allocator, wal_path) catch |err| {
+            if (err == error.FileNotFound) break; // No more WAL files
+            return err;
+        };
+        defer reader.deinit();
+
+        // Read all records from this file
+        while (try reader.readRecord()) |record| {
+            defer {
+                var rec = record;
+                rec.deinit(allocator);
+            }
+            if (record.record_type == .insert_row) {
+                recovered_count += 1;
+            }
         }
+
+        seq += 1;
     }
 
     // Should recover all records from all WAL files
@@ -263,9 +274,7 @@ test "WAL Rotation: Multiple sequential rotations" {
 
     try std.fs.cwd().makePath(test_dir);
 
-    var wal = try WalWriter.init(.{
-        .allocator = allocator,
-        .wal_dir = test_dir,
+    var wal = try WalWriter.initWithOptions(allocator, test_dir, .{
         .page_size = 4096,
         .max_file_size = 7000,
     });
@@ -276,8 +285,6 @@ test "WAL Rotation: Multiple sequential rotations" {
 
     var batch: usize = 0;
     while (batch < num_batches) : (batch += 1) {
-        const sequence_before = wal.sequence;
-
         // Write records
         var i: usize = 0;
         while (i < records_per_batch) : (i += 1) {
@@ -288,10 +295,10 @@ test "WAL Rotation: Multiple sequential rotations" {
                 .lsn = 0,
                 .row_id = @as(u64, @intCast(record_id)),
                 .table_name = "sequential_test",
-                .column_name = "data",
-                .value = ColumnValue{ .int = @as(i64, @intCast(record_id)) },
+                .data = "",
+                .checksum = 0,
             };
-            try wal.writeRecord(record);
+            _ = try wal.writeRecord(record);
         }
 
         // Verify we can still write after each batch (rotation may have occurred)
@@ -301,10 +308,10 @@ test "WAL Rotation: Multiple sequential rotations" {
             .lsn = 0,
             .row_id = 0,
             .table_name = "",
-            .column_name = "",
-            .value = ColumnValue.null_value,
+            .data = "",
+            .checksum = 0,
         };
-        try wal.writeRecord(test_record);
+        _ = try wal.writeRecord(test_record);
     }
 
     // Verify WAL is healthy after all operations
@@ -319,48 +326,46 @@ test "WAL Rotation: Interleaved transactions across rotation boundary" {
 
     try std.fs.cwd().makePath(test_dir);
 
-    var wal = try WalWriter.init(.{
-        .allocator = allocator,
-        .wal_dir = test_dir,
+    var wal = try WalWriter.initWithOptions(allocator, test_dir, .{
         .page_size = 4096,
         .max_file_size = 8192,
     });
     defer wal.deinit();
 
     // Start transaction 1
-    try wal.writeRecord(WalRecord{
+    _ = try wal.writeRecord(WalRecord{
         .record_type = .begin_tx,
         .tx_id = 1,
         .lsn = 0,
         .row_id = 0,
         .table_name = "",
-        .column_name = "",
-        .value = ColumnValue.null_value,
+        .data = "",
+        .checksum = 0,
     });
 
     // Write many records to force rotation
     var i: u64 = 0;
     while (i < 80) : (i += 1) {
-        try wal.writeRecord(WalRecord{
+        _ = try wal.writeRecord(WalRecord{
             .record_type = .insert_row,
             .tx_id = 1,
             .lsn = 0,
             .row_id = i,
             .table_name = "tx_test",
-            .column_name = "data",
-            .value = ColumnValue{ .int = @as(i64, @intCast(i)) },
+            .data = "",
+            .checksum = 0,
         });
     }
 
     // Commit transaction 1 (should work even after rotation)
-    try wal.writeRecord(WalRecord{
+    _ = try wal.writeRecord(WalRecord{
         .record_type = .commit_tx,
         .tx_id = 1,
         .lsn = 0,
         .row_id = 0,
         .table_name = "",
-        .column_name = "",
-        .value = ColumnValue.null_value,
+        .data = "",
+        .checksum = 0,
     });
 
     try wal.flush();
@@ -373,9 +378,7 @@ test "WAL Rotation: File handle validity after rotation" {
 
     try std.fs.cwd().makePath(test_dir);
 
-    var wal = try WalWriter.init(.{
-        .allocator = allocator,
-        .wal_dir = test_dir,
+    var wal = try WalWriter.initWithOptions(allocator, test_dir, .{
         .page_size = 4096,
         .max_file_size = 8000,
     });
@@ -390,10 +393,10 @@ test "WAL Rotation: File handle validity after rotation" {
             .lsn = 0,
             .row_id = i,
             .table_name = "handle_test",
-            .column_name = "data",
-            .value = ColumnValue{ .int = @as(i64, @intCast(i)) },
+            .data = "",
+            .checksum = 0,
         };
-        try wal.writeRecord(record);
+        _ = try wal.writeRecord(record);
     }
 
     // CRITICAL TEST: After rotation, the file handle should be valid
@@ -409,10 +412,10 @@ test "WAL Rotation: File handle validity after rotation" {
             .lsn = 0,
             .row_id = i + 1000,
             .table_name = "handle_test",
-            .column_name = "data",
-            .value = ColumnValue{ .int = @as(i64, @intCast(i + 1000)) },
+            .data = "",
+            .checksum = 0,
         };
-        try wal.writeRecord(record);
+        _ = try wal.writeRecord(record);
     }
 
     // Final flush to ensure everything is written

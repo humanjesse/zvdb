@@ -48,7 +48,6 @@ fn deleteThreadFn(context: *DeleteThreadContext) void {
             break :blk switch (err) {
                 error.SerializationFailure => DeleteResult.serialization_failure,
                 error.RowNotFound => DeleteResult.row_not_found,
-                else => DeleteResult.other_error,
             };
         };
         break :blk DeleteResult.success;
@@ -63,8 +62,8 @@ test "Concurrent Delete Stress Test: 100 threads deleting same row" {
     defer table.deinit();
 
     // Add columns
-    try table.addColumn("id", .int, null);
-    try table.addColumn("name", .text, null);
+    try table.addColumn("id", .int);
+    try table.addColumn("name", .text);
 
     // Create commit log for MVCC
     var clog = CommitLog.init(allocator);
@@ -72,7 +71,14 @@ test "Concurrent Delete Stress Test: 100 threads deleting same row" {
 
     // Insert a test row with transaction ID 1
     var values = std.StringHashMap(ColumnValue).init(allocator);
-    defer values.deinit();
+    defer {
+        var it = values.iterator();
+        while (it.next()) |entry| {
+            var val = entry.value_ptr.*;
+            val.deinit(allocator);
+        }
+        values.deinit();
+    }
 
     try values.put("id", ColumnValue{ .int = 42 });
     try values.put("name", ColumnValue{ .text = try allocator.dupe(u8, "Test Row") });
@@ -81,7 +87,7 @@ test "Concurrent Delete Stress Test: 100 threads deleting same row" {
     try table.insertWithId(1, values, tx_id);
 
     // Mark transaction 1 as committed
-    try clog.markCommitted(tx_id);
+    try clog.setStatus(tx_id, .committed);
 
     // Create contexts for NUM_THREADS concurrent delete attempts
     var contexts: [NUM_THREADS]DeleteThreadContext = undefined;
@@ -153,8 +159,8 @@ test "Concurrent Update Stress Test: 100 threads updating same row" {
     defer table.deinit();
 
     // Add columns
-    try table.addColumn("id", .int, null);
-    try table.addColumn("counter", .int, null);
+    try table.addColumn("id", .int);
+    try table.addColumn("counter", .int);
 
     // Create commit log for MVCC
     var clog = CommitLog.init(allocator);
@@ -171,7 +177,7 @@ test "Concurrent Update Stress Test: 100 threads updating same row" {
     try table.insertWithId(1, values, initial_tx_id);
 
     // Mark transaction 1 as committed
-    try clog.markCommitted(initial_tx_id);
+    try clog.setStatus(initial_tx_id, .committed);
 
     // Thread context for concurrent updates
     const UpdateThreadContext = struct {
@@ -182,24 +188,26 @@ test "Concurrent Update Stress Test: 100 threads updating same row" {
         clog: *CommitLog,
     };
 
-    fn updateThreadFn(context: *UpdateThreadContext) void {
-        context.result = blk: {
-            context.table.update(
-                context.row_id,
-                "counter",
-                ColumnValue{ .int = @as(i64, @intCast(context.tx_id)) },
-                context.tx_id,
-                context.clog,
-            ) catch |err| {
-                break :blk switch (err) {
-                    error.SerializationFailure => DeleteResult.serialization_failure,
-                    error.RowNotFound => DeleteResult.row_not_found,
-                    else => DeleteResult.other_error,
+    const updateThreadFn = struct {
+        fn func(context: *UpdateThreadContext) void {
+            context.result = blk: {
+                context.table.update(
+                    context.row_id,
+                    "counter",
+                    ColumnValue{ .int = @as(i64, @intCast(context.tx_id)) },
+                    context.tx_id,
+                    context.clog,
+                ) catch |err| {
+                    break :blk switch (err) {
+                        error.SerializationFailure => DeleteResult.serialization_failure,
+                        error.RowNotFound => DeleteResult.row_not_found,
+                        else => DeleteResult.other_error,
+                    };
                 };
+                break :blk DeleteResult.success;
             };
-            break :blk DeleteResult.success;
-        };
-    }
+        }
+    }.func;
 
     var update_contexts: [NUM_THREADS]UpdateThreadContext = undefined;
     var update_threads: [NUM_THREADS]std.Thread = undefined;
@@ -251,8 +259,8 @@ test "Mixed Concurrent Operations: Deletes and Updates on same row" {
     var table = try Table.init(allocator, "test_table");
     defer table.deinit();
 
-    try table.addColumn("id", .int, null);
-    try table.addColumn("value", .int, null);
+    try table.addColumn("id", .int);
+    try table.addColumn("value", .int);
 
     var clog = CommitLog.init(allocator);
     defer clog.deinit();
@@ -264,7 +272,7 @@ test "Mixed Concurrent Operations: Deletes and Updates on same row" {
     try values.put("value", ColumnValue{ .int = 0 });
 
     try table.insertWithId(1, values, 1);
-    try clog.markCommitted(1);
+    try clog.setStatus(1, .committed);
 
     // Mixed operation context
     const MixedOpContext = struct {
@@ -276,32 +284,34 @@ test "Mixed Concurrent Operations: Deletes and Updates on same row" {
         clog: *CommitLog,
     };
 
-    fn mixedOpThreadFn(context: *MixedOpContext) void {
-        context.result = blk: {
-            if (context.is_delete) {
-                context.table.delete(context.row_id, context.tx_id, context.clog) catch |err| {
-                    break :blk switch (err) {
-                        error.SerializationFailure => DeleteResult.serialization_failure,
-                        else => DeleteResult.other_error,
+    const mixedOpThreadFn = struct {
+        fn func(context: *MixedOpContext) void {
+            context.result = blk: {
+                if (context.is_delete) {
+                    context.table.delete(context.row_id, context.tx_id, context.clog) catch |err| {
+                        break :blk switch (err) {
+                            error.SerializationFailure => DeleteResult.serialization_failure,
+                            else => DeleteResult.other_error,
+                        };
                     };
-                };
-            } else {
-                context.table.update(
-                    context.row_id,
-                    "value",
-                    ColumnValue{ .int = 999 },
-                    context.tx_id,
-                    context.clog,
-                ) catch |err| {
-                    break :blk switch (err) {
-                        error.SerializationFailure => DeleteResult.serialization_failure,
-                        else => DeleteResult.other_error,
+                } else {
+                    context.table.update(
+                        context.row_id,
+                        "value",
+                        ColumnValue{ .int = 999 },
+                        context.tx_id,
+                        context.clog,
+                    ) catch |err| {
+                        break :blk switch (err) {
+                            error.SerializationFailure => DeleteResult.serialization_failure,
+                            else => DeleteResult.other_error,
+                        };
                     };
-                };
-            }
-            break :blk DeleteResult.success;
-        };
-    }
+                }
+                break :blk DeleteResult.success;
+            };
+        }
+    }.func;
 
     const MIXED_THREADS = 50;
     var mixed_contexts: [MIXED_THREADS]MixedOpContext = undefined;
