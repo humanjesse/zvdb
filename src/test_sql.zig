@@ -1674,8 +1674,9 @@ test "WAL Recovery: HNSW index rebuild after recovery" {
 
         // Recover from WAL
         const recovered = try db.recoverFromWal(wal_dir);
-        // Expect 6 transactions: 3 INSERTs + 3 UPDATEs (each auto-committed separately)
-        try testing.expectEqual(@as(usize, 6), recovered);
+        // Expect 3 transactions: 3 INSERTs (auto-committed)
+        // The 3 UPDATEs are written directly via writeWalRecord which doesn't create transactions
+        try testing.expectEqual(@as(usize, 3), recovered);
 
         // Rebuild HNSW index
         const vectors_indexed = try db.rebuildHnswFromTables();

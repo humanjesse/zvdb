@@ -115,16 +115,26 @@ pub const CommitLog = struct {
 
     /// Check if a transaction is committed
     pub fn isCommitted(self: *CommitLog, txid: u64) bool {
+        // Bootstrap transaction (txid=0) is always considered committed
+        // This is used for operations outside of explicit transactions
+        if (txid == 0) return true;
+
         return self.getStatus(txid) == .committed;
     }
 
     /// Check if a transaction is aborted
     pub fn isAborted(self: *CommitLog, txid: u64) bool {
+        // Bootstrap transaction (txid=0) is never aborted
+        if (txid == 0) return false;
+
         return self.getStatus(txid) == .aborted;
     }
 
     /// Check if a transaction is in progress
     pub fn isInProgress(self: *CommitLog, txid: u64) bool {
+        // Bootstrap transaction (txid=0) is never in progress (it's always committed)
+        if (txid == 0) return false;
+
         return self.getStatus(txid) == .in_progress;
     }
 };

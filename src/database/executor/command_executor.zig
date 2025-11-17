@@ -372,8 +372,8 @@ pub fn executeDelete(db: *Database, cmd: sql.DeleteCmd) !QueryResult {
         }
     }
 
-    // Phase 4: Trigger auto-VACUUM after DELETE operations
-    db.maybeAutoVacuum();
+    // Note: Auto-VACUUM is now triggered in executor.zig after auto-commit
+    // (removed from here to avoid triggering before transaction commits)
 
     var result = QueryResult.init(db.allocator);
     try result.addColumn("deleted");
@@ -632,8 +632,8 @@ pub fn executeUpdate(db: *Database, cmd: sql.UpdateCmd) !QueryResult {
         updated_count += 1;
     }
 
-    // Phase 4: Trigger auto-VACUUM after UPDATE operations
-    db.maybeAutoVacuum();
+    // Note: Auto-VACUUM is now triggered in executor.zig after auto-commit
+    // (removed from here to avoid triggering before transaction commits)
 
     var result = QueryResult.init(db.allocator);
     try result.addColumn("updated");
