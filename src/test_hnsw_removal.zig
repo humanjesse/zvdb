@@ -82,8 +82,8 @@ test "HNSW Removal: Linear chain remains connected" {
         var found_d = false;
         var found_e = false;
         for (results) |result| {
-            if (result.id == node_d) found_d = true;
-            if (result.id == node_e) found_e = true;
+            if (result.external_id == node_d) found_d = true;
+            if (result.external_id == node_e) found_e = true;
         }
         try testing.expect(found_d);
         try testing.expect(found_e);
@@ -98,8 +98,8 @@ test "HNSW Removal: Linear chain remains connected" {
         var found_a = false;
         var found_b = false;
         for (results) |result| {
-            if (result.id == node_a) found_a = true;
-            if (result.id == node_b) found_b = true;
+            if (result.external_id == node_a) found_a = true;
+            if (result.external_id == node_b) found_b = true;
         }
         try testing.expect(found_a);
         try testing.expect(found_b);
@@ -113,16 +113,16 @@ test "HNSW Removal: Search completeness after removal" {
 
     // Create a triangle: A -> B -> C -> A
     const node_a = try hnsw.insert(&[_]f32{ 0.0, 0.0, 0.0 }, null);
-    const node_b = try hnsw.insert(&[_]f32{ 1.0, 0.0, 0.0 }, null);
+    _ = try hnsw.insert(&[_]f32{ 1.0, 0.0, 0.0 }, null); // node_b
     const node_c = try hnsw.insert(&[_]f32{ 0.5, 0.87, 0.0 }, null);
-    const node_d = try hnsw.insert(&[_]f32{ 2.0, 0.0, 0.0 }, null);
-    const node_e = try hnsw.insert(&[_]f32{ 1.5, 0.87, 0.0 }, null);
+    _ = try hnsw.insert(&[_]f32{ 2.0, 0.0, 0.0 }, null); // node_d
+    _ = try hnsw.insert(&[_]f32{ 1.5, 0.87, 0.0 }, null); // node_e
 
     // Count nodes before removal
-    const count_before = {
+    const count_before = blk: {
         const results = try hnsw.search(&[_]f32{ 0.0, 0.0, 0.0 }, 10);
         defer allocator.free(results);
-        results.len
+        break :blk results.len;
     };
     try testing.expectEqual(@as(usize, 5), count_before);
 
@@ -130,10 +130,10 @@ test "HNSW Removal: Search completeness after removal" {
     try hnsw.removeNode(node_a);
 
     // Search should still find all remaining nodes
-    const count_after = {
+    const count_after = blk: {
         const results = try hnsw.search(&[_]f32{ 1.0, 0.0, 0.0 }, 10);
         defer allocator.free(results);
-        results.len
+        break :blk results.len;
     };
     try testing.expectEqual(@as(usize, 4), count_after);
 
@@ -141,10 +141,10 @@ test "HNSW Removal: Search completeness after removal" {
     try hnsw.removeNode(node_c);
 
     // Search should still find all remaining nodes
-    const count_final = {
+    const count_final = blk: {
         const results = try hnsw.search(&[_]f32{ 2.0, 0.0, 0.0 }, 10);
         defer allocator.free(results);
-        results.len
+        break :blk results.len;
     };
     try testing.expectEqual(@as(usize, 3), count_final);
 }
@@ -160,7 +160,7 @@ test "HNSW Removal: Hub node removal redistributes connections" {
     const spoke2 = try hnsw.insert(&[_]f32{ 0.0, 1.0, 0.0 }, null);
     const spoke3 = try hnsw.insert(&[_]f32{ -1.0, 0.0, 0.0 }, null);
     const spoke4 = try hnsw.insert(&[_]f32{ 0.0, -1.0, 0.0 }, null);
-    const spoke5 = try hnsw.insert(&[_]f32{ 0.71, 0.71, 0.0 }, null);
+    _ = try hnsw.insert(&[_]f32{ 0.71, 0.71, 0.0 }, null); // spoke5
 
     // Verify all spokes are reachable via hub
     {
@@ -185,8 +185,8 @@ test "HNSW Removal: Hub node removal redistributes connections" {
         var found_spoke3 = false;
         var found_spoke4 = false;
         for (results) |result| {
-            if (result.id == spoke3) found_spoke3 = true;
-            if (result.id == spoke4) found_spoke4 = true;
+            if (result.external_id == spoke3) found_spoke3 = true;
+            if (result.external_id == spoke4) found_spoke4 = true;
         }
         try testing.expect(found_spoke3);
         try testing.expect(found_spoke4);
@@ -201,8 +201,8 @@ test "HNSW Removal: Hub node removal redistributes connections" {
         var found_spoke1 = false;
         var found_spoke2 = false;
         for (results) |result| {
-            if (result.id == spoke1) found_spoke1 = true;
-            if (result.id == spoke2) found_spoke2 = true;
+            if (result.external_id == spoke1) found_spoke1 = true;
+            if (result.external_id == spoke2) found_spoke2 = true;
         }
         try testing.expect(found_spoke1);
         try testing.expect(found_spoke2);
@@ -264,7 +264,7 @@ test "HNSW Removal: Sequential removal maintains connectivity" {
         // Verify we can reach the furthest node
         var found_last = false;
         for (results) |result| {
-            if (result.id == nodes[9]) found_last = true;
+            if (result.external_id == nodes[9]) found_last = true;
         }
         try testing.expect(found_last);
     }
@@ -313,7 +313,7 @@ test "HNSW Removal: Single neighbor node removal" {
         const results = try hnsw.search(&[_]f32{ 0.0, 0.0, 0.0 }, 1);
         defer allocator.free(results);
         try testing.expectEqual(@as(usize, 1), results.len);
-        try testing.expectEqual(node_a, results[0].id);
+        try testing.expectEqual(node_a, results[0].external_id);
     }
 }
 
@@ -365,10 +365,10 @@ test "HNSW Removal: Removal preserves search accuracy" {
     defer hnsw.deinit();
 
     // Create nodes at known positions
-    const node_a = try hnsw.insert(&[_]f32{ 0.0, 0.0, 0.0 }, null);
-    const node_b = try hnsw.insert(&[_]f32{ 1.0, 0.0, 0.0 }, null);
+    _ = try hnsw.insert(&[_]f32{ 0.0, 0.0, 0.0 }, null); // node_a
+    _ = try hnsw.insert(&[_]f32{ 1.0, 0.0, 0.0 }, null); // node_b
     const node_c = try hnsw.insert(&[_]f32{ 2.0, 0.0, 0.0 }, null);
-    const node_d = try hnsw.insert(&[_]f32{ 3.0, 0.0, 0.0 }, null);
+    _ = try hnsw.insert(&[_]f32{ 3.0, 0.0, 0.0 }, null); // node_d
     const node_e = try hnsw.insert(&[_]f32{ 10.0, 0.0, 0.0 }, null);
 
     // Remove middle node
@@ -388,8 +388,8 @@ test "HNSW Removal: Removal preserves search accuracy" {
         try testing.expect(dist0 <= dist1);
 
         // Should not find the distant node E in top 2
-        try testing.expect(results[0].id != node_e);
-        try testing.expect(results[1].id != node_e);
+        try testing.expect(results[0].external_id != node_e);
+        try testing.expect(results[1].external_id != node_e);
     }
 }
 
@@ -438,7 +438,7 @@ test "HNSW Removal: Multiple removals in sequence" {
 
         var found_last = false;
         for (results) |result| {
-            if (result.id == nodes[6]) found_last = true;
+            if (result.external_id == nodes[6]) found_last = true;
         }
         try testing.expect(found_last);
     }

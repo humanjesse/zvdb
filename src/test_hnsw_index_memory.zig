@@ -12,7 +12,7 @@ test "type index doesn't hold dangling pointers after metadata update" {
     defer index.deinit();
 
     // Create initial metadata with type "document"
-    var meta1 = try NodeMetadata.init(allocator, "document", "file1.txt");
+    const meta1 = try NodeMetadata.init(allocator, "document", "file1.txt");
     const point1 = [_]f32{ 1.0, 2.0, 3.0 };
 
     const id1 = try index.insertWithMetadata(&point1, null, meta1);
@@ -24,7 +24,7 @@ test "type index doesn't hold dangling pointers after metadata update" {
     try testing.expectEqual(id1, docs[0]);
 
     // Update metadata to a different type
-    var meta2 = try NodeMetadata.init(allocator, "image", "file2.jpg");
+    const meta2 = try NodeMetadata.init(allocator, "image", "file2.jpg");
     try index.updateMetadata(id1, meta2);
 
     // The old type index entry should be cleaned up properly
@@ -47,7 +47,7 @@ test "file path index doesn't hold dangling pointers after node removal" {
     defer index.deinit();
 
     // Create metadata with file path
-    var meta = try NodeMetadata.init(allocator, "document", "test.txt");
+    const meta = try NodeMetadata.init(allocator, "document", "test.txt");
     const point = [_]f32{ 1.0, 2.0, 3.0 };
 
     const id = try index.insertWithMetadata(&point, null, meta);
@@ -75,9 +75,9 @@ test "multiple nodes sharing same type - key cleanup only when last removed" {
     defer index.deinit();
 
     // Create multiple nodes with the same type
-    var meta1 = try NodeMetadata.init(allocator, "document", "file1.txt");
-    var meta2 = try NodeMetadata.init(allocator, "document", "file2.txt");
-    var meta3 = try NodeMetadata.init(allocator, "document", "file3.txt");
+    const meta1 = try NodeMetadata.init(allocator, "document", "file1.txt");
+    const meta2 = try NodeMetadata.init(allocator, "document", "file2.txt");
+    const meta3 = try NodeMetadata.init(allocator, "document", "file3.txt");
 
     const point1 = [_]f32{ 1.0, 2.0, 3.0 };
     const point2 = [_]f32{ 4.0, 5.0, 6.0 };
@@ -118,9 +118,9 @@ test "multiple nodes sharing same file path - key cleanup only when last removed
     defer index.deinit();
 
     // Create multiple nodes with the same file path
-    var meta1 = try NodeMetadata.init(allocator, "chunk", "document.txt");
-    var meta2 = try NodeMetadata.init(allocator, "chunk", "document.txt");
-    var meta3 = try NodeMetadata.init(allocator, "chunk", "document.txt");
+    const meta1 = try NodeMetadata.init(allocator, "chunk", "document.txt");
+    const meta2 = try NodeMetadata.init(allocator, "chunk", "document.txt");
+    const meta3 = try NodeMetadata.init(allocator, "chunk", "document.txt");
 
     const point1 = [_]f32{ 1.0, 2.0, 3.0 };
     const point2 = [_]f32{ 4.0, 5.0, 6.0 };
@@ -177,7 +177,7 @@ test "memory leak test with allocator tracking" {
         const file_name = try std.fmt.allocPrint(allocator, "file_{d}.txt", .{i % 5});
         defer allocator.free(file_name);
 
-        var meta = try NodeMetadata.init(allocator, type_name, file_name);
+        const meta = try NodeMetadata.init(allocator, type_name, file_name);
         const point = [_]f32{ @floatFromInt(i), @floatFromInt(i + 1), @floatFromInt(i + 2) };
         _ = try index.insertWithMetadata(&point, null, meta);
     }
@@ -201,7 +201,7 @@ test "memory leak test with allocator tracking" {
         const new_type = try std.fmt.allocPrint(allocator, "updated_type_{d}", .{i});
         defer allocator.free(new_type);
 
-        var new_meta = try NodeMetadata.init(allocator, new_type, null);
+        const new_meta = try NodeMetadata.init(allocator, new_type, null);
         try index.updateMetadata(i, new_meta);
     }
 
@@ -215,7 +215,7 @@ test "stress test: rapid metadata updates" {
     defer index.deinit();
 
     // Create a node
-    var meta = try NodeMetadata.init(allocator, "initial", "initial.txt");
+    const meta = try NodeMetadata.init(allocator, "initial", "initial.txt");
     const point = [_]f32{ 1.0, 2.0, 3.0 };
     const id = try index.insertWithMetadata(&point, null, meta);
 
@@ -227,7 +227,7 @@ test "stress test: rapid metadata updates" {
         const file_name = try std.fmt.allocPrint(allocator, "file_{d}.txt", .{i});
         defer allocator.free(file_name);
 
-        var new_meta = try NodeMetadata.init(allocator, type_name, file_name);
+        const new_meta = try NodeMetadata.init(allocator, type_name, file_name);
         try index.updateMetadata(id, new_meta);
     }
 
@@ -248,13 +248,13 @@ test "type index key ownership after updateMetadata changes type" {
     defer index.deinit();
 
     // Create initial metadata
-    var meta1 = try NodeMetadata.init(allocator, "type_a", null);
+    const meta1 = try NodeMetadata.init(allocator, "type_a", null);
     const point = [_]f32{ 1.0, 2.0, 3.0 };
     const id = try index.insertWithMetadata(&point, null, meta1);
 
     // The original string used for meta1 is now owned by the node
     // Update to a different type - the old key should be freed
-    var meta2 = try NodeMetadata.init(allocator, "type_b", null);
+    const meta2 = try NodeMetadata.init(allocator, "type_b", null);
     try index.updateMetadata(id, meta2);
 
     // Verify old type is gone
@@ -275,12 +275,12 @@ test "file path index key ownership after updateMetadata changes path" {
     defer index.deinit();
 
     // Create initial metadata
-    var meta1 = try NodeMetadata.init(allocator, "doc", "path_a.txt");
+    const meta1 = try NodeMetadata.init(allocator, "doc", "path_a.txt");
     const point = [_]f32{ 1.0, 2.0, 3.0 };
     const id = try index.insertWithMetadata(&point, null, meta1);
 
     // Update to a different path
-    var meta2 = try NodeMetadata.init(allocator, "doc", "path_b.txt");
+    const meta2 = try NodeMetadata.init(allocator, "doc", "path_b.txt");
     try index.updateMetadata(id, meta2);
 
     // Verify old path is gone
@@ -308,7 +308,7 @@ test "no double-free when removing last node of a type" {
     defer index.deinit();
 
     // Create a single node
-    var meta = try NodeMetadata.init(allocator, "unique_type", "unique.txt");
+    const meta = try NodeMetadata.init(allocator, "unique_type", "unique.txt");
     const point = [_]f32{ 1.0, 2.0, 3.0 };
     const id = try index.insertWithMetadata(&point, null, meta);
 
@@ -342,7 +342,7 @@ test "deinit properly cleans up all index keys" {
             const file_name = try std.fmt.allocPrint(allocator, "file_{d}.txt", .{i});
             defer allocator.free(file_name);
 
-            var meta = try NodeMetadata.init(allocator, type_name, file_name);
+            const meta = try NodeMetadata.init(allocator, type_name, file_name);
             const point = [_]f32{ @floatFromInt(i), @floatFromInt(i + 1), @floatFromInt(i + 2) };
             _ = try index.insertWithMetadata(&point, null, meta);
         }
