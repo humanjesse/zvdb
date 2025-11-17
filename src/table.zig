@@ -540,8 +540,12 @@ pub const Table = struct {
     pub fn get(self: *Table, id: u64, snapshot: ?*const Snapshot, clog: ?*CommitLog) ?*Row {
         const chain_head = self.version_chains.get(id) orelse return null;
 
-        // Non-MVCC mode: return newest version
+        // Non-MVCC mode: return newest version if not deleted
         if (snapshot == null or clog == null) {
+            // Check if row is deleted (xmax != 0 means deleted)
+            if (chain_head.xmax != 0) {
+                return null;
+            }
             return &chain_head.data;
         }
 
@@ -888,9 +892,9 @@ pub const Table = struct {
         return stats;
     }
 
-    /// Save table to a binary file (.zvdb format)
+    /// Save table to a binary file (.zvdb format v2)
     /// NOTE: Currently saves only the newest version of each row (no MVCC history)
-    /// TODO Phase 4: Save version chains for full MVCC recovery
+    /// For full MVCC recovery, use saveMvcc() instead
     pub fn save(self: *Table, path: []const u8) !void {
         // Ensure parent directory exists
         if (std.fs.path.dirname(path)) |dir_path| {
@@ -971,9 +975,112 @@ pub const Table = struct {
         }
     }
 
-    /// Load table from a binary file (.zvdb format)
+    /// Save table to a binary file with full MVCC version chains (.zvdb format v3)
+    /// Persists all versions of each row, along with transaction metadata
+    /// checkpoint_txid: The transaction ID at the time of this checkpoint
+    pub fn saveMvcc(self: *Table, path: []const u8, checkpoint_txid: u64) !void {
+        // Ensure parent directory exists
+        if (std.fs.path.dirname(path)) |dir_path| {
+            std.fs.cwd().makePath(dir_path) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => return err,
+            };
+        }
+
+        const file = try std.fs.cwd().createFile(path, .{});
+        defer file.close();
+
+        // Write header
+        const magic: u32 = 0x5456_4442; // "TVDB" in hex
+        const version: u32 = 3; // Version 3 adds MVCC support
+        try utils.writeInt(file, u32, magic);
+        try utils.writeInt(file, u32, version);
+
+        // Write metadata
+        try utils.writeInt(file, u64, self.name.len);
+        try file.writeAll(self.name);
+        try utils.writeInt(file, u64, self.next_id.load(.monotonic));
+        try utils.writeInt(file, u64, checkpoint_txid); // NEW: checkpoint transaction ID
+
+        // Write schema
+        try utils.writeInt(file, u64, self.columns.items.len);
+        for (self.columns.items) |col| {
+            try utils.writeInt(file, u64, col.name.len);
+            try file.writeAll(col.name);
+            try utils.writeInt(file, u8, @intFromEnum(col.col_type));
+            // Write embedding dimension for embedding type
+            if (col.col_type == .embedding) {
+                const dim = col.embedding_dim orelse 768;
+                try utils.writeInt(file, u64, dim);
+            }
+        }
+
+        // Write version chains (all versions, not just newest)
+        try utils.writeInt(file, u64, self.version_chains.count());
+        var it = self.version_chains.iterator();
+        while (it.next()) |entry| {
+            const row_id = entry.key_ptr.*;
+            const version_head = entry.value_ptr.*;
+
+            // Count versions in this chain
+            var version_count: u32 = 0;
+            var counter: ?*RowVersion = version_head;
+            while (counter) |v| : (counter = v.next) {
+                version_count += 1;
+            }
+
+            // Write row ID and version count
+            try utils.writeInt(file, u64, row_id);
+            try utils.writeInt(file, u32, version_count);
+
+            // Write each version in the chain (newest to oldest)
+            var current_version: ?*RowVersion = version_head;
+            while (current_version) |ver| : (current_version = ver.next) {
+                // Write transaction metadata
+                try utils.writeInt(file, u64, ver.xmin);
+                try utils.writeInt(file, u64, ver.xmax);
+
+                // Write row data
+                const row = ver.data;
+                try utils.writeInt(file, u64, row.values.count());
+
+                var val_it = row.values.iterator();
+                while (val_it.next()) |val_entry| {
+                    const col_name = val_entry.key_ptr.*;
+                    const value = val_entry.value_ptr.*;
+
+                    // Write column name
+                    try utils.writeInt(file, u64, col_name.len);
+                    try file.writeAll(col_name);
+
+                    // Write value type tag
+                    try utils.writeInt(file, u8, @intFromEnum(std.meta.activeTag(value)));
+
+                    // Write value data
+                    switch (value) {
+                        .null_value => {},
+                        .int => |i| try utils.writeInt(file, i64, i),
+                        .float => |f| try file.writeAll(std.mem.asBytes(&f)),
+                        .bool => |b| try utils.writeInt(file, u8, if (b) 1 else 0),
+                        .text => |s| {
+                            try utils.writeInt(file, u64, s.len);
+                            try file.writeAll(s);
+                        },
+                        .embedding => |e| {
+                            try utils.writeInt(file, u64, e.len);
+                            for (e) |val| {
+                                try file.writeAll(std.mem.asBytes(&val));
+                            }
+                        },
+                    }
+                }
+            }
+        }
+    }
+
+    /// Load table from a binary file (.zvdb format v1/v2)
     /// NOTE: Loads rows as single versions with tx_id=0 (bootstrap)
-    /// TODO Phase 4: Load version chains for full MVCC recovery
+    /// For full MVCC recovery, use loadMvcc() instead
     pub fn load(allocator: Allocator, path: []const u8) !Table {
         const file = try std.fs.cwd().openFile(path, .{});
         defer file.close();
@@ -1094,6 +1201,167 @@ pub const Table = struct {
             // Create version for loaded row (tx_id = 0 for bootstrap)
             const row_version = try RowVersion.init(allocator, row_id, 0, row);
             try table.version_chains.put(row_id, row_version);
+        }
+
+        return table;
+    }
+
+    /// Load table from a binary file with full MVCC version chains (.zvdb format v3)
+    /// Reconstructs complete version chain history with transaction metadata
+    pub fn loadMvcc(allocator: Allocator, path: []const u8) !Table {
+        const file = try std.fs.cwd().openFile(path, .{});
+        defer file.close();
+
+        // Read and verify header
+        const magic = try utils.readInt(file, u32);
+        if (magic != 0x5456_4442) return error.InvalidFileFormat;
+
+        const version = try utils.readInt(file, u32);
+        if (version != 3) return error.UnsupportedVersion;
+
+        // Read metadata
+        const name_len = try utils.readInt(file, u64);
+        const name = try allocator.alloc(u8, name_len);
+        // Handle cleanup explicitly before table owns the name
+        _ = file.readAll(name) catch |err| {
+            allocator.free(name);
+            return err;
+        };
+
+        const next_id = utils.readInt(file, u64) catch |err| {
+            allocator.free(name);
+            return err;
+        };
+
+        const checkpoint_txid = utils.readInt(file, u64) catch |err| {
+            allocator.free(name);
+            return err;
+        };
+        _ = checkpoint_txid; // Currently unused, but available for future use
+
+        // Initialize table - from this point, table owns name
+        var table = Table{
+            .name = name,
+            .columns = ArrayList(Column).init(allocator),
+            .version_chains = AutoHashMap(u64, *RowVersion).init(allocator),
+            .next_id = std.atomic.Value(u64).init(next_id),
+            .allocator = allocator,
+        };
+        errdefer table.deinit();
+
+        // Read schema
+        const column_count = try utils.readInt(file, u64);
+        for (0..column_count) |_| {
+            const col_name_len = try utils.readInt(file, u64);
+            const col_name = try allocator.alloc(u8, col_name_len);
+            errdefer allocator.free(col_name);
+            _ = try file.readAll(col_name);
+
+            const col_type_int = try utils.readInt(file, u8);
+            const col_type: ColumnType = @enumFromInt(col_type_int);
+
+            // Read embedding dimension for embedding type
+            var embedding_dim: ?usize = null;
+            if (col_type == .embedding) {
+                embedding_dim = try utils.readInt(file, u64);
+            }
+
+            try table.columns.append(Column{
+                .name = col_name,
+                .col_type = col_type,
+                .embedding_dim = embedding_dim,
+            });
+        }
+
+        // Read version chains
+        const chain_count = try utils.readInt(file, u64);
+        for (0..chain_count) |_| {
+            const row_id = try utils.readInt(file, u64);
+            const version_count = try utils.readInt(file, u32);
+
+            var chain_head: ?*RowVersion = null;
+            var chain_tail: ?*RowVersion = null;
+
+            // Read each version in the chain
+            for (0..version_count) |_| {
+                // Read transaction metadata
+                const xmin = try utils.readInt(file, u64);
+                const xmax = try utils.readInt(file, u64);
+
+                // Read row data
+                var row = Row.init(allocator, row_id);
+                errdefer row.deinit(allocator);
+
+                const value_count = try utils.readInt(file, u64);
+                for (0..value_count) |_| {
+                    // Read column name
+                    const col_name_len = try utils.readInt(file, u64);
+                    const col_name = try allocator.alloc(u8, col_name_len);
+                    errdefer allocator.free(col_name);
+                    _ = try file.readAll(col_name);
+
+                    // Read value type
+                    const value_type_int = try utils.readInt(file, u8);
+
+                    // Read value data based on type
+                    const value: ColumnValue = switch (value_type_int) {
+                        0 => .null_value,
+                        1 => .{ .int = try utils.readInt(file, i64) },
+                        2 => blk: {
+                            var bytes: [8]u8 = undefined;
+                            _ = try file.readAll(&bytes);
+                            const f = std.mem.bytesToValue(f64, &bytes);
+                            break :blk .{ .float = f };
+                        },
+                        3 => blk: { // text
+                            const text_len = try utils.readInt(file, u64);
+                            const text = try allocator.alloc(u8, text_len);
+                            errdefer allocator.free(text);
+                            _ = try file.readAll(text);
+                            break :blk .{ .text = text };
+                        },
+                        4 => .{ .bool = (try utils.readInt(file, u8)) != 0 },
+                        5 => blk: { // embedding
+                            const emb_len = try utils.readInt(file, u64);
+                            const embedding = try allocator.alloc(f32, emb_len);
+                            errdefer allocator.free(embedding);
+                            for (embedding) |*val| {
+                                var bytes: [4]u8 = undefined;
+                                _ = try file.readAll(&bytes);
+                                val.* = std.mem.bytesToValue(f32, &bytes);
+                            }
+                            break :blk .{ .embedding = embedding };
+                        },
+                        else => return error.InvalidValueType,
+                    };
+
+                    try row.values.put(col_name, value);
+                }
+
+                // Create RowVersion with actual transaction metadata
+                const row_version = try allocator.create(RowVersion);
+                row_version.* = .{
+                    .row_id = row_id,
+                    .xmin = xmin,
+                    .xmax = xmax,
+                    .data = row,
+                    .next = null,
+                };
+
+                // Link into chain (maintaining newest-to-oldest order)
+                if (chain_head == null) {
+                    chain_head = row_version;
+                    chain_tail = row_version;
+                } else {
+                    chain_tail.?.next = row_version;
+                    chain_tail = row_version;
+                }
+            }
+
+            // Add chain to table
+            if (chain_head) |head| {
+                try table.version_chains.put(row_id, head);
+            }
         }
 
         return table;

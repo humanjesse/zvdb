@@ -502,3 +502,234 @@ test "empty transaction rollback" {
     // Should succeed without errors
     try testing.expect(true);
 }
+
+// ============================================================================
+// CommitLog Persistence Tests (Phase 4A)
+// ============================================================================
+
+const transaction = @import("transaction.zig");
+const CommitLog = transaction.CommitLog;
+const TxStatus = transaction.TxStatus;
+const AutoHashMap = std.AutoHashMap;
+
+test "CommitLog: save and load empty CLOG" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Create empty CLOG and save
+    var clog = CommitLog.init(allocator);
+    defer clog.deinit();
+
+    const temp_path = "/tmp/test_clog_empty.zvdb";
+    defer std.fs.cwd().deleteFile(temp_path) catch {};
+
+    try clog.save(temp_path);
+
+    // Load and verify
+    var loaded_clog = try CommitLog.load(allocator, temp_path);
+    defer loaded_clog.deinit();
+
+    try testing.expectEqual(@as(u32, 0), loaded_clog.status_map.count());
+}
+
+test "CommitLog: save and load single transaction" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Create CLOG with one committed transaction
+    var clog = CommitLog.init(allocator);
+    defer clog.deinit();
+
+    try clog.setStatus(1, .committed);
+
+    const temp_path = "/tmp/test_clog_single.zvdb";
+    defer std.fs.cwd().deleteFile(temp_path) catch {};
+
+    try clog.save(temp_path);
+
+    // Load and verify
+    var loaded_clog = try CommitLog.load(allocator, temp_path);
+    defer loaded_clog.deinit();
+
+    try testing.expectEqual(@as(u32, 1), loaded_clog.status_map.count());
+    try testing.expect(loaded_clog.isCommitted(1));
+}
+
+test "CommitLog: save and load multiple transactions with different states" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Create CLOG with multiple transactions in different states
+    var clog = CommitLog.init(allocator);
+    defer clog.deinit();
+
+    try clog.setStatus(1, .committed);
+    try clog.setStatus(2, .aborted);
+    try clog.setStatus(3, .in_progress);
+    try clog.setStatus(10, .committed);
+    try clog.setStatus(25, .aborted);
+
+    const temp_path = "/tmp/test_clog_multiple.zvdb";
+    defer std.fs.cwd().deleteFile(temp_path) catch {};
+
+    try clog.save(temp_path);
+
+    // Load and verify all states
+    var loaded_clog = try CommitLog.load(allocator, temp_path);
+    defer loaded_clog.deinit();
+
+    try testing.expectEqual(@as(u32, 5), loaded_clog.status_map.count());
+    try testing.expect(loaded_clog.isCommitted(1));
+    try testing.expect(loaded_clog.isAborted(2));
+    try testing.expect(loaded_clog.isInProgress(3));
+    try testing.expect(loaded_clog.isCommitted(10));
+    try testing.expect(loaded_clog.isAborted(25));
+}
+
+test "CommitLog: invalid file format returns error" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const temp_path = "/tmp/test_clog_invalid.zvdb";
+    defer std.fs.cwd().deleteFile(temp_path) catch {};
+
+    // Write a file with wrong magic number
+    {
+        const file = try std.fs.cwd().createFile(temp_path, .{});
+        defer file.close();
+
+        const utils = @import("utils.zig");
+        try utils.writeInt(file, u32, 0xDEADBEEF); // Wrong magic
+        try utils.writeInt(file, u32, 1); // Version
+    }
+
+    // Try to load - should fail
+    const result = CommitLog.load(allocator, temp_path);
+    try testing.expectError(error.InvalidFileFormat, result);
+}
+
+test "CommitLog: unsupported version returns error" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const temp_path = "/tmp/test_clog_version.zvdb";
+    defer std.fs.cwd().deleteFile(temp_path) catch {};
+
+    // Write a file with future version
+    {
+        const file = try std.fs.cwd().createFile(temp_path, .{});
+        defer file.close();
+
+        const utils = @import("utils.zig");
+        try utils.writeInt(file, u32, 0x434C_4F47); // Correct magic "CLOG"
+        try utils.writeInt(file, u32, 999); // Future version
+    }
+
+    // Try to load - should fail
+    const result = CommitLog.load(allocator, temp_path);
+    try testing.expectError(error.UnsupportedVersion, result);
+}
+
+test "CommitLog: mergeRecoveredState combines states correctly" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Create checkpoint CLOG with some transactions
+    var checkpoint_clog = CommitLog.init(allocator);
+    defer checkpoint_clog.deinit();
+
+    try checkpoint_clog.setStatus(1, .committed);
+    try checkpoint_clog.setStatus(2, .committed);
+
+    // Create recovered state from WAL with new and overlapping transactions
+    var recovered_state = AutoHashMap(u64, TxStatus).init(allocator);
+    defer recovered_state.deinit();
+
+    try recovered_state.put(2, .aborted); // Overlapping - should override
+    try recovered_state.put(3, .committed); // New transaction
+    try recovered_state.put(4, .in_progress); // New transaction
+
+    // Merge recovered state into checkpoint
+    try checkpoint_clog.mergeRecoveredState(recovered_state);
+
+    // Verify merged state
+    try testing.expectEqual(@as(u32, 4), checkpoint_clog.status_map.count());
+    try testing.expect(checkpoint_clog.isCommitted(1)); // Unchanged from checkpoint
+    try testing.expect(checkpoint_clog.isAborted(2)); // Overridden by recovery
+    try testing.expect(checkpoint_clog.isCommitted(3)); // New from recovery
+    try testing.expect(checkpoint_clog.isInProgress(4)); // New from recovery
+}
+
+test "CommitLog: save/load preserves large transaction IDs" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Create CLOG with very large transaction IDs
+    var clog = CommitLog.init(allocator);
+    defer clog.deinit();
+
+    const large_txid: u64 = 1_000_000_000_000; // 1 trillion
+    try clog.setStatus(large_txid, .committed);
+    try clog.setStatus(large_txid + 1, .aborted);
+
+    const temp_path = "/tmp/test_clog_large_ids.zvdb";
+    defer std.fs.cwd().deleteFile(temp_path) catch {};
+
+    try clog.save(temp_path);
+
+    // Load and verify
+    var loaded_clog = try CommitLog.load(allocator, temp_path);
+    defer loaded_clog.deinit();
+
+    try testing.expect(loaded_clog.isCommitted(large_txid));
+    try testing.expect(loaded_clog.isAborted(large_txid + 1));
+}
+
+test "CommitLog: bootstrap transaction (txid=0) behavior" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var clog = CommitLog.init(allocator);
+    defer clog.deinit();
+
+    // Bootstrap transaction should always be committed, never in progress, never aborted
+    try testing.expect(clog.isCommitted(0));
+    try testing.expect(!clog.isInProgress(0));
+    try testing.expect(!clog.isAborted(0));
+
+    // This should be true even if we explicitly set status (though we shouldn't)
+    try clog.setStatus(0, .in_progress);
+
+    // Bootstrap txid=0 special handling should still apply
+    try testing.expect(clog.isCommitted(0));
+}
+
+test "CommitLog: save creates parent directory if needed" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var clog = CommitLog.init(allocator);
+    defer clog.deinit();
+
+    try clog.setStatus(1, .committed);
+
+    const temp_dir = "/tmp/test_clog_subdir";
+    const temp_path = "/tmp/test_clog_subdir/nested/clog.zvdb";
+    defer std.fs.cwd().deleteTree(temp_dir) catch {};
+
+    // Should create nested directory
+    try clog.save(temp_path);
+
+    // Verify file was created
+    const file = try std.fs.cwd().openFile(temp_path, .{});
+    file.close();
+}

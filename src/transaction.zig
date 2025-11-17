@@ -137,6 +137,102 @@ pub const CommitLog = struct {
 
         return self.getStatus(txid) == .in_progress;
     }
+
+    /// Save commit log to a binary file
+    /// File format:
+    ///   - Magic: "CLOG" (4 bytes)
+    ///   - Version: 1 (4 bytes)
+    ///   - Entry count (u64)
+    ///   - For each entry: TX ID (u64) + Status (u8)
+    pub fn save(self: *CommitLog, path: []const u8) !void {
+        const utils = @import("utils.zig");
+
+        // Ensure parent directory exists
+        if (std.fs.path.dirname(path)) |dir_path| {
+            std.fs.cwd().makePath(dir_path) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => return err,
+            };
+        }
+
+        const file = try std.fs.cwd().createFile(path, .{});
+        defer file.close();
+
+        // Write header
+        const magic: u32 = 0x434C_4F47; // "CLOG" in hex
+        const version: u32 = 1;
+        try utils.writeInt(file, u32, magic);
+        try utils.writeInt(file, u32, version);
+
+        // Lock mutex to safely iterate over status_map
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Write entry count
+        const count = self.status_map.count();
+        try utils.writeInt(file, u64, count);
+
+        // Write each transaction entry
+        var it = self.status_map.iterator();
+        while (it.next()) |entry| {
+            const txid = entry.key_ptr.*;
+            const status = entry.value_ptr.*;
+
+            try utils.writeInt(file, u64, txid);
+            try utils.writeInt(file, u8, @intFromEnum(status));
+        }
+    }
+
+    /// Load commit log from a binary file
+    /// Returns a new CommitLog instance with loaded transaction states
+    pub fn load(allocator: Allocator, path: []const u8) !CommitLog {
+        const utils = @import("utils.zig");
+
+        const file = try std.fs.cwd().openFile(path, .{});
+        defer file.close();
+
+        // Read and verify header
+        const magic = try utils.readInt(file, u32);
+        if (magic != 0x434C_4F47) return error.InvalidFileFormat;
+
+        const version = try utils.readInt(file, u32);
+        if (version != 1) return error.UnsupportedVersion;
+
+        // Initialize new CommitLog
+        var clog = CommitLog.init(allocator);
+        errdefer clog.deinit();
+
+        // Read entry count
+        const count = try utils.readInt(file, u64);
+
+        // Read each transaction entry
+        for (0..count) |_| {
+            const txid = try utils.readInt(file, u64);
+            const status_int = try utils.readInt(file, u8);
+            const status: TxStatus = @enumFromInt(status_int);
+
+            try clog.status_map.put(txid, status);
+        }
+
+        return clog;
+    }
+
+    /// Merge recovered transaction state from WAL replay into this CommitLog
+    /// This is used during recovery to combine checkpoint state with WAL state
+    /// If a transaction exists in both, the recovered state takes precedence
+    pub fn mergeRecoveredState(self: *CommitLog, recovered: AutoHashMap(u64, TxStatus)) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var it = recovered.iterator();
+        while (it.next()) |entry| {
+            const txid = entry.key_ptr.*;
+            const status = entry.value_ptr.*;
+
+            // Recovered state takes precedence over checkpoint state
+            try self.status_map.put(txid, status);
+        }
+    }
 };
 
 // ============================================================================

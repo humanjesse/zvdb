@@ -369,6 +369,24 @@ pub const Database = struct {
     }
 
     // ========================================================================
+    // MVCC Persistence (Phase 3)
+    // ========================================================================
+
+    /// Save all tables with full MVCC support (version chains + CommitLog)
+    /// This is the Phase 3 checkpoint function that preserves transaction history
+    pub fn saveAllMvcc(self: *Database, dir_path: []const u8) !void {
+        const persistence = @import("persistence.zig");
+        return persistence.saveAllMvcc(self, dir_path);
+    }
+
+    /// Load all tables with full MVCC support from checkpoint
+    /// Falls back to v2 format for backward compatibility
+    pub fn loadAllMvcc(allocator: Allocator, dir_path: []const u8) !Database {
+        const persistence = @import("persistence.zig");
+        return persistence.loadAllMvcc(allocator, dir_path);
+    }
+
+    // ========================================================================
     // Validation Configuration Helpers
     // ========================================================================
 

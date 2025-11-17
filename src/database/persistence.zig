@@ -3,9 +3,11 @@ const core = @import("core.zig");
 const Database = core.Database;
 const Table = @import("../table.zig").Table;
 const HNSW = @import("../hnsw.zig").HNSW;
+const CommitLog = @import("../transaction.zig").CommitLog;
 const Allocator = std.mem.Allocator;
 
-/// Save all tables and HNSW index to the data directory
+/// Save all tables and HNSW index to the data directory (v2 format - no MVCC)
+/// For full MVCC recovery, use saveAllMvcc() instead
 pub fn saveAll(db: *Database, dir_path: []const u8) !void {
     // Create directory if it doesn't exist
     std.fs.cwd().makePath(dir_path) catch |err| switch (err) {
@@ -110,6 +112,172 @@ pub fn loadAll(allocator: Allocator, dir_path: []const u8) !Database {
             try db.hnsw_indexes.put(dim, hnsw);
         } else if (std.mem.eql(u8, entry.name, "vectors.hnsw")) {
             // Legacy: Load old single HNSW index as 768-dimensional for backward compatibility
+            const file_path = try std.fmt.allocPrint(
+                allocator,
+                "{s}/{s}",
+                .{ dir_path, entry.name },
+            );
+            defer allocator.free(file_path);
+
+            const hnsw = try allocator.create(HNSW(f32));
+            hnsw.* = try HNSW(f32).load(allocator, file_path);
+            try db.hnsw_indexes.put(768, hnsw);
+        }
+    }
+
+    return db;
+}
+
+/// Save all tables with full MVCC version chains and CommitLog state
+/// This enables complete MVCC recovery including transaction history
+pub fn saveAllMvcc(db: *Database, dir_path: []const u8) !void {
+    // Create directory if it doesn't exist
+    std.fs.cwd().makePath(dir_path) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    // Get current checkpoint transaction ID
+    const checkpoint_txid = db.getCurrentTxId();
+
+    // Step 1: Save CommitLog state
+    const clog_path = try std.fmt.allocPrint(
+        db.allocator,
+        "{s}/commitlog.zvdb",
+        .{dir_path},
+    );
+    defer db.allocator.free(clog_path);
+
+    try db.tx_manager.clog.save(clog_path);
+
+    // Step 2: Save each table with full MVCC data
+    var it = db.tables.iterator();
+    while (it.next()) |entry| {
+        const table_name = entry.key_ptr.*;
+        const table = entry.value_ptr.*;
+
+        const file_path = try std.fmt.allocPrint(
+            db.allocator,
+            "{s}/{s}.zvdb",
+            .{ dir_path, table_name },
+        );
+        defer db.allocator.free(file_path);
+
+        try table.saveMvcc(file_path, checkpoint_txid);
+    }
+
+    // Step 3: Save all per-dimension HNSW indexes (unchanged from saveAll)
+    var hnsw_it = db.hnsw_indexes.iterator();
+    while (hnsw_it.next()) |entry| {
+        const dim = entry.key_ptr.*;
+        const h = entry.value_ptr.*;
+
+        const hnsw_path = try std.fmt.allocPrint(
+            db.allocator,
+            "{s}/vectors_{d}.hnsw",
+            .{ dir_path, dim },
+        );
+        defer db.allocator.free(hnsw_path);
+
+        try h.save(hnsw_path);
+    }
+}
+
+/// Load all tables with full MVCC version chains and CommitLog state
+/// If WAL recovery is needed, call recoverFromWal() after this
+pub fn loadAllMvcc(allocator: Allocator, dir_path: []const u8) !Database {
+    var db = Database.init(allocator);
+    errdefer db.deinit();
+
+    // Open directory
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => {
+            // Directory doesn't exist yet, return empty database
+            return db;
+        },
+        else => return err,
+    };
+    defer dir.close();
+
+    // Step 1: Try to load CommitLog if it exists
+    const clog_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/commitlog.zvdb",
+        .{dir_path},
+    );
+    defer allocator.free(clog_path);
+
+    // Load CLOG or use empty one if file doesn't exist
+    const clog_file_exists = blk: {
+        std.fs.cwd().access(clog_path, .{}) catch {
+            break :blk false;
+        };
+        break :blk true;
+    };
+
+    if (clog_file_exists) {
+        // Load existing CLOG
+        const loaded_clog = try CommitLog.load(allocator, clog_path);
+        // Replace the default CLOG in tx_manager
+        db.tx_manager.clog.deinit();
+        db.tx_manager.clog = loaded_clog;
+    }
+
+    // Step 2: Iterate through files to load tables and indexes
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+
+        // Check file extension
+        const ext = std.fs.path.extension(entry.name);
+
+        if (std.mem.eql(u8, ext, ".zvdb") and !std.mem.eql(u8, entry.name, "commitlog.zvdb")) {
+            // Load table file with MVCC support
+            const file_path = try std.fmt.allocPrint(
+                allocator,
+                "{s}/{s}",
+                .{ dir_path, entry.name },
+            );
+            defer allocator.free(file_path);
+
+            // Try to load as v3 (MVCC), fall back to v2 if needed
+            var table = Table.loadMvcc(allocator, file_path) catch |err| switch (err) {
+                error.UnsupportedVersion => blk: {
+                    // Fall back to old load method for v1/v2 files
+                    break :blk try Table.load(allocator, file_path);
+                },
+                else => return err,
+            };
+            errdefer table.deinit();
+
+            // Allocate owned table pointer
+            const table_ptr = try allocator.create(Table);
+            table_ptr.* = table;
+
+            // Duplicate table name for the key
+            const table_name_key = try allocator.dupe(u8, table.name);
+
+            // Add to database
+            try db.tables.put(table_name_key, table_ptr);
+        } else if (std.mem.startsWith(u8, entry.name, "vectors_") and std.mem.endsWith(u8, entry.name, ".hnsw")) {
+            // Load per-dimension HNSW index (unchanged from loadAll)
+            const prefix_len = "vectors_".len;
+            const suffix_len = ".hnsw".len;
+            const dim_str = entry.name[prefix_len .. entry.name.len - suffix_len];
+            const dim = try std.fmt.parseInt(usize, dim_str, 10);
+
+            const file_path = try std.fmt.allocPrint(
+                allocator,
+                "{s}/{s}",
+                .{ dir_path, entry.name },
+            );
+            defer allocator.free(file_path);
+
+            const hnsw = try allocator.create(HNSW(f32));
+            hnsw.* = try HNSW(f32).load(allocator, file_path);
+            try db.hnsw_indexes.put(dim, hnsw);
+        } else if (std.mem.eql(u8, entry.name, "vectors.hnsw")) {
+            // Legacy: Load old single HNSW index as 768-dimensional
             const file_path = try std.fmt.allocPrint(
                 allocator,
                 "{s}/{s}",
