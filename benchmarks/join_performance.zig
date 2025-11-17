@@ -48,7 +48,7 @@ fn benchmarkJoin(allocator: std.mem.Allocator, name: []const u8, size1: usize, s
         const query = try std.fmt.allocPrint(
             allocator,
             "INSERT INTO users (id, name) VALUES ({d}, '{s}')",
-            .{ i % 1000, name_str },  // Use modulo to create duplicates for realistic join
+            .{ i % 1000, name_str }, // Use modulo to create duplicates for realistic join
         );
         defer allocator.free(query);
 
@@ -61,7 +61,7 @@ fn benchmarkJoin(allocator: std.mem.Allocator, name: []const u8, size1: usize, s
         const query = try std.fmt.allocPrint(
             allocator,
             "INSERT INTO orders (user_id, amount) VALUES ({d}, {d}.00)",
-            .{ i % 1000, i },  // Create matching user_ids
+            .{ i % 1000, i }, // Create matching user_ids
         );
         defer allocator.free(query);
 
