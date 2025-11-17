@@ -127,6 +127,9 @@ pub const Database = struct {
     vacuum_config: VacuumConfig, // Auto-vacuum settings
     txn_count_since_vacuum: usize, // Track transactions for auto-vacuum
 
+    // Resource limits (security)
+    max_embeddings_per_row: usize, // Maximum embedding columns per row (default: 10)
+
     pub fn init(allocator: Allocator) Database {
         return Database{
             .tables = StringHashMap(*Table).init(allocator),
@@ -141,6 +144,7 @@ pub const Database = struct {
             .validation_mode = .strict, // Strict mode by default
             .vacuum_config = VacuumConfig{}, // Auto-vacuum enabled with defaults
             .txn_count_since_vacuum = 0,
+            .max_embeddings_per_row = 10, // Reasonable default to prevent resource exhaustion
         };
     }
 

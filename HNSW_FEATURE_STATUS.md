@@ -176,6 +176,55 @@ LIMIT 3
   - **Workaround:** Use table API to insert real embeddings from external models
   - **Future enhancement:** Integrate real embedding models (or stay with external approach)
 
+- **Same-dimension embedding columns cause `DuplicateExternalId` errors**
+
+  ⚠️ **CRITICAL LIMITATION:** Multiple embedding columns in a single row must have **different dimensions**. Attempting to use multiple embedding columns with the same dimension will fail.
+
+  **Why This Happens:**
+  HNSW indexes use `(row_id, dimension)` as the unique identifier. Multiple embedding columns with the same dimension create identical identifiers, causing a collision.
+
+  **What DOES NOT Work ❌**
+  ```sql
+  CREATE TABLE docs (
+      id INT,
+      title_vec embedding(128),
+      content_vec embedding(128)  -- Same dimension = FAILS
+  );
+
+  -- Error: DuplicateExternalId
+  INSERT INTO docs VALUES (1, [0.1, 0.2, ...], [0.3, 0.4, ...]);
+  ```
+
+  **What DOES Work ✅**
+  ```sql
+  CREATE TABLE docs (
+      id INT,
+      title_vec embedding(128),
+      content_vec embedding(256)  -- Different dimensions = OK
+  );
+
+  -- Success: Uses separate dimension-specific indexes
+  INSERT INTO docs VALUES (1, [0.1, 0.2, ...], [0.3, 0.4, ...]);
+  ```
+
+  **Workarounds:**
+  - **Option 1:** Use different embedding dimensions for each column (recommended)
+    ```sql
+    CREATE TABLE documents (
+        id INT,
+        text_embedding embedding(384),
+        metadata_embedding embedding(128)
+    );
+    ```
+  - **Option 2:** Separate tables for different embedding types
+    ```sql
+    CREATE TABLE documents (id INT, title TEXT);
+    CREATE TABLE doc_embeddings (doc_id INT, text_embedding embedding(128));
+    CREATE TABLE metadata_embeddings (doc_id INT, metadata_embedding embedding(128));
+    ```
+
+  **Future Fix:** Planned enhancement will use composite external IDs `(row_id, dimension, column_name)` to support identical dimensions. This will enable natural table schemas without workarounds.
+
 ---
 
 ## 🚧 Still TODO (from original analysis)

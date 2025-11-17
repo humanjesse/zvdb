@@ -24,6 +24,8 @@ pub const SqlError = error{
     Overflow,
     HavingWithoutGroupBy, // HAVING used without GROUP BY
     ValidationFailed, // Query validation failed (semantic errors)
+    DuplicateEmbeddingDimension, // Multiple embedding columns with same dimension in one table
+    TooManyEmbeddings, // Too many embedding columns per row (resource limit)
 };
 
 /// ORDER BY direction

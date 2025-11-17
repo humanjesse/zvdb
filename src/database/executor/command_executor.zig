@@ -106,6 +106,31 @@ fn handleValidationResult(db: *Database, validation_result: *ValidationResult) !
 /// Execute CREATE TABLE command
 /// Creates a new table with the specified columns and types
 pub fn executeCreateTable(db: *Database, cmd: sql.CreateTableCmd) !QueryResult {
+    // Validate: Check for duplicate embedding dimensions
+    // HNSW uses row_id as the unique key per dimension, so multiple embedding columns
+    // with the same dimension in one table will cause DuplicateExternalId errors on INSERT
+    var seen_dims = std.AutoHashMap(usize, []const u8).init(db.allocator);
+    defer seen_dims.deinit();
+
+    for (cmd.columns.items) |col_def| {
+        if (col_def.col_type == .embedding) {
+            if (col_def.embedding_dim) |dim| {
+                if (seen_dims.get(dim)) |existing_col_name| {
+                    std.debug.print(
+                        "ERROR: Cannot create table '{s}': columns '{s}' and '{s}' both have embedding dimension {d}\n",
+                        .{ cmd.table_name, existing_col_name, col_def.name, dim },
+                    );
+                    std.debug.print(
+                        "HINT: Each embedding dimension can only appear once per table. Use different dimensions for different embedding columns.\n",
+                        .{},
+                    );
+                    return sql.SqlError.DuplicateEmbeddingDimension;
+                }
+                try seen_dims.put(dim, col_def.name);
+            }
+        }
+    }
+
     const table_ptr = try db.allocator.create(Table);
     table_ptr.* = try Table.init(db.allocator, cmd.table_name);
 
@@ -276,6 +301,13 @@ pub fn executeInsert(db: *Database, cmd: sql.InsertCmd) !QueryResult {
             _ = try h.insert(embedding, final_row_id);
             // Continue to process all embedding columns (removed break statement)
         }
+    }
+
+    // Security: Enforce resource limit on embedding columns per row
+    // This prevents resource exhaustion attacks where an attacker creates tables
+    // with 100+ embedding columns, causing memory exhaustion on each INSERT
+    if (embedding_dims.items.len > db.max_embeddings_per_row) {
+        return sql.SqlError.TooManyEmbeddings;
     }
 
     // Additional rollback for HNSW if B-tree index update fails
