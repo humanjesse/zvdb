@@ -106,6 +106,31 @@ fn handleValidationResult(db: *Database, validation_result: *ValidationResult) !
 /// Execute CREATE TABLE command
 /// Creates a new table with the specified columns and types
 pub fn executeCreateTable(db: *Database, cmd: sql.CreateTableCmd) !QueryResult {
+    // Validate: Check for duplicate embedding dimensions
+    // HNSW uses row_id as the unique key per dimension, so multiple embedding columns
+    // with the same dimension in one table will cause DuplicateExternalId errors on INSERT
+    var seen_dims = std.AutoHashMap(usize, []const u8).init(db.allocator);
+    defer seen_dims.deinit();
+
+    for (cmd.columns.items) |col_def| {
+        if (col_def.col_type == .embedding) {
+            if (col_def.embedding_dim) |dim| {
+                if (seen_dims.get(dim)) |existing_col_name| {
+                    std.debug.print(
+                        "ERROR: Cannot create table '{s}': columns '{s}' and '{s}' both have embedding dimension {d}\n",
+                        .{ cmd.table_name, existing_col_name, col_def.name, dim },
+                    );
+                    std.debug.print(
+                        "HINT: Each embedding dimension can only appear once per table. Use different dimensions for different embedding columns.\n",
+                        .{},
+                    );
+                    return sql.SqlError.DuplicateEmbeddingDimension;
+                }
+                try seen_dims.put(dim, col_def.name);
+            }
+        }
+    }
+
     const table_ptr = try db.allocator.create(Table);
     table_ptr.* = try Table.init(db.allocator, cmd.table_name);
 
@@ -262,27 +287,35 @@ pub fn executeInsert(db: *Database, cmd: sql.InsertCmd) !QueryResult {
 
     // If there's an embedding column, add to the appropriate dimension-specific HNSW index
     const row = table.get(final_row_id, snapshot, clog).?;
-    var embedding_dim: ?usize = null; // Track embedding dimension for potential rollback
+    var embedding_dims = ArrayList(usize).init(db.allocator); // Track all embedding dimensions for potential rollback
+    defer embedding_dims.deinit();
     var it = row.values.iterator();
     while (it.next()) |entry| {
         if (entry.value_ptr.* == .embedding) {
             const embedding = entry.value_ptr.embedding;
             const dim = embedding.len;
-            embedding_dim = dim; // Store for potential rollback
+            try embedding_dims.append(dim); // Store for potential rollback
 
             // Get or create HNSW index for this dimension
             const h = try db.getOrCreateHnswForDim(dim);
             _ = try h.insert(embedding, final_row_id);
-            break;
+            // Continue to process all embedding columns (removed break statement)
         }
+    }
+
+    // Security: Enforce resource limit on embedding columns per row
+    // This prevents resource exhaustion attacks where an attacker creates tables
+    // with 100+ embedding columns, causing memory exhaustion on each INSERT
+    if (embedding_dims.items.len > db.max_embeddings_per_row) {
+        return sql.SqlError.TooManyEmbeddings;
     }
 
     // Additional rollback for HNSW if B-tree index update fails
     errdefer {
-        if (embedding_dim) |dim| {
+        for (embedding_dims.items) |dim| {
             if (db.hnsw_indexes.get(dim)) |h| {
                 h.removeNode(final_row_id) catch |err| {
-                    std.debug.print("CRITICAL: Failed to rollback HNSW insert for row {}: {}\n", .{ final_row_id, err });
+                    std.debug.print("CRITICAL: Failed to rollback HNSW insert for row {} in dim {}: {}\n", .{ final_row_id, dim, err });
                 };
             }
         }
@@ -496,48 +529,65 @@ pub fn executeUpdate(db: *Database, cmd: sql.UpdateCmd) !QueryResult {
             try old_row_for_index.set(db.allocator, entry.key_ptr.*, entry.value_ptr.*);
         }
 
-        // Track if embedding column is being updated
-        var old_embedding: ?[]const f32 = null;
-        var new_embedding: ?[]const f32 = null;
-        var embedding_changed = false;
-
-        // Clone old embedding for potential rollback
-        var old_embedding_backup: ?[]f32 = null;
-        defer if (old_embedding_backup) |emb| db.allocator.free(emb);
-
-        // Find old embedding if it exists
-        var it = row.values.iterator();
-        while (it.next()) |entry| {
-            if (entry.value_ptr.* == .embedding) {
-                old_embedding = entry.value_ptr.embedding;
-                // Clone for potential rollback
-                old_embedding_backup = try db.allocator.dupe(f32, old_embedding.?);
-                break;
+        // Track embedding column updates (support multiple embeddings per row)
+        const EmbeddingUpdate = struct {
+            column_name: []const u8,
+            old_backup: ?[]f32,
+            new_value: []const f32,
+            changed: bool,
+        };
+        var embedding_updates = ArrayList(EmbeddingUpdate).init(db.allocator);
+        defer {
+            for (embedding_updates.items) |update| {
+                if (update.old_backup) |backup| {
+                    db.allocator.free(backup);
+                }
             }
+            embedding_updates.deinit();
         }
 
-        // First pass: Detect if embedding is changing and determine new embedding
+        // Process each assignment to find embedding updates
         for (cmd.assignments.items) |assignment| {
             if (assignment.value == .embedding) {
-                new_embedding = assignment.value.embedding;
-                // Check if embedding actually changed
-                if (old_embedding) |old_emb| {
-                    if (old_emb.len == new_embedding.?.len) {
-                        var changed = false;
-                        for (old_emb, 0..) |val, i| {
-                            if (val != new_embedding.?[i]) {
-                                changed = true;
-                                break;
+                const new_embedding = assignment.value.embedding;
+
+                // Find old embedding value for this column (if it exists)
+                const old_value = row.get(assignment.column);
+                var old_backup: ?[]f32 = null;
+                var changed = false;
+
+                if (old_value) |old_val| {
+                    if (old_val == .embedding) {
+                        const old_emb = old_val.embedding;
+                        // Clone for rollback
+                        old_backup = try db.allocator.dupe(f32, old_emb);
+
+                        // Check if actually changed
+                        if (old_emb.len == new_embedding.len) {
+                            for (old_emb, 0..) |val, i| {
+                                if (val != new_embedding[i]) {
+                                    changed = true;
+                                    break;
+                                }
                             }
+                        } else {
+                            changed = true;
                         }
-                        embedding_changed = changed;
                     } else {
-                        embedding_changed = true;
+                        // Column exists but wasn't an embedding before
+                        changed = true;
                     }
                 } else {
-                    embedding_changed = true;
+                    // New embedding column being added
+                    changed = true;
                 }
-                break; // Only one embedding column per table
+
+                try embedding_updates.append(.{
+                    .column_name = assignment.column,
+                    .old_backup = old_backup,
+                    .new_value = new_embedding,
+                    .changed = changed,
+                });
             }
         }
 
@@ -580,33 +630,34 @@ pub fn executeUpdate(db: *Database, cmd: sql.UpdateCmd) !QueryResult {
             _ = try recovery.writeWalRecord(db, WalRecordType.update_row, cmd.table_name, row_id, combined_data);
         }
 
-        // Handle HNSW index updates BEFORE applying row updates
-        if (embedding_changed) {
-            // Remove old vector from its dimension-specific HNSW (if it existed)
-            if (old_embedding_backup) |old_emb| {
-                const old_dim = old_emb.len;
-                if (db.hnsw_indexes.get(old_dim)) |h| {
-                    h.removeNode(row_id) catch |err| {
-                        std.debug.print("Error removing node from HNSW: {}\n", .{err});
-                        return err;
-                    };
+        // Handle HNSW index updates BEFORE applying row updates (support multiple embeddings)
+        for (embedding_updates.items) |update| {
+            if (update.changed) {
+                // Remove old vector from its dimension-specific HNSW (if it existed)
+                if (update.old_backup) |old_emb| {
+                    const old_dim = old_emb.len;
+                    if (db.hnsw_indexes.get(old_dim)) |h| {
+                        h.removeNode(row_id) catch |err| {
+                            std.debug.print("Error removing node from HNSW (column '{s}'): {}\n", .{ update.column_name, err });
+                            return err;
+                        };
+                    }
                 }
-            }
 
-            // Insert new vector to its dimension-specific HNSW
-            if (new_embedding) |new_emb| {
+                // Insert new vector to its dimension-specific HNSW
+                const new_emb = update.new_value;
                 const new_dim = new_emb.len;
                 const h = try db.getOrCreateHnswForDim(new_dim);
                 _ = h.insert(new_emb, row_id) catch |err| {
                     // Rollback: Re-insert old embedding to restore HNSW state
-                    if (old_embedding_backup) |old_clone| {
+                    if (update.old_backup) |old_clone| {
                         const old_dim = old_clone.len;
                         const old_h = try db.getOrCreateHnswForDim(old_dim);
                         _ = old_h.insert(old_clone, row_id) catch {
-                            std.debug.print("CRITICAL: Failed to rollback HNSW state after insert failure\n", .{});
+                            std.debug.print("CRITICAL: Failed to rollback HNSW state after insert failure (column '{s}')\n", .{update.column_name});
                         };
                     }
-                    std.debug.print("Error inserting new vector to HNSW: {}\n", .{err});
+                    std.debug.print("Error inserting new vector to HNSW (column '{s}'): {}\n", .{ update.column_name, err });
                     return err;
                 };
             }

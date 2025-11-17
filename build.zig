@@ -265,6 +265,33 @@ pub fn build(b: *std.Build) void {
     });
     const run_hnsw_removal_tests = b.addRunArtifact(hnsw_removal_tests);
 
+    const multi_embedding_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_multi_embedding.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_multi_embedding_tests = b.addRunArtifact(multi_embedding_tests);
+
+    const hybrid_query_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_hybrid_queries.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_hybrid_query_tests = b.addRunArtifact(hybrid_query_tests);
+
+    const array_literal_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_array_literals.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_array_literal_tests = b.addRunArtifact(array_literal_tests);
+
     const insert_atomicity_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/test_insert_atomicity.zig"),
@@ -302,6 +329,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_wal_rotation_tests.step);
     test_step.dependOn(&run_hnsw_index_memory_tests.step);
     test_step.dependOn(&run_hnsw_removal_tests.step);
+    test_step.dependOn(&run_multi_embedding_tests.step);
+    test_step.dependOn(&run_hybrid_query_tests.step);
+    test_step.dependOn(&run_array_literal_tests.step);
     test_step.dependOn(&run_insert_atomicity_tests.step);
 
     // Add unit tests
