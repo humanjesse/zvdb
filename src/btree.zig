@@ -833,10 +833,11 @@ pub const BTree = struct {
                     _ = try self.rebalanceAfterDelete(node);
 
                     return true;
-                } else if (cmp == .gt) {
+                } else if (cmp == .lt) {
                     // Keys are sorted, won't find it later
                     return false;
                 }
+                // If cmp == .gt, continue searching through remaining keys
             }
             return false;
         }
@@ -854,7 +855,12 @@ pub const BTree = struct {
                 return false;
             } else if (cmp == .eq) {
                 // In B+ tree, separator keys are duplicated in leaves
-                // Search the right subtree (where the actual value is)
+                // Search left child first (where the separator came from)
+                if (i < node.children.items.len) {
+                    const found = try self.deleteFromNode(node.children.items[i].?, key, row_id);
+                    if (found) return true;
+                }
+                // Also search right child as the key might be there too
                 if (i + 1 < node.children.items.len) {
                     return try self.deleteFromNode(node.children.items[i + 1].?, key, row_id);
                 }
@@ -1329,7 +1335,7 @@ test "BTree: alternating insert and delete" {
     while (i < 100) : (i += 1) {
         try tree.insert(ColumnValue{ .int = @intCast(i) }, i);
 
-        if (i > 10) {
+        if (i >= 10) {
             // Delete something from earlier
             _ = try tree.delete(ColumnValue{ .int = @intCast(i - 10) }, i - 10);
         }
@@ -1345,4 +1351,165 @@ test "BTree: alternating insert and delete" {
         defer testing.allocator.free(results);
         try testing.expectEqual(@as(usize, 1), results.len);
     }
+}
+
+test "BTree: delete key matching separator value" {
+    var tree = BTree.init(testing.allocator);
+    defer tree.deinit();
+
+    // PHASE 1: Create tree with known separator
+    // Insert 32 keys (0-31) to trigger exactly one split
+    // This creates: Root with separator=15, Left leaf [0-14], Right leaf [15-31]
+    var i: u64 = 0;
+    while (i < 32) : (i += 1) {
+        try tree.insert(ColumnValue{ .int = @intCast(i) }, i * 10);
+    }
+
+    try testing.expectEqual(@as(usize, 32), tree.getSize());
+
+    // PHASE 2: Verify key 15 exists (this will be our separator)
+    const before_delete = try tree.search(ColumnValue{ .int = 15 });
+    defer testing.allocator.free(before_delete);
+    try testing.expectEqual(@as(usize, 1), before_delete.len);
+    try testing.expectEqual(@as(u64, 150), before_delete[0]);
+
+    // PHASE 3: Delete the key that matches the separator
+    // This tests the bug fix: must search RIGHT child, not LEFT
+    const deleted = try tree.delete(ColumnValue{ .int = 15 }, 150);
+    try testing.expect(deleted);
+    try testing.expectEqual(@as(usize, 31), tree.getSize());
+
+    // PHASE 4: Verify deletion worked
+    const after_delete = try tree.search(ColumnValue{ .int = 15 });
+    defer testing.allocator.free(after_delete);
+    try testing.expectEqual(@as(usize, 0), after_delete.len);
+
+    // PHASE 5: Verify surrounding keys still exist
+    const key_14 = try tree.search(ColumnValue{ .int = 14 });
+    defer testing.allocator.free(key_14);
+    try testing.expectEqual(@as(usize, 1), key_14.len);
+
+    const key_16 = try tree.search(ColumnValue{ .int = 16 });
+    defer testing.allocator.free(key_16);
+    try testing.expectEqual(@as(usize, 1), key_16.len);
+
+    // PHASE 6: Verify tree structure with range query
+    const range_result = try tree.findRange(
+        ColumnValue{ .int = 0 },
+        ColumnValue{ .int = 31 },
+        true,
+        true,
+    );
+    defer testing.allocator.free(range_result);
+    try testing.expectEqual(@as(usize, 31), range_result.len);
+
+    // Verify no gaps in range (except for 15)
+    var expected_row_id: u64 = 0;
+    for (range_result) |row_id| {
+        if (expected_row_id == 150) expected_row_id += 10; // Skip deleted
+        try testing.expectEqual(expected_row_id, row_id);
+        expected_row_id += 10;
+    }
+}
+
+test "BTree: delete separator with duplicate keys" {
+    var tree = BTree.init(testing.allocator);
+    defer tree.deinit();
+
+    // PHASE 1: Create tree with duplicate keys at separator position
+    // Insert keys 0-14 (will be in left leaf)
+    var i: u64 = 0;
+    while (i < 15) : (i += 1) {
+        try tree.insert(ColumnValue{ .int = @intCast(i) }, i * 10);
+    }
+
+    // Insert key 15 multiple times - this will be our separator
+    // Row IDs: 100, 101, 102, 103, 104
+    try tree.insert(ColumnValue{ .int = 15 }, 100);
+    try tree.insert(ColumnValue{ .int = 15 }, 101);
+    try tree.insert(ColumnValue{ .int = 15 }, 102);
+    try tree.insert(ColumnValue{ .int = 15 }, 103);
+    try tree.insert(ColumnValue{ .int = 15 }, 104);
+
+    // Insert keys 16-31 (will be in right leaf, triggering split)
+    i = 16;
+    while (i < 32) : (i += 1) {
+        try tree.insert(ColumnValue{ .int = @intCast(i) }, i * 10);
+    }
+
+    // 0-14 = 15 keys, key 15 x5 = 5 keys, 16-31 = 16 keys = 36 total
+    try testing.expectEqual(@as(usize, 36), tree.getSize());
+
+    // PHASE 2: Verify all instances of key 15 exist
+    const before_delete = try tree.search(ColumnValue{ .int = 15 });
+    defer testing.allocator.free(before_delete);
+    try testing.expectEqual(@as(usize, 5), before_delete.len);
+
+    // Verify we have all 5 row_ids
+    var found_100 = false;
+    var found_101 = false;
+    var found_102 = false;
+    var found_103 = false;
+    var found_104 = false;
+    for (before_delete) |row_id| {
+        if (row_id == 100) found_100 = true;
+        if (row_id == 101) found_101 = true;
+        if (row_id == 102) found_102 = true;
+        if (row_id == 103) found_103 = true;
+        if (row_id == 104) found_104 = true;
+    }
+    try testing.expect(found_100);
+    try testing.expect(found_101);
+    try testing.expect(found_102);
+    try testing.expect(found_103);
+    try testing.expect(found_104);
+
+    // PHASE 3: Delete some (but not all) instances of key 15
+    const deleted_101 = try tree.delete(ColumnValue{ .int = 15 }, 101);
+    try testing.expect(deleted_101);
+    try testing.expectEqual(@as(usize, 35), tree.getSize());
+
+    const deleted_103 = try tree.delete(ColumnValue{ .int = 15 }, 103);
+    try testing.expect(deleted_103);
+    try testing.expectEqual(@as(usize, 34), tree.getSize());
+
+    // PHASE 4: Verify remaining instances still exist
+    const after_delete = try tree.search(ColumnValue{ .int = 15 });
+    defer testing.allocator.free(after_delete);
+    try testing.expectEqual(@as(usize, 3), after_delete.len);
+
+    // Check that 100, 102, 104 remain (101 and 103 were deleted)
+    found_100 = false;
+    found_101 = false;
+    found_102 = false;
+    found_103 = false;
+    found_104 = false;
+    for (after_delete) |row_id| {
+        if (row_id == 100) found_100 = true;
+        if (row_id == 101) found_101 = true;
+        if (row_id == 102) found_102 = true;
+        if (row_id == 103) found_103 = true;
+        if (row_id == 104) found_104 = true;
+    }
+    try testing.expect(found_100);
+    try testing.expect(!found_101); // Should be deleted
+    try testing.expect(found_102);
+    try testing.expect(!found_103); // Should be deleted
+    try testing.expect(found_104);
+
+    // PHASE 5: Verify tree structure is still valid with range query
+    const range_result = try tree.findRange(
+        ColumnValue{ .int = 0 },
+        ColumnValue{ .int = 31 },
+        true,
+        true,
+    );
+    defer testing.allocator.free(range_result);
+    try testing.expectEqual(@as(usize, 34), range_result.len);
+
+    // PHASE 6: Verify we can still insert and search correctly
+    try tree.insert(ColumnValue{ .int = 15 }, 105);
+    const final_search = try tree.search(ColumnValue{ .int = 15 });
+    defer testing.allocator.free(final_search);
+    try testing.expectEqual(@as(usize, 4), final_search.len);
 }
