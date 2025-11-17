@@ -1551,6 +1551,14 @@ test "WalWriter: cleanup old files reduces quota" {
 }
 
 test "WalWriter: rejects symlink" {
+    const builtin = @import("builtin");
+
+    // Skip on Windows: symlink creation requires special privileges
+    // and the security concern is primarily Unix/Linux-specific
+    if (builtin.os.tag == .windows) {
+        return error.SkipZigTest;
+    }
+
     const allocator = testing.allocator;
 
     const random_id = std.crypto.random.int(u64);
