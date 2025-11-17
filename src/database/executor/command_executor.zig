@@ -246,6 +246,15 @@ pub fn executeInsert(db: *Database, cmd: sql.InsertCmd) !QueryResult {
     try table.insertWithId(row_id, values_map, tx_id);
     const final_row_id = row_id;
 
+    // Bug Fix #6: Rollback the table insert if any index update fails
+    // This ensures atomicity between table and index operations
+    errdefer {
+        // Physically delete the row we just inserted (complete removal, not MVCC deletion)
+        table.physicalDelete(final_row_id) catch |err| {
+            std.debug.print("CRITICAL: Failed to rollback table insert for row {}: {}\n", .{ final_row_id, err });
+        };
+    }
+
     // Phase 3: Get MVCC context to retrieve the row we just inserted
     // With the visibility fix, transactions can now see their own changes
     const snapshot = db.getCurrentSnapshot();
@@ -253,15 +262,29 @@ pub fn executeInsert(db: *Database, cmd: sql.InsertCmd) !QueryResult {
 
     // If there's an embedding column, add to the appropriate dimension-specific HNSW index
     const row = table.get(final_row_id, snapshot, clog).?;
+    var embedding_dim: ?usize = null; // Track embedding dimension for potential rollback
     var it = row.values.iterator();
     while (it.next()) |entry| {
         if (entry.value_ptr.* == .embedding) {
             const embedding = entry.value_ptr.embedding;
             const dim = embedding.len;
+            embedding_dim = dim; // Store for potential rollback
+
             // Get or create HNSW index for this dimension
             const h = try db.getOrCreateHnswForDim(dim);
             _ = try h.insert(embedding, final_row_id);
             break;
+        }
+    }
+
+    // Additional rollback for HNSW if B-tree index update fails
+    errdefer {
+        if (embedding_dim) |dim| {
+            if (db.hnsw_indexes.get(dim)) |h| {
+                h.removeNode(final_row_id) catch |err| {
+                    std.debug.print("CRITICAL: Failed to rollback HNSW insert for row {}: {}\n", .{ final_row_id, err });
+                };
+            }
         }
     }
 

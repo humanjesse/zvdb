@@ -228,6 +228,8 @@ pub fn HNSW(comptime T: type) type {
             // Clean up type index
             var type_it = self.type_index.iterator();
             while (type_it.next()) |entry| {
+                // Free the duplicated key
+                self.allocator.free(entry.key_ptr.*);
                 var list = entry.value_ptr;
                 list.deinit();
             }
@@ -236,6 +238,8 @@ pub fn HNSW(comptime T: type) type {
             // Clean up file_path index
             var file_path_it = self.file_path_index.iterator();
             while (file_path_it.next()) |entry| {
+                // Free the duplicated key
+                self.allocator.free(entry.key_ptr.*);
                 var list = entry.value_ptr;
                 list.deinit();
             }
@@ -452,6 +456,48 @@ pub fn HNSW(comptime T: type) type {
                 }
             }
 
+            // CRITICAL: Reconnect neighbors at each layer to prevent fragmentation
+            // For each layer, connect the deleted node's neighbors to each other
+            for (node.connections, 0..) |conn_list, layer| {
+                const neighbors = conn_list.items;
+
+                // For each pair of neighbors, add an edge between them
+                for (neighbors, 0..) |neighbor_a_id, i| {
+                    for (neighbors[i + 1 ..]) |neighbor_b_id| {
+                        const neighbor_a = self.nodes.getPtr(neighbor_a_id) orelse continue;
+                        const neighbor_b = self.nodes.getPtr(neighbor_b_id) orelse continue;
+
+                        // Check if neighbor_b is already in neighbor_a's connections
+                        var already_connected = false;
+                        if (layer < neighbor_a.connections.len) {
+                            for (neighbor_a.connections[layer].items) |conn_id| {
+                                if (conn_id == neighbor_b_id) {
+                                    already_connected = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (!already_connected) {
+                            // Add bidirectional connection
+                            if (layer < neighbor_a.connections.len and layer < neighbor_b.connections.len) {
+                                neighbor_a.mutex.lock();
+                                defer neighbor_a.mutex.unlock();
+                                neighbor_b.mutex.lock();
+                                defer neighbor_b.mutex.unlock();
+
+                                try neighbor_a.connections[layer].append(neighbor_b_id);
+                                try neighbor_b.connections[layer].append(neighbor_a_id);
+
+                                // Shrink if needed to maintain max connections
+                                try self.shrinkConnections(neighbor_a_id, layer);
+                                try self.shrinkConnections(neighbor_b_id, layer);
+                            }
+                        }
+                    }
+                }
+            }
+
             // Remove all connections from other nodes to this node
             var nodes_it = self.nodes.iterator();
             while (nodes_it.next()) |entry| {
@@ -540,6 +586,10 @@ pub fn HNSW(comptime T: type) type {
         fn addToTypeIndex(self: *Self, node_type: []const u8, external_id: u64) !void {
             var result = try self.type_index.getOrPut(node_type);
             if (!result.found_existing) {
+                // Duplicate the key to own it (prevent dangling pointer)
+                const owned_key = try self.allocator.dupe(u8, node_type);
+                errdefer self.allocator.free(owned_key);
+                result.key_ptr.* = owned_key;
                 result.value_ptr.* = ArrayList(u64).init(self.allocator);
             }
             try result.value_ptr.append(external_id);
@@ -551,6 +601,14 @@ pub fn HNSW(comptime T: type) type {
             for (list.items, 0..) |id, i| {
                 if (id == external_id) {
                     _ = list.swapRemove(i);
+                    // If list is now empty, clean up the entry and free the key
+                    if (list.items.len == 0) {
+                        const entry = self.type_index.getEntry(node_type).?;
+                        const key_to_free = entry.key_ptr.*;
+                        list.deinit();
+                        _ = self.type_index.remove(node_type);
+                        self.allocator.free(key_to_free);
+                    }
                     break;
                 }
             }
@@ -560,6 +618,10 @@ pub fn HNSW(comptime T: type) type {
         fn addToFilePathIndex(self: *Self, file_path: []const u8, external_id: u64) !void {
             var result = try self.file_path_index.getOrPut(file_path);
             if (!result.found_existing) {
+                // Duplicate the key to own it (prevent dangling pointer)
+                const owned_key = try self.allocator.dupe(u8, file_path);
+                errdefer self.allocator.free(owned_key);
+                result.key_ptr.* = owned_key;
                 result.value_ptr.* = ArrayList(u64).init(self.allocator);
             }
             try result.value_ptr.append(external_id);
@@ -571,6 +633,14 @@ pub fn HNSW(comptime T: type) type {
             for (list.items, 0..) |id, i| {
                 if (id == external_id) {
                     _ = list.swapRemove(i);
+                    // If list is now empty, clean up the entry and free the key
+                    if (list.items.len == 0) {
+                        const entry = self.file_path_index.getEntry(file_path).?;
+                        const key_to_free = entry.key_ptr.*;
+                        list.deinit();
+                        _ = self.file_path_index.remove(file_path);
+                        self.allocator.free(key_to_free);
+                    }
                     break;
                 }
             }

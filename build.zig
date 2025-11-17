@@ -246,6 +246,34 @@ pub fn build(b: *std.Build) void {
     });
     const run_wal_rotation_tests = b.addRunArtifact(wal_rotation_tests);
 
+    // Bug fix tests from claude/investigate-previous-issues branch
+    const hnsw_index_memory_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_hnsw_index_memory.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_hnsw_index_memory_tests = b.addRunArtifact(hnsw_index_memory_tests);
+
+    const hnsw_removal_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_hnsw_removal.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_hnsw_removal_tests = b.addRunArtifact(hnsw_removal_tests);
+
+    const insert_atomicity_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_insert_atomicity.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_insert_atomicity_tests = b.addRunArtifact(insert_atomicity_tests);
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_hnsw_tests.step);
     test_step.dependOn(&run_sql_tests.step);
@@ -272,6 +300,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_concurrent_delete_stress_tests.step);
     test_step.dependOn(&run_hnsw_self_loop_tests.step);
     test_step.dependOn(&run_wal_rotation_tests.step);
+    test_step.dependOn(&run_hnsw_index_memory_tests.step);
+    test_step.dependOn(&run_hnsw_removal_tests.step);
+    test_step.dependOn(&run_insert_atomicity_tests.step);
 
     // Add unit tests
     // const unit_tests = b.addTest(.{
