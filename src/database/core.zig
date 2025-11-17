@@ -96,6 +96,18 @@ pub const QueryResult = struct {
     }
 };
 
+/// Auto-VACUUM configuration
+pub const VacuumConfig = struct {
+    /// Enable automatic VACUUM after operations
+    enabled: bool = true,
+
+    /// Trigger auto-VACUUM when version chain length exceeds this
+    max_chain_length: usize = 10,
+
+    /// Trigger auto-VACUUM every N transactions
+    txn_interval: usize = 1000,
+};
+
 /// Main database with SQL and vector search
 pub const Database = struct {
     tables: StringHashMap(*Table),
@@ -111,6 +123,10 @@ pub const Database = struct {
     enable_validation: bool, // Master switch for validation
     validation_mode: ValidationMode, // How validation errors are handled
 
+    // Auto-VACUUM configuration (Phase 4)
+    vacuum_config: VacuumConfig, // Auto-vacuum settings
+    txn_count_since_vacuum: usize, // Track transactions for auto-vacuum
+
     pub fn init(allocator: Allocator) Database {
         return Database{
             .tables = StringHashMap(*Table).init(allocator),
@@ -123,6 +139,8 @@ pub const Database = struct {
             .tx_manager = TransactionManager.init(allocator),
             .enable_validation = true, // Enabled by default for safety
             .validation_mode = .strict, // Strict mode by default
+            .vacuum_config = VacuumConfig{}, // Auto-vacuum enabled with defaults
+            .txn_count_since_vacuum = 0,
         };
     }
 
@@ -199,6 +217,74 @@ pub const Database = struct {
         }
         self.data_dir = try self.allocator.dupe(u8, data_dir);
         self.auto_save = auto_save;
+    }
+
+    // ========================================================================
+    // Auto-VACUUM Support (Phase 4)
+    // ========================================================================
+
+    /// Check if auto-VACUUM should be triggered and run it if needed
+    /// Called after UPDATE/DELETE operations
+    pub fn maybeAutoVacuum(self: *Database) void {
+        if (!self.vacuum_config.enabled) return;
+
+        // Check if we should trigger based on transaction count
+        self.txn_count_since_vacuum += 1;
+        const should_vacuum_by_count = self.txn_count_since_vacuum >= self.vacuum_config.txn_interval;
+
+        // Check if any table has excessive version chain length
+        var should_vacuum_by_chain = false;
+        var it = self.tables.valueIterator();
+        while (it.next()) |table_ptr| {
+            const stats = table_ptr.*.getVacuumStats();
+            if (stats.max_chain_length > self.vacuum_config.max_chain_length) {
+                should_vacuum_by_chain = true;
+                break;
+            }
+        }
+
+        // Trigger auto-VACUUM if either condition is met
+        if (should_vacuum_by_count or should_vacuum_by_chain) {
+            self.runAutoVacuum() catch |err| {
+                std.debug.print("Auto-VACUUM failed: {}\n", .{err});
+            };
+        }
+    }
+
+    /// Run auto-VACUUM on all tables
+    /// Called automatically by maybeAutoVacuum when thresholds are exceeded
+    fn runAutoVacuum(self: *Database) !void {
+        // Get minimum visible transaction ID
+        const min_visible_txid = blk: {
+            var min_txid: u64 = std.math.maxInt(u64);
+            var found_any = false;
+
+            self.tx_manager.mutex.lock();
+            defer self.tx_manager.mutex.unlock();
+
+            var it = self.tx_manager.active_txs.valueIterator();
+            while (it.next()) |tx_ptr| {
+                if (tx_ptr.*.id < min_txid) {
+                    min_txid = tx_ptr.*.id;
+                    found_any = true;
+                }
+            }
+
+            if (!found_any) {
+                min_txid = self.tx_manager.next_tx_id.load(.monotonic);
+            }
+
+            break :blk min_txid;
+        };
+
+        // VACUUM all tables
+        var table_it = self.tables.valueIterator();
+        while (table_it.next()) |table_ptr| {
+            _ = try table_ptr.*.vacuum(min_visible_txid, &self.tx_manager.clog);
+        }
+
+        // Reset counter
+        self.txn_count_since_vacuum = 0;
     }
 
     // ========================================================================

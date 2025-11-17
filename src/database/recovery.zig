@@ -76,7 +76,7 @@ pub fn enableWal(db: *Database, wal_dir: []const u8) !void {
 }
 
 /// Helper function to write a WAL record and flush to disk
-/// Centralizes transaction ID management and WAL writing logic
+/// Uses the current transaction's ID or 0 for bootstrap mode
 /// Returns the transaction ID used for this record
 pub fn writeWalRecord(
     db: *Database,
@@ -87,8 +87,8 @@ pub fn writeWalRecord(
 ) !u64 {
     const w = db.wal orelse return error.WalNotEnabled;
 
-    // Get transaction ID and increment atomically from TransactionManager (single source of truth)
-    const tx_id = db.tx_manager.next_tx_id.fetchAdd(1, .monotonic);
+    // Use current transaction ID (or 0 for bootstrap/backward compatibility)
+    const tx_id = db.getCurrentTxId();
 
     // Create WAL record (writeRecord makes its own copy of table_name and data)
     const table_name_owned = try db.allocator.dupe(u8, table_name);
@@ -106,20 +106,10 @@ pub fn writeWalRecord(
 
     // Write WAL record and flush to disk (CRITICAL: must be durable before table mutation)
     _ = try w.writeRecord(record);
-
-    // Write COMMIT record to mark this transaction as committed
-    // (Each SQL statement is an auto-committed transaction)
-    const commit_record = WalRecord{
-        .record_type = .commit_tx,
-        .tx_id = tx_id,
-        .lsn = 0,
-        .row_id = 0,
-        .table_name = "",
-        .data = "",
-        .checksum = 0,
-    };
-    _ = try w.writeRecord(commit_record);
     try w.flush();
+
+    // Note: COMMIT records are now written by transaction_executor.zig
+    // when the transaction is explicitly committed (including auto-commit)
 
     return tx_id;
 }
@@ -293,7 +283,12 @@ pub fn recoverFromWal(db: *Database, wal_dir: []const u8) !usize {
                 }
 
                 // Only process records from committed transactions
-                const tx_state = transactions.get(record.tx_id) orelse .active;
+                // Note: txid=0 (bootstrap) is always considered committed
+                const tx_state = if (record.tx_id == 0)
+                    .committed
+                else
+                    transactions.get(record.tx_id) orelse .active;
+
                 if (tx_state != .committed) {
                     continue; // Skip records from uncommitted/aborted transactions
                 }

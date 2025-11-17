@@ -412,7 +412,9 @@ pub const RowVersion = struct {
     /// This is the CORE visibility logic for MVCC
     pub fn isVisible(self: *const RowVersion, snapshot: *const Snapshot, clog: *CommitLog) bool {
         // Version created by a transaction that started after our snapshot?
-        if (self.xmin >= snapshot.txid) return false;
+        // Note: We use > not >= because a transaction can see its own changes
+        // (xmin == snapshot.txid means this is our own transaction)
+        if (self.xmin > snapshot.txid) return false;
 
         // Version created by a transaction that was active when we took snapshot?
         if (snapshot.wasActive(self.xmin)) return false;
@@ -558,8 +560,28 @@ pub const Table = struct {
     /// Delete a row by ID (MVCC-enabled)
     /// Marks the current version as deleted (sets xmax) instead of physically removing it
     /// For non-MVCC mode (tx_id=0), uses maxInt(u64) as sentinel for "deleted"
-    pub fn delete(self: *Table, id: u64, tx_id: u64) !void {
+    pub fn delete(self: *Table, id: u64, tx_id: u64, clog: ?*CommitLog) !void {
         const chain_head = self.version_chains.get(id) orelse return error.RowNotFound;
+
+        // Phase 3: Write-write conflict detection
+        // Check if another transaction is already updating/deleting this row
+
+        // Check 1: Another transaction has marked this row for deletion
+        if (chain_head.xmax != 0 and chain_head.xmax != tx_id) {
+            // Another transaction has locked this row for update/delete
+            // This is a write-write conflict - abort with serialization error
+            return error.SerializationFailure;
+        }
+
+        // Check 2: This row was created by another uncommitted transaction
+        if (chain_head.xmin != tx_id and chain_head.xmin != 0) {
+            if (clog) |log| {
+                if (!log.isCommitted(chain_head.xmin)) {
+                    // Creating transaction is still active/aborted
+                    return error.SerializationFailure;
+                }
+            }
+        }
 
         // Mark the current version as deleted
         // Use maxInt as sentinel for immediate deletion (backward compatibility)
@@ -615,8 +637,33 @@ pub const Table = struct {
 
     /// Update a row by creating a new version (MVCC-enabled)
     /// Creates a new version with the updated value and chains it to the old version
-    pub fn update(self: *Table, row_id: u64, column: []const u8, new_value: ColumnValue, tx_id: u64) !void {
+    pub fn update(self: *Table, row_id: u64, column: []const u8, new_value: ColumnValue, tx_id: u64, clog: ?*CommitLog) !void {
         const old_version = self.version_chains.get(row_id) orelse return error.RowNotFound;
+
+        // Phase 3: Write-write conflict detection
+        // Check if another transaction is already updating/deleting this row
+
+        // Check 1: Another transaction has marked this row for deletion
+        if (old_version.xmax != 0 and old_version.xmax != tx_id) {
+            // Another transaction has locked this row for update/delete
+            // This is a write-write conflict - abort with serialization error
+            return error.SerializationFailure;
+        }
+
+        // Check 2: This row was created by another uncommitted transaction
+        // If the current version's creator (xmin) is different from us and hasn't committed, conflict!
+        if (old_version.xmin != tx_id and old_version.xmin != 0) {
+            if (clog) |log| {
+                // Check if the creating transaction has committed
+                if (!log.isCommitted(old_version.xmin)) {
+                    // Transaction that created this version is still active or aborted
+                    // This is a write-write conflict
+                    return error.SerializationFailure;
+                }
+                // Transaction committed - OK to update this row
+            }
+            // No commit log available - allow for backward compatibility
+        }
 
         // Mark old version as superseded by this transaction
         old_version.xmax = tx_id;
@@ -685,6 +732,144 @@ pub const Table = struct {
         }
 
         return visible_ids.toOwnedSlice();
+    }
+
+    // ============================================================================
+    // Phase 4: VACUUM - Garbage Collection for Old Versions
+    // ============================================================================
+
+    /// Statistics about version chain lengths in the table
+    pub const VacuumStats = struct {
+        total_chains: usize,
+        total_versions: usize,
+        max_chain_length: usize,
+        avg_chain_length: f64,
+        versions_removed: usize,
+    };
+
+    /// Get statistics about version chains (useful for deciding when to VACUUM)
+    pub fn getVacuumStats(self: *Table) VacuumStats {
+        var stats = VacuumStats{
+            .total_chains = 0,
+            .total_versions = 0,
+            .max_chain_length = 0,
+            .avg_chain_length = 0.0,
+            .versions_removed = 0,
+        };
+
+        var it = self.version_chains.iterator();
+        while (it.next()) |entry| {
+            stats.total_chains += 1;
+            var chain_length: usize = 0;
+
+            var version: ?*RowVersion = entry.value_ptr.*;
+            while (version) |v| {
+                chain_length += 1;
+                stats.total_versions += 1;
+                version = v.next;
+            }
+
+            if (chain_length > stats.max_chain_length) {
+                stats.max_chain_length = chain_length;
+            }
+        }
+
+        if (stats.total_chains > 0) {
+            stats.avg_chain_length = @as(f64, @floatFromInt(stats.total_versions)) / @as(f64, @floatFromInt(stats.total_chains));
+        }
+
+        return stats;
+    }
+
+    /// VACUUM: Remove old row versions that are no longer visible to any transaction
+    /// This frees up memory by cleaning up old versions from version chains
+    ///
+    /// Algorithm:
+    /// 1. Find versions that are no longer visible to any active transaction
+    /// 2. Remove them from version chains
+    /// 3. Free their memory
+    ///
+    /// Safety rules:
+    /// - Never remove the head (newest version) of a chain
+    /// - Only remove versions where:
+    ///   a) Created by aborted transaction, OR
+    ///   b) Deleted before min_visible_txid and created before min_visible_txid
+    ///
+    /// Parameters:
+    /// - min_visible_txid: Minimum transaction ID of all active transactions
+    ///   (any version created/deleted before this is potentially removable)
+    /// - clog: Commit log to check transaction status
+    ///
+    /// Returns: Statistics about the vacuum operation
+    pub fn vacuum(self: *Table, min_visible_txid: u64, clog: *CommitLog) !VacuumStats {
+        var stats = self.getVacuumStats();
+
+        var it = self.version_chains.iterator();
+        while (it.next()) |entry| {
+            const head = entry.value_ptr.*;
+
+            // Walk the version chain and clean up old versions
+            var current: ?*RowVersion = head.next; // Start from second version (never remove head)
+            var prev: *RowVersion = head;
+
+            while (current) |version| {
+                const next = version.next;
+
+                // Check if this version can be removed
+                const can_remove = blk: {
+                    // Version was created by an aborted transaction - always safe to remove
+                    if (clog.isAborted(version.xmin)) {
+                        break :blk true;
+                    }
+
+                    // Version must be deleted (xmax != 0)
+                    if (version.xmax == 0) {
+                        break :blk false; // Still current version in some chain
+                    }
+
+                    // Deletion must be by a committed transaction
+                    if (!clog.isCommitted(version.xmax)) {
+                        break :blk false; // Deletion not committed yet
+                    }
+
+                    // Both creation and deletion must be before min_visible_txid
+                    if (version.xmin >= min_visible_txid or version.xmax >= min_visible_txid) {
+                        break :blk false; // Might still be visible to some transaction
+                    }
+
+                    // Creation must be committed
+                    if (!clog.isCommitted(version.xmin)) {
+                        break :blk false; // Creating transaction not committed
+                    }
+
+                    // All conditions met - safe to remove
+                    break :blk true;
+                };
+
+                if (can_remove) {
+                    // Remove this version from the chain
+                    prev.next = next;
+
+                    // Free the version
+                    version.deinit(self.allocator);
+                    stats.versions_removed += 1;
+                } else {
+                    // Keep this version, move prev pointer
+                    prev = version;
+                }
+
+                current = next;
+            }
+        }
+
+        // Update stats with final counts
+        const final_stats = self.getVacuumStats();
+        stats.total_chains = final_stats.total_chains;
+        stats.total_versions = final_stats.total_versions;
+        stats.max_chain_length = final_stats.max_chain_length;
+        stats.avg_chain_length = final_stats.avg_chain_length;
+
+        return stats;
     }
 
     /// Save table to a binary file (.zvdb format)

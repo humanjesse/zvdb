@@ -432,7 +432,7 @@ test "IndexManager: automatic index updates on delete" {
     const row = table.get(row_id, null, null).?;
     try mgr.onDelete("users", row_id, row);
     // TODO Phase 3: Pass transaction ID
-    try table.delete(row_id, 0);
+    try table.delete(row_id, 0, null);
 
     // Query index - should be empty
     const results = try mgr.query("idx_users_id", ColumnValue{ .int = 42 });

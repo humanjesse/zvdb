@@ -50,8 +50,34 @@ pub fn execute(db: *Database, query: []const u8) !QueryResult {
     var cmd = try sql.parse(db.allocator, query);
     defer cmd.deinit(db.allocator);
 
+    // Check if we need auto-commit for DML operations
+    const needs_auto_commit = switch (cmd) {
+        .insert, .delete, .update => db.tx_manager.getCurrentTx() == null,
+        else => false,
+    };
+
+    // Begin auto-commit transaction if needed
+    var auto_commit_active = false;
+    if (needs_auto_commit) {
+        var begin_result = try transaction_executor.executeBegin(db);
+        begin_result.deinit();
+        auto_commit_active = true;
+    }
+    defer {
+        // Clean up auto-commit transaction on error (if not committed)
+        if (auto_commit_active) {
+            // Transaction wasn't committed, so roll it back and clean up
+            if (transaction_executor.executeRollback(db)) |rb| {
+                var rb_mut = rb;
+                rb_mut.deinit();
+            } else |_| {
+                // Rollback failed, but transaction manager will clean up
+            }
+        }
+    }
+
     // Route to appropriate executor based on command type
-    return switch (cmd) {
+    const result = switch (cmd) {
         // DDL Commands (Data Definition Language)
         .create_table => |create| try command_executor.executeCreateTable(db, create),
         .create_index => |create_idx| try command_executor.executeCreateIndex(db, create_idx),
@@ -69,7 +95,22 @@ pub fn execute(db: *Database, query: []const u8) !QueryResult {
         .begin => try transaction_executor.executeBegin(db),
         .commit => try transaction_executor.executeCommit(db),
         .rollback => try transaction_executor.executeRollback(db),
+
+        // Maintenance Commands
+        .vacuum => |vacuum| try command_executor.executeVacuum(db, vacuum),
     };
+
+    // Commit auto-commit transaction if successful
+    if (needs_auto_commit) {
+        var commit_result = try transaction_executor.executeCommit(db);
+        commit_result.deinit();
+        auto_commit_active = false; // Mark as committed so defer doesn't rollback
+
+        // Trigger auto-VACUUM after commit (so the transaction is no longer active)
+        db.maybeAutoVacuum();
+    }
+
+    return result;
 }
 
 // ============================================================================

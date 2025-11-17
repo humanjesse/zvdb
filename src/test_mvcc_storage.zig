@@ -71,7 +71,7 @@ test "update creates new version with chain" {
 
     // Transaction 2: Update row
     const tx2 = try tx_mgr.begin();
-    try table.update(1, "value", ColumnValue{ .int = 200 }, tx2);
+    try table.update(1, "value", ColumnValue{ .int = 200 }, tx2, null);
     try tx_mgr.commit(tx2);
 
     // Verify version chain
@@ -115,7 +115,7 @@ test "delete marks xmax, doesn't remove" {
 
     // Delete row
     const tx2 = try tx_mgr.begin();
-    try table.delete(1, tx2);
+    try table.delete(1, tx2, null);
     try tx_mgr.commit(tx2);
 
     // Verify version still exists in version_chains
@@ -151,7 +151,7 @@ test "visibility: snapshot sees correct version" {
 
     // T3: Update row (value=200) and commit
     const tx3 = try tx_mgr.begin();
-    try table.update(1, "value", ColumnValue{ .int = 200 }, tx3);
+    try table.update(1, "value", ColumnValue{ .int = 200 }, tx3, null);
     try tx_mgr.commit(tx3);
 
     // T2 should still see value=100 (snapshot isolation!)
@@ -262,7 +262,7 @@ test "getAllRows filters by visibility" {
 
     // Delete row 2
     const tx3 = try tx_mgr.begin();
-    try table.delete(2, tx3);
+    try table.delete(2, tx3, null);
     try tx_mgr.commit(tx3);
 
     // Old snapshot should still see all 3 rows
@@ -335,7 +335,7 @@ test "multiple updates create long version chain" {
     var i: i64 = 1;
     while (i <= 5) : (i += 1) {
         const tx = try tx_mgr.begin();
-        try table.update(1, "counter", ColumnValue{ .int = i }, tx);
+        try table.update(1, "counter", ColumnValue{ .int = i }, tx, null);
         try tx_mgr.commit(tx);
     }
 
@@ -373,7 +373,7 @@ test "non-MVCC mode returns newest version" {
     try table.insertWithId(1, values, 0);
 
     // Update without MVCC
-    try table.update(1, "value", ColumnValue{ .int = 200 }, 0);
+    try table.update(1, "value", ColumnValue{ .int = 200 }, 0, null);
 
     // Get without snapshot should return newest version
     const row = table.get(1, null, null).?;
@@ -408,7 +408,7 @@ test "deleted row not visible after commit" {
 
     // Delete
     const tx2 = try tx_mgr.begin();
-    try table.delete(1, tx2);
+    try table.delete(1, tx2, null);
     try tx_mgr.commit(tx2);
 
     // New snapshot should not see the row
@@ -446,7 +446,7 @@ test "concurrent readers see consistent snapshots" {
 
     // Writer updates
     const writer = try tx_mgr.begin();
-    try table.update(1, "value", ColumnValue{ .int = 200 }, writer);
+    try table.update(1, "value", ColumnValue{ .int = 200 }, writer, null);
     try tx_mgr.commit(writer);
 
     // Reader 2 takes snapshot
@@ -482,9 +482,9 @@ test "version chain cleanup works" {
     try values.put("value", ColumnValue{ .int = 0 });
     try table.insertWithId(1, values, 1);
 
-    try table.update(1, "value", ColumnValue{ .int = 1 }, 2);
-    try table.update(1, "value", ColumnValue{ .int = 2 }, 3);
-    try table.update(1, "value", ColumnValue{ .int = 3 }, 4);
+    try table.update(1, "value", ColumnValue{ .int = 1 }, 2, null);
+    try table.update(1, "value", ColumnValue{ .int = 2 }, 3, null);
+    try table.update(1, "value", ColumnValue{ .int = 3 }, 4, null);
 
     // Table.deinit() will call deinitChain on all version chains
     // This test just ensures no memory leaks occur (verified by allocator)
@@ -515,7 +515,7 @@ test "save and load preserves newest version" {
         try table.insertWithId(1, values, 1);
 
         // Update to create version chain
-        try table.update(1, "age", ColumnValue{ .int = 31 }, 2);
+        try table.update(1, "age", ColumnValue{ .int = 31 }, 2, null);
 
         try table.save(temp_path);
     }
