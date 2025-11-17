@@ -376,7 +376,21 @@ pub fn validateWalPath(path: []const u8) !void {
 /// - Using exclusive file creation flags
 /// - Running the database with minimal filesystem permissions
 /// - Using process isolation (containers, chroot)
+///
+/// Platform support:
+/// - Unix/Linux/macOS: Full symlink checking via fstatat
+/// - Windows: Not supported (returns false - Windows symlinks work differently)
 pub fn isSymlink(dir_path: []const u8, file_path: []const u8) !bool {
+    const builtin = @import("builtin");
+
+    // Windows doesn't support fstatat/AT.SYMLINK_NOFOLLOW
+    // Windows symlinks work differently (require admin privileges by default)
+    // For Windows, we skip the symlink check
+    if (builtin.os.tag == .windows) {
+        return false;
+    }
+
+    // Unix/Linux/macOS implementation
     // Try to stat the file without following symlinks
     // We use fstatat with AT.SYMLINK_NOFOLLOW flag
 
@@ -402,7 +416,7 @@ pub fn isSymlink(dir_path: []const u8, file_path: []const u8) !bool {
     const stat_result = std.posix.fstatatZ(
         dir_fd,
         @ptrCast(&path_buf),
-        std.c.AT.SYMLINK_NOFOLLOW,
+        std.posix.AT.SYMLINK_NOFOLLOW,
     ) catch |err| switch (err) {
         error.FileNotFound => return false, // File doesn't exist, not a symlink
         else => return err,
