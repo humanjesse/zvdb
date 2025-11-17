@@ -566,13 +566,6 @@ pub const Table = struct {
         // Phase 3: Write-write conflict detection
         // Check if another transaction is already updating/deleting this row
 
-        // Check 1: Another transaction has marked this row for deletion
-        if (chain_head.xmax != 0 and chain_head.xmax != tx_id) {
-            // Another transaction has locked this row for update/delete
-            // This is a write-write conflict - abort with serialization error
-            return error.SerializationFailure;
-        }
-
         // Check 2: This row was created by another uncommitted transaction
         if (chain_head.xmin != tx_id and chain_head.xmin != 0) {
             if (clog) |log| {
@@ -583,9 +576,24 @@ pub const Table = struct {
             }
         }
 
-        // Mark the current version as deleted
-        // Use maxInt as sentinel for immediate deletion (backward compatibility)
-        chain_head.xmax = if (tx_id == 0) std.math.maxInt(u64) else tx_id;
+        // CRITICAL FIX: Atomic check-and-set to prevent race conditions
+        // This ensures only ONE transaction can successfully mark the row for deletion
+        const target_xmax = if (tx_id == 0) std.math.maxInt(u64) else tx_id;
+        const expected: u64 = 0;
+
+        // Atomically check if xmax is 0 and set it to our transaction ID
+        // Returns null on success, or the current value if it was not 0
+        const result = @cmpxchgWeak(u64, &chain_head.xmax, expected, target_xmax, .monotonic, .monotonic);
+
+        if (result) |current_xmax| {
+            // CAS failed - another transaction beat us to it
+            if (current_xmax != tx_id) {
+                // Another transaction has locked this row for update/delete
+                // This is a write-write conflict - abort with serialization error
+                return error.SerializationFailure;
+            }
+            // If current_xmax == tx_id, we already marked this row (idempotent operation)
+        }
 
         // Don't physically remove - old snapshots may still need to see it!
     }
@@ -643,13 +651,6 @@ pub const Table = struct {
         // Phase 3: Write-write conflict detection
         // Check if another transaction is already updating/deleting this row
 
-        // Check 1: Another transaction has marked this row for deletion
-        if (old_version.xmax != 0 and old_version.xmax != tx_id) {
-            // Another transaction has locked this row for update/delete
-            // This is a write-write conflict - abort with serialization error
-            return error.SerializationFailure;
-        }
-
         // Check 2: This row was created by another uncommitted transaction
         // If the current version's creator (xmin) is different from us and hasn't committed, conflict!
         if (old_version.xmin != tx_id and old_version.xmin != 0) {
@@ -665,8 +666,23 @@ pub const Table = struct {
             // No commit log available - allow for backward compatibility
         }
 
-        // Mark old version as superseded by this transaction
-        old_version.xmax = tx_id;
+        // CRITICAL FIX: Atomic check-and-set to prevent race conditions
+        // This ensures only ONE transaction can successfully mark the row for update
+        const expected: u64 = 0;
+
+        // Atomically check if xmax is 0 and set it to our transaction ID
+        // Returns null on success, or the current value if it was not 0
+        const result = @cmpxchgWeak(u64, &old_version.xmax, expected, tx_id, .monotonic, .monotonic);
+
+        if (result) |current_xmax| {
+            // CAS failed - another transaction beat us to it
+            if (current_xmax != tx_id) {
+                // Another transaction has locked this row for update/delete
+                // This is a write-write conflict - abort with serialization error
+                return error.SerializationFailure;
+            }
+            // If current_xmax == tx_id, we already marked this row (retry of same update)
+        }
 
         // Clone old row data
         var new_row = try old_version.data.clone(self.allocator);

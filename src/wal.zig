@@ -643,14 +643,18 @@ pub const WalWriter = struct {
         // Flush current buffer
         try self.flush();
 
-        // Close current file
+        // CRITICAL FIX: Create new file BEFORE closing the old one
+        // This prevents leaving self.file in a broken state if createWalFile fails
+        // (e.g., due to disk full, permissions, etc.)
+        const new_sequence = self.sequence + 1;
+        const new_file = try createWalFile(self.wal_dir, new_sequence, self.page_size);
+
+        // Now it's safe to close the old file
         self.file.close();
 
-        // Increment sequence
-        self.sequence += 1;
-
-        // Create new file
-        self.file = try createWalFile(self.wal_dir, self.sequence, self.page_size);
+        // Update to new file and sequence
+        self.file = new_file;
+        self.sequence = new_sequence;
 
         // Reset file size (just the header)
         self.current_file_size = WalHeader.SIZE;
