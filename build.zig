@@ -218,6 +218,34 @@ pub fn build(b: *std.Build) void {
     });
     const run_vacuum_tests = b.addRunArtifact(vacuum_tests);
 
+    // Critical bug fix validation tests
+    const concurrent_delete_stress_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_concurrent_delete_stress.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_concurrent_delete_stress_tests = b.addRunArtifact(concurrent_delete_stress_tests);
+
+    const hnsw_self_loop_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_hnsw_self_loop.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_hnsw_self_loop_tests = b.addRunArtifact(hnsw_self_loop_tests);
+
+    const wal_rotation_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_wal_rotation.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_wal_rotation_tests = b.addRunArtifact(wal_rotation_tests);
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_hnsw_tests.step);
     test_step.dependOn(&run_sql_tests.step);
@@ -241,6 +269,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_query_optimizer_tests.step);
     test_step.dependOn(&run_mvcc_concurrent_tests.step);
     test_step.dependOn(&run_vacuum_tests.step);
+    test_step.dependOn(&run_concurrent_delete_stress_tests.step);
+    test_step.dependOn(&run_hnsw_self_loop_tests.step);
+    test_step.dependOn(&run_wal_rotation_tests.step);
 
     // Add unit tests
     // const unit_tests = b.addTest(.{
