@@ -560,15 +560,27 @@ pub const Table = struct {
     /// Delete a row by ID (MVCC-enabled)
     /// Marks the current version as deleted (sets xmax) instead of physically removing it
     /// For non-MVCC mode (tx_id=0), uses maxInt(u64) as sentinel for "deleted"
-    pub fn delete(self: *Table, id: u64, tx_id: u64) !void {
+    pub fn delete(self: *Table, id: u64, tx_id: u64, clog: ?*CommitLog) !void {
         const chain_head = self.version_chains.get(id) orelse return error.RowNotFound;
 
         // Phase 3: Write-write conflict detection
         // Check if another transaction is already updating/deleting this row
+
+        // Check 1: Another transaction has marked this row for deletion
         if (chain_head.xmax != 0 and chain_head.xmax != tx_id) {
             // Another transaction has locked this row for update/delete
             // This is a write-write conflict - abort with serialization error
             return error.SerializationFailure;
+        }
+
+        // Check 2: This row was created by another uncommitted transaction
+        if (chain_head.xmin != tx_id and chain_head.xmin != 0) {
+            if (clog) |log| {
+                if (!log.isCommitted(chain_head.xmin)) {
+                    // Creating transaction is still active/aborted
+                    return error.SerializationFailure;
+                }
+            }
         }
 
         // Mark the current version as deleted
@@ -625,17 +637,32 @@ pub const Table = struct {
 
     /// Update a row by creating a new version (MVCC-enabled)
     /// Creates a new version with the updated value and chains it to the old version
-    pub fn update(self: *Table, row_id: u64, column: []const u8, new_value: ColumnValue, tx_id: u64) !void {
+    pub fn update(self: *Table, row_id: u64, column: []const u8, new_value: ColumnValue, tx_id: u64, clog: ?*CommitLog) !void {
         const old_version = self.version_chains.get(row_id) orelse return error.RowNotFound;
 
         // Phase 3: Write-write conflict detection
         // Check if another transaction is already updating/deleting this row
+
+        // Check 1: Another transaction has marked this row for deletion
         if (old_version.xmax != 0 and old_version.xmax != tx_id) {
             // Another transaction has locked this row for update/delete
             // This is a write-write conflict - abort with serialization error
-            // In a full implementation, we could check if that transaction committed/aborted
-            // and decide whether to wait or abort, but for now we abort immediately
             return error.SerializationFailure;
+        }
+
+        // Check 2: This row was created by another uncommitted transaction
+        // If the current version's creator (xmin) is different from us and hasn't committed, conflict!
+        if (old_version.xmin != tx_id and old_version.xmin != 0) {
+            if (clog) |log| {
+                // Check if the creating transaction has committed
+                if (!log.isCommitted(old_version.xmin)) {
+                    // Transaction that created this version is still active or aborted
+                    // This is a write-write conflict
+                    return error.SerializationFailure;
+                }
+                // Transaction committed - OK to update this row
+            }
+            // No commit log available - allow for backward compatibility
         }
 
         // Mark old version as superseded by this transaction
@@ -776,7 +803,6 @@ pub const Table = struct {
     /// Returns: Statistics about the vacuum operation
     pub fn vacuum(self: *Table, min_visible_txid: u64, clog: *CommitLog) !VacuumStats {
         var stats = self.getVacuumStats();
-        const initial_versions = stats.total_versions;
 
         var it = self.version_chains.iterator();
         while (it.next()) |entry| {

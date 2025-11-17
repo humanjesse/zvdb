@@ -354,7 +354,7 @@ pub fn executeDelete(db: *Database, cmd: sql.DeleteCmd) !QueryResult {
 
             // Phase 3: Pass actual transaction ID from active transaction
             const tx_id = db.getCurrentTxId();
-            _ = table.delete(row_id, tx_id) catch {};
+            try table.delete(row_id, tx_id, clog);
             deleted_count += 1;
 
             // Track operation in transaction if one is active
@@ -607,7 +607,7 @@ pub fn executeUpdate(db: *Database, cmd: sql.UpdateCmd) !QueryResult {
         // Note: We call update() for each column which creates multiple versions
         // TODO Phase 4: Optimize to create single version for multi-column updates
         for (cmd.assignments.items) |assignment| {
-            try table.update(row_id, assignment.column, assignment.value, tx_id);
+            try table.update(row_id, assignment.column, assignment.value, tx_id, clog);
         }
 
         // Get the updated row for index updates
