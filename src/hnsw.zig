@@ -1124,31 +1124,61 @@ pub fn HNSW(comptime T: type) type {
             var source_node = self.nodes.getPtr(source) orelse return error.NodeNotFound;
             var target_node = self.nodes.getPtr(target) orelse return error.NodeNotFound;
 
-            // Prevent deadlock by always locking in consistent order (lower ID first)
-            if (source < target) {
+            // CRITICAL FIX: Handle self-loop case to prevent deadlock
+            if (source == target) {
+                // Self-loop: only lock once since source and target are the same node
+                source_node.mutex.lock();
+                defer source_node.mutex.unlock();
+
+                // Add self-loop connection
+                if (level < source_node.connections.len) {
+                    try source_node.connections[level].append(target);
+                }
+
+                // Shrink connections if needed
+                if (level < source_node.connections.len) {
+                    try self.shrinkConnections(source, level);
+                }
+            } else if (source < target) {
+                // Prevent deadlock by always locking in consistent order (lower ID first)
                 source_node.mutex.lock();
                 defer source_node.mutex.unlock();
                 target_node.mutex.lock();
                 defer target_node.mutex.unlock();
+
+                if (level < source_node.connections.len) {
+                    try source_node.connections[level].append(target);
+                }
+                if (level < target_node.connections.len) {
+                    try target_node.connections[level].append(source);
+                }
+
+                if (level < source_node.connections.len) {
+                    try self.shrinkConnections(source, level);
+                }
+                if (level < target_node.connections.len) {
+                    try self.shrinkConnections(target, level);
+                }
             } else {
+                // source > target: lock in reverse order
                 target_node.mutex.lock();
                 defer target_node.mutex.unlock();
                 source_node.mutex.lock();
                 defer source_node.mutex.unlock();
-            }
 
-            if (level < source_node.connections.len) {
-                try source_node.connections[level].append(target);
-            }
-            if (level < target_node.connections.len) {
-                try target_node.connections[level].append(source);
-            }
+                if (level < source_node.connections.len) {
+                    try source_node.connections[level].append(target);
+                }
+                if (level < target_node.connections.len) {
+                    try target_node.connections[level].append(source);
+                }
 
-            if (level < source_node.connections.len) {
-                try self.shrinkConnections(source, level);
-            }
-            if (level < target_node.connections.len) {
-                try self.shrinkConnections(target, level);
+                if (level < source_node.connections.len) {
+                    try self.shrinkConnections(source, level);
+                }
+                if (level < target_node.connections.len) {
+                    try self.shrinkConnections(target, level);
+                }
             }
         }
 
