@@ -3,22 +3,32 @@ const Allocator = std.mem.Allocator;
 const ArrayList = std.array_list.Managed;
 const ColumnValue = @import("table.zig").ColumnValue;
 
-/// B-tree implementation for database indexing
+/// B+ tree implementation for database indexing
 ///
-/// This B-tree provides O(log n) insert, search, and delete operations
-/// for database indexes. It supports:
+/// This B+ tree provides O(log n) insert, search, and delete operations
+/// for database indexes with full rebalancing support. It supports:
 /// - All ColumnValue types (int, float, text, bool)
-/// - Range queries (findRange)
+/// - Range queries (findRange) - optimized with leaf links
 /// - Duplicate key handling
-/// - Automatic balancing
+/// - Automatic balancing and rebalancing
+/// - Full deletion with borrowing and merging
 /// - Persistence (save/load)
 ///
-/// Design:
+/// B+ Tree Design:
 /// - ORDER = 16 (max 31 keys per node, min 15 keys)
 /// - Keys are sorted within each node
-/// - Leaf nodes contain row IDs
-/// - Internal nodes contain child pointers
+/// - Leaf nodes contain row IDs (actual data)
+/// - Internal nodes contain separator keys only (routing information)
 /// - All leaves are at the same level (balanced)
+/// - Leaves are linked for efficient range scans (next_leaf/prev_leaf)
+///
+/// Deletion Algorithm:
+/// - Always delete from leaf nodes only (B+ tree principle)
+/// - After deletion, if node has < MIN_KEYS:
+///   1. Try to borrow from left sibling (if it has > MIN_KEYS)
+///   2. Try to borrow from right sibling (if it has > MIN_KEYS)
+///   3. Otherwise, merge with a sibling
+///   4. Recursively rebalance parent if merge occurred
 /// B-tree order (maximum number of children = ORDER * 2)
 pub const ORDER: usize = 16;
 pub const MAX_KEYS: usize = ORDER * 2 - 1; // 31 keys
@@ -43,6 +53,14 @@ pub const BTreeNode = struct {
     /// Parent pointer (null for root)
     parent: ?*BTreeNode,
 
+    /// Next leaf pointer (for B+ tree leaf linking)
+    /// Only used in leaf nodes, null otherwise
+    next_leaf: ?*BTreeNode,
+
+    /// Previous leaf pointer (for B+ tree leaf linking)
+    /// Only used in leaf nodes, null otherwise
+    prev_leaf: ?*BTreeNode,
+
     /// Allocator for this node
     allocator: Allocator,
 
@@ -56,6 +74,8 @@ pub const BTreeNode = struct {
             .values = ArrayList(u64).init(allocator),
             .is_leaf = is_leaf,
             .parent = null,
+            .next_leaf = null,
+            .prev_leaf = null,
             .allocator = allocator,
         };
 
@@ -236,6 +256,19 @@ pub const BTree = struct {
             }
         }
 
+        // Maintain leaf links for B+ tree
+        if (child.is_leaf) {
+            // Insert right between child and child.next_leaf
+            right.next_leaf = child.next_leaf;
+            right.prev_leaf = child;
+            child.next_leaf = right;
+
+            // Update the next leaf's prev pointer if it exists
+            if (right.next_leaf) |next| {
+                next.prev_leaf = right;
+            }
+        }
+
         // Promote middle key to parent
         const middle_key = child.keys.items[mid];
         try parent.keys.insert(child_idx, middle_key);
@@ -363,9 +396,56 @@ pub const BTree = struct {
         var results = ArrayList(u64).init(self.allocator);
         errdefer results.deinit();
 
-        try self.findRangeInNode(self.root.?, min_key, max_key, min_inclusive, max_inclusive, &results);
+        // B+ tree optimization: find starting leaf and scan using leaf links
+        const start_leaf = try self.findLeafForKey(self.root.?, min_key);
+
+        // Scan leaves from left to right using leaf links
+        var current_leaf: ?*BTreeNode = start_leaf;
+        while (current_leaf) |leaf| {
+            // Process all keys in this leaf
+            for (leaf.keys.items, 0..) |key, i| {
+                const cmp_min = compareColumnValues(key, min_key);
+                const cmp_max = compareColumnValues(key, max_key);
+
+                // Check if key is in range
+                const matches_min = if (min_inclusive)
+                    (cmp_min == .gt or cmp_min == .eq)
+                else
+                    cmp_min == .gt;
+
+                const matches_max = if (max_inclusive)
+                    (cmp_max == .lt or cmp_max == .eq)
+                else
+                    cmp_max == .lt;
+
+                // If we've passed max_key, we're done
+                if (cmp_max == .gt) {
+                    return try results.toOwnedSlice();
+                }
+
+                // Add value if in range
+                if (matches_min and matches_max) {
+                    try results.append(leaf.values.items[i]);
+                }
+            }
+
+            // Move to next leaf
+            current_leaf = leaf.next_leaf;
+        }
 
         return try results.toOwnedSlice();
+    }
+
+    /// Find the leaf node that should contain a given key
+    /// Used for range scans and deletion
+    fn findLeafForKey(self: *const BTree, node: *BTreeNode, key: ColumnValue) !*BTreeNode {
+        if (node.is_leaf) {
+            return node;
+        }
+
+        // Find the appropriate child
+        const child_idx = node.findChildIndex(key);
+        return try self.findLeafForKey(node.children.items[child_idx].?, key);
     }
 
     /// Find range within a specific node and its children
@@ -453,44 +533,337 @@ pub const BTree = struct {
         return deleted;
     }
 
-    /// Delete from a specific node (simplified version for now)
-    /// TODO: Implement full B-tree deletion with rebalancing
-    fn deleteFromNode(self: *BTree, node: *BTreeNode, key: ColumnValue, row_id: u64) !bool {
+    /// Find the index of a child node in its parent's children array
+    /// Returns null if node has no parent or is not found
+    fn getNodeIndexInParent(node: *BTreeNode) ?usize {
+        const parent = node.parent orelse return null;
+        for (parent.children.items, 0..) |child_opt, i| {
+            if (child_opt) |child| {
+                if (child == node) {
+                    return i;
+                }
+            }
+        }
+        return null;
+    }
 
-        // Find the key in this node
+    /// Find the left sibling of a node (must have same parent)
+    /// Returns null if no left sibling exists
+    fn findLeftSibling(node: *BTreeNode) ?*BTreeNode {
+        const idx = getNodeIndexInParent(node) orelse return null;
+        if (idx == 0) return null; // No left sibling
+
+        const parent = node.parent.?;
+        return parent.children.items[idx - 1];
+    }
+
+    /// Find the right sibling of a node (must have same parent)
+    /// Returns null if no right sibling exists
+    fn findRightSibling(node: *BTreeNode) ?*BTreeNode {
+        const idx = getNodeIndexInParent(node) orelse return null;
+        const parent = node.parent.?;
+        if (idx + 1 >= parent.children.items.len) return null; // No right sibling
+
+        return parent.children.items[idx + 1];
+    }
+
+    /// Borrow a key from the left sibling (rotation right)
+    /// Used when current node has too few keys and left sibling has extras
+    fn borrowFromLeftSibling(self: *BTree, node: *BTreeNode, left_sibling: *BTreeNode) !void {
+        _ = self;
+        const parent = node.parent.?;
+        const node_idx = getNodeIndexInParent(node).?;
+
+        if (node.is_leaf) {
+            // Leaf node: move last key from left sibling to beginning of node
+            const borrowed_key = left_sibling.keys.items[left_sibling.keys.items.len - 1];
+            const borrowed_value = left_sibling.values.items[left_sibling.values.items.len - 1];
+
+            // Insert at beginning of current node
+            try node.keys.insert(0, borrowed_key);
+            try node.values.insert(0, borrowed_value);
+
+            // Remove from left sibling
+            _ = left_sibling.keys.pop();
+            _ = left_sibling.values.pop();
+
+            // Update parent separator to first key of current node
+            parent.keys.items[node_idx - 1] = borrowed_key;
+        } else {
+            // Internal node: rotate through parent
+            const separator = parent.keys.items[node_idx - 1];
+            const borrowed_child = left_sibling.children.items[left_sibling.children.items.len - 1].?;
+
+            // Insert separator at beginning of current node
+            try node.keys.insert(0, separator);
+            try node.children.insert(0, borrowed_child);
+            borrowed_child.parent = node;
+
+            // Move last key from left sibling to parent
+            parent.keys.items[node_idx - 1] = left_sibling.keys.items[left_sibling.keys.items.len - 1];
+
+            // Remove from left sibling
+            _ = left_sibling.keys.pop();
+            _ = left_sibling.children.pop();
+        }
+    }
+
+    /// Borrow a key from the right sibling (rotation left)
+    /// Used when current node has too few keys and right sibling has extras
+    fn borrowFromRightSibling(self: *BTree, node: *BTreeNode, right_sibling: *BTreeNode) !void {
+        _ = self;
+        const parent = node.parent.?;
+        const node_idx = getNodeIndexInParent(node).?;
+
+        if (node.is_leaf) {
+            // Leaf node: move first key from right sibling to end of node
+            const borrowed_key = right_sibling.keys.items[0];
+            const borrowed_value = right_sibling.values.items[0];
+
+            // Append to current node
+            try node.keys.append(borrowed_key);
+            try node.values.append(borrowed_value);
+
+            // Remove from right sibling
+            _ = right_sibling.keys.orderedRemove(0);
+            _ = right_sibling.values.orderedRemove(0);
+
+            // Update parent separator to first key of right sibling (after removal)
+            if (right_sibling.keys.items.len > 0) {
+                parent.keys.items[node_idx] = right_sibling.keys.items[0];
+            }
+        } else {
+            // Internal node: rotate through parent
+            const separator = parent.keys.items[node_idx];
+            const borrowed_child = right_sibling.children.items[0].?;
+
+            // Append separator to current node
+            try node.keys.append(separator);
+            try node.children.append(borrowed_child);
+            borrowed_child.parent = node;
+
+            // Move first key from right sibling to parent
+            parent.keys.items[node_idx] = right_sibling.keys.items[0];
+
+            // Remove from right sibling
+            _ = right_sibling.keys.orderedRemove(0);
+            _ = right_sibling.children.orderedRemove(0);
+        }
+    }
+
+    /// Merge node with its left sibling
+    /// All keys from node are moved to left sibling, node is deleted
+    fn mergeWithLeftSibling(self: *BTree, node: *BTreeNode, left_sibling: *BTreeNode) !void {
+        const parent = node.parent.?;
+        const node_idx = getNodeIndexInParent(node).?;
+
+        if (node.is_leaf) {
+            // Leaf node: move all keys from node to left sibling
+            for (node.keys.items) |key| {
+                try left_sibling.keys.append(key);
+            }
+            for (node.values.items) |value| {
+                try left_sibling.values.append(value);
+            }
+
+            // Update leaf links
+            left_sibling.next_leaf = node.next_leaf;
+            if (node.next_leaf) |next| {
+                next.prev_leaf = left_sibling;
+            }
+
+            // Clear node's keys/values to prevent double-free
+            node.keys.items.len = 0;
+            node.values.items.len = 0;
+        } else {
+            // Internal node: pull down separator from parent and merge
+            const separator = parent.keys.items[node_idx - 1];
+            try left_sibling.keys.append(separator);
+
+            // Move all keys and children from node to left sibling
+            for (node.keys.items) |key| {
+                try left_sibling.keys.append(key);
+            }
+            for (node.children.items) |child_opt| {
+                if (child_opt) |child| {
+                    try left_sibling.children.append(child);
+                    child.parent = left_sibling;
+                }
+            }
+
+            // Clear node to prevent double-free
+            node.keys.items.len = 0;
+            node.children.items.len = 0;
+        }
+
+        // Remove separator and node pointer from parent
+        var removed_key = parent.keys.orderedRemove(node_idx - 1);
+        removed_key.deinit(parent.allocator);
+        _ = parent.children.orderedRemove(node_idx);
+
+        // Free the now-empty node
+        node.deinit();
+        self.allocator.destroy(node);
+    }
+
+    /// Merge node with its right sibling
+    /// All keys from right sibling are moved to node, right sibling is deleted
+    fn mergeWithRightSibling(self: *BTree, node: *BTreeNode, right_sibling: *BTreeNode) !void {
+        const parent = node.parent.?;
+        const node_idx = getNodeIndexInParent(node).?;
+
+        if (node.is_leaf) {
+            // Leaf node: move all keys from right sibling to node
+            for (right_sibling.keys.items) |key| {
+                try node.keys.append(key);
+            }
+            for (right_sibling.values.items) |value| {
+                try node.values.append(value);
+            }
+
+            // Update leaf links
+            node.next_leaf = right_sibling.next_leaf;
+            if (right_sibling.next_leaf) |next| {
+                next.prev_leaf = node;
+            }
+
+            // Clear right sibling to prevent double-free
+            right_sibling.keys.items.len = 0;
+            right_sibling.values.items.len = 0;
+        } else {
+            // Internal node: pull down separator from parent and merge
+            const separator = parent.keys.items[node_idx];
+            try node.keys.append(separator);
+
+            // Move all keys and children from right sibling to node
+            for (right_sibling.keys.items) |key| {
+                try node.keys.append(key);
+            }
+            for (right_sibling.children.items) |child_opt| {
+                if (child_opt) |child| {
+                    try node.children.append(child);
+                    child.parent = node;
+                }
+            }
+
+            // Clear right sibling to prevent double-free
+            right_sibling.keys.items.len = 0;
+            right_sibling.children.items.len = 0;
+        }
+
+        // Remove separator and right sibling pointer from parent
+        var removed_key = parent.keys.orderedRemove(node_idx);
+        removed_key.deinit(parent.allocator);
+        _ = parent.children.orderedRemove(node_idx + 1);
+
+        // Free the now-empty right sibling
+        right_sibling.deinit();
+        self.allocator.destroy(right_sibling);
+    }
+
+    /// Rebalance a node after deletion if it has too few keys
+    /// Returns true if rebalancing was performed
+    fn rebalanceAfterDelete(self: *BTree, node: *BTreeNode) !bool {
+        // Root can have fewer than MIN_KEYS
+        if (node.parent == null) {
+            return false;
+        }
+
+        // If node has enough keys, no rebalancing needed
+        if (node.keys.items.len >= MIN_KEYS) {
+            return false;
+        }
+
+        // Try to borrow from left sibling
+        if (findLeftSibling(node)) |left_sibling| {
+            if (left_sibling.keys.items.len > MIN_KEYS) {
+                try self.borrowFromLeftSibling(node, left_sibling);
+                return true;
+            }
+        }
+
+        // Try to borrow from right sibling
+        if (findRightSibling(node)) |right_sibling| {
+            if (right_sibling.keys.items.len > MIN_KEYS) {
+                try self.borrowFromRightSibling(node, right_sibling);
+                return true;
+            }
+        }
+
+        // Can't borrow - must merge
+        // Prefer merging with left sibling
+        if (findLeftSibling(node)) |left_sibling| {
+            const parent = node.parent.?;
+            try self.mergeWithLeftSibling(node, left_sibling);
+            // Recursively rebalance parent (merge removed a key from it)
+            _ = try self.rebalanceAfterDelete(parent);
+            return true;
+        }
+
+        // Merge with right sibling
+        if (findRightSibling(node)) |right_sibling| {
+            const parent = node.parent.?;
+            try self.mergeWithRightSibling(node, right_sibling);
+            // Recursively rebalance parent
+            _ = try self.rebalanceAfterDelete(parent);
+            return true;
+        }
+
+        return false;
+    }
+
+    /// Delete from a specific node with full B+ tree rebalancing
+    fn deleteFromNode(self: *BTree, node: *BTreeNode, key: ColumnValue, row_id: u64) !bool {
+        // B+ tree principle: always delete from leaf nodes only
+        // Internal nodes are just guides, actual data is in leaves
+
+        if (node.is_leaf) {
+            // Leaf node: find and delete the key
+            var i: usize = 0;
+            while (i < node.keys.items.len) : (i += 1) {
+                const cmp = compareColumnValues(key, node.keys.items[i]);
+
+                if (cmp == .eq and node.values.items[i] == row_id) {
+                    // Found it - remove key and value
+                    var removed_key = node.keys.orderedRemove(i);
+                    removed_key.deinit(node.allocator);
+                    _ = node.values.orderedRemove(i);
+
+                    // Rebalance if necessary (node now has too few keys)
+                    _ = try self.rebalanceAfterDelete(node);
+
+                    return true;
+                } else if (cmp == .gt) {
+                    // Keys are sorted, won't find it later
+                    return false;
+                }
+            }
+            return false;
+        }
+
+        // Internal node: navigate to the correct child
         var i: usize = 0;
         while (i < node.keys.items.len) : (i += 1) {
             const cmp = compareColumnValues(key, node.keys.items[i]);
 
-            if (cmp == .eq and node.is_leaf and node.values.items[i] == row_id) {
-                // Found it - remove key and value
-                var removed_key = node.keys.orderedRemove(i);
-                removed_key.deinit(node.allocator);
-                _ = node.values.orderedRemove(i);
-                return true;
-            } else if (cmp == .eq and !node.is_leaf) {
-                // Matching separator in internal node - search left child first
-                // (In B+ tree style, the separator key is duplicated in the right subtree)
+            if (cmp == .lt) {
+                // Key would be in left child
                 if (i < node.children.items.len) {
-                    const found = try self.deleteFromNode(node.children.items[i].?, key, row_id);
-                    if (found) return true;
-                }
-                // Also search right child as the key might be there too
-                if (i + 1 < node.children.items.len) {
-                    return try self.deleteFromNode(node.children.items[i + 1].?, key, row_id);
+                    return try self.deleteFromNode(node.children.items[i].?, key, row_id);
                 }
                 return false;
-            } else if (cmp == .lt) {
-                // Key would be in left child
-                if (!node.is_leaf and i < node.children.items.len) {
-                    return try self.deleteFromNode(node.children.items[i].?, key, row_id);
+            } else if (cmp == .eq) {
+                // In B+ tree, separator keys are duplicated in leaves
+                // Search the right subtree (where the actual value is)
+                if (i + 1 < node.children.items.len) {
+                    return try self.deleteFromNode(node.children.items[i + 1].?, key, row_id);
                 }
                 return false;
             }
         }
 
-        // Key might be in rightmost child
-        if (!node.is_leaf and node.children.items.len > 0) {
+        // Key is greater than all separators - search rightmost child
+        if (node.children.items.len > 0) {
             const last_child = node.children.items[node.children.items.len - 1].?;
             return try self.deleteFromNode(last_child, key, row_id);
         }
@@ -724,4 +1097,252 @@ test "BTree: delete from tree with splits" {
     defer testing.allocator.free(results3);
     try testing.expectEqual(@as(usize, 1), results3.len);
     try testing.expectEqual(@as(u64, 510), results3[0]);
+}
+
+test "BTree: B+ tree leaf links maintained after splits" {
+    var tree = BTree.init(testing.allocator);
+    defer tree.deinit();
+
+    // Insert enough to trigger splits
+    var i: u64 = 0;
+    while (i < 100) : (i += 1) {
+        try tree.insert(ColumnValue{ .int = @intCast(i) }, i);
+    }
+
+    // Range query should work efficiently using leaf links
+    const results = try tree.findRange(
+        ColumnValue{ .int = 20 },
+        ColumnValue{ .int = 30 },
+        true,
+        true,
+    );
+    defer testing.allocator.free(results);
+
+    try testing.expectEqual(@as(usize, 11), results.len); // 20-30 inclusive
+
+    // Verify results are in order
+    for (results, 0..) |val, idx| {
+        try testing.expectEqual(@as(u64, 20 + idx), val);
+    }
+}
+
+test "BTree: deletion with rebalancing - borrow from sibling" {
+    var tree = BTree.init(testing.allocator);
+    defer tree.deinit();
+
+    // Insert enough to create a multi-level tree
+    var i: u64 = 0;
+    while (i < 50) : (i += 1) {
+        try tree.insert(ColumnValue{ .int = @intCast(i) }, i);
+    }
+
+    const size_before = tree.getSize();
+
+    // Delete several items to trigger borrowing
+    var deleted_count: usize = 0;
+    i = 0;
+    while (i < 10) : (i += 1) {
+        const deleted = try tree.delete(ColumnValue{ .int = @intCast(i) }, i);
+        if (deleted) deleted_count += 1;
+    }
+
+    try testing.expectEqual(@as(usize, 10), deleted_count);
+    try testing.expectEqual(size_before - 10, tree.getSize());
+
+    // Verify deleted keys are gone
+    i = 0;
+    while (i < 10) : (i += 1) {
+        const results = try tree.search(ColumnValue{ .int = @intCast(i) });
+        defer testing.allocator.free(results);
+        try testing.expectEqual(@as(usize, 0), results.len);
+    }
+
+    // Verify remaining keys are still present
+    i = 10;
+    while (i < 50) : (i += 1) {
+        const results = try tree.search(ColumnValue{ .int = @intCast(i) });
+        defer testing.allocator.free(results);
+        try testing.expectEqual(@as(usize, 1), results.len);
+        try testing.expectEqual(@as(u64, i), results[0]);
+    }
+}
+
+test "BTree: deletion with merging" {
+    var tree = BTree.init(testing.allocator);
+    defer tree.deinit();
+
+    // Insert values
+    var i: u64 = 0;
+    while (i < 100) : (i += 1) {
+        try tree.insert(ColumnValue{ .int = @intCast(i) }, i);
+    }
+
+    // Delete many items to trigger merging
+    i = 0;
+    while (i < 50) : (i += 1) {
+        const deleted = try tree.delete(ColumnValue{ .int = @intCast(i) }, i);
+        try testing.expect(deleted);
+    }
+
+    try testing.expectEqual(@as(usize, 50), tree.getSize());
+
+    // Verify deleted items are gone
+    i = 0;
+    while (i < 50) : (i += 1) {
+        const results = try tree.search(ColumnValue{ .int = @intCast(i) });
+        defer testing.allocator.free(results);
+        try testing.expectEqual(@as(usize, 0), results.len);
+    }
+
+    // Verify remaining items exist
+    i = 50;
+    while (i < 100) : (i += 1) {
+        const results = try tree.search(ColumnValue{ .int = @intCast(i) });
+        defer testing.allocator.free(results);
+        try testing.expectEqual(@as(usize, 1), results.len);
+    }
+}
+
+test "BTree: stress test - insert 1000, delete 900" {
+    var tree = BTree.init(testing.allocator);
+    defer tree.deinit();
+
+    // Insert 1000 items
+    var i: u64 = 0;
+    while (i < 1000) : (i += 1) {
+        try tree.insert(ColumnValue{ .int = @intCast(i) }, i);
+    }
+
+    try testing.expectEqual(@as(usize, 1000), tree.getSize());
+
+    // Delete 900 items (keep every 10th)
+    var deleted_count: usize = 0;
+    i = 0;
+    while (i < 1000) : (i += 1) {
+        if (i % 10 != 0) {
+            const deleted = try tree.delete(ColumnValue{ .int = @intCast(i) }, i);
+            if (deleted) deleted_count += 1;
+        }
+    }
+
+    try testing.expectEqual(@as(usize, 900), deleted_count);
+    try testing.expectEqual(@as(usize, 100), tree.getSize());
+
+    // Verify only every 10th item remains
+    i = 0;
+    while (i < 1000) : (i += 1) {
+        const results = try tree.search(ColumnValue{ .int = @intCast(i) });
+        defer testing.allocator.free(results);
+
+        if (i % 10 == 0) {
+            try testing.expectEqual(@as(usize, 1), results.len);
+            try testing.expectEqual(@as(u64, i), results[0]);
+        } else {
+            try testing.expectEqual(@as(usize, 0), results.len);
+        }
+    }
+
+    // Range query should still work
+    const range_results = try tree.findRange(
+        ColumnValue{ .int = 0 },
+        ColumnValue{ .int = 999 },
+        true,
+        true,
+    );
+    defer testing.allocator.free(range_results);
+    try testing.expectEqual(@as(usize, 100), range_results.len);
+}
+
+test "BTree: delete all items one by one" {
+    var tree = BTree.init(testing.allocator);
+    defer tree.deinit();
+
+    // Insert items
+    const count: u64 = 50;
+    var i: u64 = 0;
+    while (i < count) : (i += 1) {
+        try tree.insert(ColumnValue{ .int = @intCast(i) }, i);
+    }
+
+    // Delete all items
+    i = 0;
+    while (i < count) : (i += 1) {
+        const deleted = try tree.delete(ColumnValue{ .int = @intCast(i) }, i);
+        try testing.expect(deleted);
+        try testing.expectEqual(count - i - 1, tree.getSize());
+    }
+
+    try testing.expectEqual(@as(usize, 0), tree.getSize());
+
+    // Verify tree is empty
+    i = 0;
+    while (i < count) : (i += 1) {
+        const results = try tree.search(ColumnValue{ .int = @intCast(i) });
+        defer testing.allocator.free(results);
+        try testing.expectEqual(@as(usize, 0), results.len);
+    }
+}
+
+test "BTree: delete with duplicate keys" {
+    var tree = BTree.init(testing.allocator);
+    defer tree.deinit();
+
+    // Insert duplicate keys
+    try tree.insert(ColumnValue{ .int = 10 }, 100);
+    try tree.insert(ColumnValue{ .int = 10 }, 101);
+    try tree.insert(ColumnValue{ .int = 10 }, 102);
+    try tree.insert(ColumnValue{ .int = 10 }, 103);
+
+    try testing.expectEqual(@as(usize, 4), tree.getSize());
+
+    // Delete specific duplicates
+    var deleted = try tree.delete(ColumnValue{ .int = 10 }, 101);
+    try testing.expect(deleted);
+    try testing.expectEqual(@as(usize, 3), tree.getSize());
+
+    deleted = try tree.delete(ColumnValue{ .int = 10 }, 103);
+    try testing.expect(deleted);
+    try testing.expectEqual(@as(usize, 2), tree.getSize());
+
+    // Verify remaining duplicates
+    const results = try tree.search(ColumnValue{ .int = 10 });
+    defer testing.allocator.free(results);
+    try testing.expectEqual(@as(usize, 2), results.len);
+
+    // Check that 100 and 102 remain (order might vary)
+    var has_100 = false;
+    var has_102 = false;
+    for (results) |val| {
+        if (val == 100) has_100 = true;
+        if (val == 102) has_102 = true;
+    }
+    try testing.expect(has_100);
+    try testing.expect(has_102);
+}
+
+test "BTree: alternating insert and delete" {
+    var tree = BTree.init(testing.allocator);
+    defer tree.deinit();
+
+    // Alternate between inserting and deleting
+    var i: u64 = 0;
+    while (i < 100) : (i += 1) {
+        try tree.insert(ColumnValue{ .int = @intCast(i) }, i);
+
+        if (i > 10) {
+            // Delete something from earlier
+            _ = try tree.delete(ColumnValue{ .int = @intCast(i - 10) }, i - 10);
+        }
+    }
+
+    // Should have roughly last 10 items
+    try testing.expectEqual(@as(usize, 10), tree.getSize());
+
+    // Verify last 10 items exist
+    i = 90;
+    while (i < 100) : (i += 1) {
+        const results = try tree.search(ColumnValue{ .int = @intCast(i) });
+        defer testing.allocator.free(results);
+        try testing.expectEqual(@as(usize, 1), results.len);
+    }
 }
