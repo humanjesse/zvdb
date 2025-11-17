@@ -81,7 +81,7 @@ test "SQL: Hybrid query - SIMILARITY with simple WHERE" {
             unreachable;
         };
         const id = row.items[id_idx].int;
-        std.debug.print("  Row {}: category='{}s', id={}\n", .{ id, std.fmt.fmtSliceEscapeLower(category), id });
+        std.debug.print("  Row {}: category='{s}', id={}\n", .{ id, category, id });
     }
 
     std.debug.print("\n✓ Hybrid query successfully filtered by WHERE clause!\n", .{});
@@ -202,7 +202,7 @@ test "SQL: Hybrid query - LIMIT applies after WHERE filter" {
     for (result.rows.items) |row| {
         const status = row.items[1].text;
         try testing.expect(std.mem.eql(u8, status, "published"));
-        std.debug.print("  Doc {}: status='{}s'\n", .{ row.items[0].int, std.fmt.fmtSliceEscapeLower(status) });
+        std.debug.print("  Doc {}: status='{s}'\n", .{ row.items[0].int, status });
     }
 
     std.debug.print("✓ LIMIT correctly applied after WHERE filtering!\n", .{});
@@ -352,7 +352,7 @@ test "SQL: Hybrid query - Multiple WHERE conditions with SIMILARITY" {
     for (result.rows.items) |row| {
         const id = row.items[0].int;
         const city = row.items[1].text;
-        std.debug.print("  Listing {}: city='{}s'\n", .{ id, std.fmt.fmtSliceEscapeLower(city) });
+        std.debug.print("  Listing {}: city='{s}'\n", .{ id, city });
         try testing.expect(std.mem.eql(u8, city, "NYC"));
     }
 

@@ -68,11 +68,14 @@ test "SQL: INSERT with array literal - 128D embedding" {
     var insert_result = try db.execute(insert_sql);
     defer insert_result.deinit();
 
-    // Verify
+    // Verify INSERT succeeded
+    try testing.expect(insert_result.rows.items.len == 1);
+    const row_id = @as(u64, @intCast(insert_result.rows.items[0].items[0].int));
+
+    // Verify data was stored correctly
     const table = db.tables.get("vectors").?;
     const snapshot = db.getCurrentSnapshot();
     const clog = db.getClog();
-    const row_id: u64 = 42;
     const row = table.get(row_id, snapshot, clog).?;
     const vec = row.get("vec").?;
 
@@ -126,10 +129,13 @@ test "SQL: INSERT with array and other types" {
     var insert_result = try db.execute("INSERT INTO mixed VALUES (99, \"test\", 88.5, true, [0.25, 0.5, 0.75, 1.0])");
     defer insert_result.deinit();
 
+    // Get the actual row_id from the INSERT result
+    try testing.expect(insert_result.rows.items.len == 1);
+    const row_id = @as(u64, @intCast(insert_result.rows.items[0].items[0].int));
+
     const table = db.tables.get("mixed").?;
     const snapshot = db.getCurrentSnapshot();
     const clog = db.getClog();
-    const row_id: u64 = 99;
     const row = table.get(row_id, snapshot, clog).?;
 
     try testing.expect(row.get("id").?.int == 99);
@@ -276,12 +282,15 @@ test "SQL: Dimension mismatch - error" {
 
     // Try to insert 3-dimensional array into 128-dimensional column
     // This should fail during validation
-    const result = db.execute("INSERT INTO dim_test VALUES (1, [0.1, 0.2, 0.3])");
 
-    // TODO: Once dimension validation is implemented, this should return an error
-    // For now, it might succeed but we should add validation
-    if (result) |_| {
-        std.debug.print("⚠ Dimension validation not yet implemented - this should fail!\n", .{});
+    // TODO: Dimension validation in INSERT path not yet implemented
+    // Known limitation: You can insert wrong-dimension vectors, which will cause
+    // runtime errors later when querying. Schema validation prevents same-dimension
+    // columns, but doesn't validate INSERT dimension matches schema dimension.
+    if (db.execute("INSERT INTO dim_test VALUES (1, [0.1, 0.2, 0.3])")) |r| {
+        var result = r;
+        defer result.deinit();
+        std.debug.print("⚠ Dimension validation in INSERT not yet implemented (known limitation)\n", .{});
     } else |err| {
         std.debug.print("✓ Dimension mismatch correctly rejected: {}\n", .{err});
     }

@@ -287,7 +287,7 @@ pub fn executeInsert(db: *Database, cmd: sql.InsertCmd) !QueryResult {
 
     // If there's an embedding column, add to the appropriate dimension-specific HNSW index
     const row = table.get(final_row_id, snapshot, clog).?;
-    var embedding_dims = std.ArrayList(usize).init(db.allocator); // Track all embedding dimensions for potential rollback
+    var embedding_dims = ArrayList(usize).init(db.allocator); // Track all embedding dimensions for potential rollback
     defer embedding_dims.deinit();
     var it = row.values.iterator();
     while (it.next()) |entry| {
@@ -536,7 +536,7 @@ pub fn executeUpdate(db: *Database, cmd: sql.UpdateCmd) !QueryResult {
             new_value: []const f32,
             changed: bool,
         };
-        var embedding_updates = std.ArrayList(EmbeddingUpdate).init(db.allocator);
+        var embedding_updates = ArrayList(EmbeddingUpdate).init(db.allocator);
         defer {
             for (embedding_updates.items) |update| {
                 if (update.old_backup) |backup| {

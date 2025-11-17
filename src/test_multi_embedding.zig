@@ -14,28 +14,38 @@ test "SQL: Multiple embedding columns per row - INSERT" {
     var create_result = try db.execute("CREATE TABLE multi_emb (id int, text_emb embedding(128), image_emb embedding(256))");
     defer create_result.deinit();
 
-    // Create test embeddings of different dimensions
-    var text_embedding = [_]f32{0.1} ** 128;
-    var image_embedding = [_]f32{0.9} ** 256;
+    // Build SQL INSERT with array literals for BOTH embeddings
+    // Text embedding: 128D with value 0.1 repeated
+    var sql_buf: [16384]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&sql_buf);
+    const writer = stream.writer();
 
-    // Insert a row with BOTH embeddings using table API
+    try writer.writeAll("INSERT INTO multi_emb VALUES (1, [");
+    var i: usize = 0;
+    while (i < 128) : (i += 1) {
+        if (i > 0) try writer.writeAll(", ");
+        try writer.writeAll("0.1");
+    }
+    try writer.writeAll("], [");
+
+    // Image embedding: 256D with value 0.9 repeated
+    i = 0;
+    while (i < 256) : (i += 1) {
+        if (i > 0) try writer.writeAll(", ");
+        try writer.writeAll("0.9");
+    }
+    try writer.writeAll("])");
+
+    const insert_sql = stream.getWritten();
+    var insert_result = try db.execute(insert_sql);
+    defer insert_result.deinit();
+
+    // Get the actual row_id from the INSERT result
+    try testing.expect(insert_result.rows.items.len == 1);
+    const row_id = @as(u64, @intCast(insert_result.rows.items[0].items[0].int));
+
+    // Get table for verification
     const table = db.tables.get("multi_emb").?;
-
-    var values = std.StringHashMap(ColumnValue).init(testing.allocator);
-    defer values.deinit();
-    try values.put("id", ColumnValue{ .int = 1 });
-
-    // Add first embedding (128-dim)
-    const text_emb = try testing.allocator.dupe(f32, &text_embedding);
-    defer testing.allocator.free(text_emb);
-    try values.put("text_emb", ColumnValue{ .embedding = text_emb });
-
-    // Add second embedding (256-dim)
-    const img_emb = try testing.allocator.dupe(f32, &image_embedding);
-    defer testing.allocator.free(img_emb);
-    try values.put("image_emb", ColumnValue{ .embedding = img_emb });
-
-    const row_id = try table.insert(values);
 
     // With our fix, BOTH embeddings should be automatically added to their respective HNSW indexes
     // The INSERT code should now iterate through ALL embeddings (no break statement)
@@ -78,24 +88,35 @@ test "SQL: Multiple embedding columns per row - UPDATE" {
     var create_result = try db.execute("CREATE TABLE multi_emb (id int, emb1 embedding(64), emb2 embedding(128))");
     defer create_result.deinit();
 
-    // Insert initial row with two embeddings
-    var old_emb1 = [_]f32{0.1} ** 64;
-    var old_emb2 = [_]f32{0.2} ** 128;
+    // Insert initial row with two embeddings using SQL
+    var sql_buf: [8192]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&sql_buf);
+    const writer = stream.writer();
+
+    try writer.writeAll("INSERT INTO multi_emb VALUES (1, [");
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        if (i > 0) try writer.writeAll(", ");
+        try writer.writeAll("0.1");
+    }
+    try writer.writeAll("], [");
+
+    i = 0;
+    while (i < 128) : (i += 1) {
+        if (i > 0) try writer.writeAll(", ");
+        try writer.writeAll("0.2");
+    }
+    try writer.writeAll("])");
+
+    const insert_sql = stream.getWritten();
+    var insert_result = try db.execute(insert_sql);
+    defer insert_result.deinit();
+
+    // Get the actual row_id from the INSERT result
+    try testing.expect(insert_result.rows.items.len == 1);
+    const row_id = @as(u64, @intCast(insert_result.rows.items[0].items[0].int));
 
     const table = db.tables.get("multi_emb").?;
-    var values = std.StringHashMap(ColumnValue).init(testing.allocator);
-    defer values.deinit();
-    try values.put("id", ColumnValue{ .int = 1 });
-
-    const emb1_old = try testing.allocator.dupe(f32, &old_emb1);
-    defer testing.allocator.free(emb1_old);
-    try values.put("emb1", ColumnValue{ .embedding = emb1_old });
-
-    const emb2_old = try testing.allocator.dupe(f32, &old_emb2);
-    defer testing.allocator.free(emb2_old);
-    try values.put("emb2", ColumnValue{ .embedding = emb2_old });
-
-    const row_id = try table.insert(values);
 
     // Verify both are in HNSW initially
     try testing.expect(db.hnsw_indexes.get(64) != null);
@@ -157,36 +178,48 @@ test "SQL: Multiple rows with multiple embeddings" {
     var create_result = try db.execute("CREATE TABLE docs (id int, title text, text_vec embedding(128), meta_vec embedding(64))");
     defer create_result.deinit();
 
-    const table = db.tables.get("docs").?;
+    // Insert 3 rows using SQL, each with 2 embeddings
+    var inserted_row_ids: [3]u64 = undefined;
+    var row_num: usize = 1;
+    while (row_num <= 3) : (row_num += 1) {
+        var sql_buf: [16384]u8 = undefined;
+        var stream = std.io.fixedBufferStream(&sql_buf);
+        const writer = stream.writer();
 
-    // Insert 3 rows, each with 2 embeddings
-    var i: usize = 1;
-    while (i <= 3) : (i += 1) {
-        var text_vec = [_]f32{@as(f32, @floatFromInt(i)) * 0.1} ** 128;
-        var meta_vec = [_]f32{@as(f32, @floatFromInt(i)) * 0.2} ** 64;
+        try writer.print("INSERT INTO docs VALUES ({d}, \"Document\", [", .{row_num});
 
-        var values = std.StringHashMap(ColumnValue).init(testing.allocator);
-        defer values.deinit();
-        try values.put("id", ColumnValue{ .int = @as(i64, @intCast(i)) });
-        try values.put("title", ColumnValue{ .text = "Document" });
+        // text_vec: 128D with value i*0.1
+        const text_val = @as(f32, @floatFromInt(row_num)) * 0.1;
+        var j: usize = 0;
+        while (j < 128) : (j += 1) {
+            if (j > 0) try writer.writeAll(", ");
+            try writer.print("{d:.3}", .{text_val});
+        }
+        try writer.writeAll("], [");
 
-        const text_emb = try testing.allocator.dupe(f32, &text_vec);
-        defer testing.allocator.free(text_emb);
-        try values.put("text_vec", ColumnValue{ .embedding = text_emb });
+        // meta_vec: 64D with value i*0.2
+        const meta_val = @as(f32, @floatFromInt(row_num)) * 0.2;
+        j = 0;
+        while (j < 64) : (j += 1) {
+            if (j > 0) try writer.writeAll(", ");
+            try writer.print("{d:.3}", .{meta_val});
+        }
+        try writer.writeAll("])");
 
-        const meta_emb = try testing.allocator.dupe(f32, &meta_vec);
-        defer testing.allocator.free(meta_emb);
-        try values.put("meta_vec", ColumnValue{ .embedding = meta_emb });
+        const insert_sql = stream.getWritten();
+        var insert_result = try db.execute(insert_sql);
+        defer insert_result.deinit();
 
-        _ = try table.insert(values);
+        // Store the actual row_id returned by INSERT
+        try testing.expect(insert_result.rows.items.len == 1);
+        inserted_row_ids[row_num - 1] = @as(u64, @intCast(insert_result.rows.items[0].items[0].int));
     }
 
     // Verify all 3 rows have entries in BOTH HNSW indexes
     const hnsw_128 = db.hnsw_indexes.get(128).?;
     const hnsw_64 = db.hnsw_indexes.get(64).?;
 
-    var row_id: u64 = 1;
-    while (row_id <= 3) : (row_id += 1) {
+    for (inserted_row_ids) |row_id| {
         try testing.expect(hnsw_128.getInternalId(row_id) != null);
         try testing.expect(hnsw_64.getInternalId(row_id) != null);
     }
@@ -200,50 +233,20 @@ test "SQL: Same dimension embeddings in different columns" {
 
     try db.initVectorSearch(16, 200);
 
-    // Create table with TWO embedding columns of the SAME dimension
-    var create_result = try db.execute("CREATE TABLE same_dim (id int, vec_a embedding(128), vec_b embedding(128))");
-    defer create_result.deinit();
+    // Attempt to create table with TWO embedding columns of the SAME dimension
+    // This should FAIL due to schema validation preventing duplicate dimensions
+    // Rationale: HNSW indexes by (dimension, row_id), so multiple same-dimension
+    // embeddings in one row would overwrite each other, causing silent data loss
+    const sql = @import("sql.zig");
+    const result = db.execute("CREATE TABLE same_dim (id int, vec_a embedding(128), vec_b embedding(128))");
 
-    var vec_a = [_]f32{0.1} ** 128;
-    var vec_b = [_]f32{0.9} ** 128;
+    // Verify that the validation correctly prevents this invalid schema
+    try testing.expectError(sql.SqlError.DuplicateEmbeddingDimension, result);
 
-    const table = db.tables.get("same_dim").?;
-    var values = std.StringHashMap(ColumnValue).init(testing.allocator);
-    defer values.deinit();
-    try values.put("id", ColumnValue{ .int = 1 });
+    // Verify the table was NOT created
+    try testing.expect(db.tables.get("same_dim") == null);
 
-    const emb_a = try testing.allocator.dupe(f32, &vec_a);
-    defer testing.allocator.free(emb_a);
-    try values.put("vec_a", ColumnValue{ .embedding = emb_a });
-
-    const emb_b = try testing.allocator.dupe(f32, &vec_b);
-    defer testing.allocator.free(emb_b);
-    try values.put("vec_b", ColumnValue{ .embedding = emb_b });
-
-    const row_id = try table.insert(values);
-
-    // Both embeddings have dimension 128, so they go into the SAME HNSW index
-    // But they should BOTH be there (not just one due to the old break statement)
-    const hnsw_128 = db.hnsw_indexes.get(128).?;
-    try testing.expect(hnsw_128 != null);
-
-    // The HNSW index should have the row_id registered
-    // (Note: With same row_id, the second insert would overwrite in HNSW,
-    // but the important test is that the code tried to insert BOTH without breaking)
-    const internal_id = hnsw_128.getInternalId(row_id);
-    try testing.expect(internal_id != null);
-
-    // Verify row has both embeddings stored
-    const snapshot = db.getCurrentSnapshot();
-    const clog = db.getClog();
-    const row = table.get(row_id, snapshot, clog).?;
-    const stored_vec_a = row.get("vec_a").?;
-    const stored_vec_b = row.get("vec_b").?;
-
-    try testing.expect(stored_vec_a.embedding[0] == 0.1);
-    try testing.expect(stored_vec_b.embedding[0] == 0.9);
-
-    std.debug.print("✓ Same dimension: both embeddings processed (last one in HNSW due to same row_id)\n", .{});
+    std.debug.print("✓ Schema validation: correctly prevents duplicate embedding dimensions\n", .{});
 }
 
 // ============================================================================
@@ -366,7 +369,8 @@ test "SQL executeInsert path: Multiple INSERTs with multiple embeddings each" {
 
     try db.initVectorSearch(16, 200);
 
-    var create_result = try db.execute("CREATE TABLE items (id int, vec_a embedding(64), vec_b embedding(64))");
+    // Use DIFFERENT dimensions to comply with schema validation
+    var create_result = try db.execute("CREATE TABLE items (id int, vec_a embedding(64), vec_b embedding(128))");
     defer create_result.deinit();
 
     const table = db.tables.get("items").?;
@@ -377,7 +381,7 @@ test "SQL executeInsert path: Multiple INSERTs with multiple embeddings each" {
     var i: i64 = 1;
     while (i <= 3) : (i += 1) {
         // Use SQL INSERT for each row
-        var insert_sql = try std.fmt.allocPrint(testing.allocator, "INSERT INTO items (id) VALUES ({d})", .{i});
+        const insert_sql = try std.fmt.allocPrint(testing.allocator, "INSERT INTO items (id) VALUES ({d})", .{i});
         defer testing.allocator.free(insert_sql);
 
         var insert_result = try db.execute(insert_sql);
@@ -385,9 +389,9 @@ test "SQL executeInsert path: Multiple INSERTs with multiple embeddings each" {
 
         const row_id = @as(u64, @intCast(insert_result.rows.items[0].items[0].int));
 
-        // Add embeddings manually
+        // Add embeddings manually (vec_a: 64D, vec_b: 128D)
         var vec_a_data = [_]f32{@as(f32, @floatFromInt(i)) * 0.1} ** 64;
-        var vec_b_data = [_]f32{@as(f32, @floatFromInt(i)) * 0.2} ** 64;
+        var vec_b_data = [_]f32{@as(f32, @floatFromInt(i)) * 0.2} ** 128;
 
         const row = table.get(row_id, snapshot, clog).?;
 
@@ -399,17 +403,21 @@ test "SQL executeInsert path: Multiple INSERTs with multiple embeddings each" {
         defer testing.allocator.free(vec_b);
         try row.set(testing.allocator, "vec_b", ColumnValue{ .embedding = vec_b });
 
-        // Index both embeddings
-        const hnsw = try db.getOrCreateHnswForDim(64);
-        _ = try hnsw.insert(&vec_a_data, row_id);
-        _ = try hnsw.insert(&vec_b_data, row_id);
+        // Index both embeddings (each in their own dimension-specific HNSW)
+        const hnsw_64 = try db.getOrCreateHnswForDim(64);
+        _ = try hnsw_64.insert(&vec_a_data, row_id);
+
+        const hnsw_128 = try db.getOrCreateHnswForDim(128);
+        _ = try hnsw_128.insert(&vec_b_data, row_id);
     }
 
-    // Verify all 3 rows are in the HNSW index
+    // Verify all 3 rows are in BOTH HNSW indexes (64D and 128D)
     const hnsw_64 = db.hnsw_indexes.get(64).?;
+    const hnsw_128 = db.hnsw_indexes.get(128).?;
     var row_id: u64 = 1;
     while (row_id <= 3) : (row_id += 1) {
         try testing.expect(hnsw_64.getInternalId(row_id) != null);
+        try testing.expect(hnsw_128.getInternalId(row_id) != null);
     }
 
     std.debug.print("✓ SQL executeInsert path: multiple rows with multiple embeddings indexed\n", .{});
