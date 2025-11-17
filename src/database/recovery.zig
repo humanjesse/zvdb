@@ -114,17 +114,18 @@ pub fn writeWalRecord(
     return tx_id;
 }
 
-/// Recover database from WAL files after a crash (Phase 2.4)
+/// Recover database from WAL files after a crash
 ///
-/// This function enables crash recovery.
+/// This function enables crash recovery with full MVCC support.
 /// Recovery process:
 /// 1. Scan WAL directory for all wal.* files
 /// 2. Read and validate WAL records using WalReader
-/// 3. Replay committed transactions in order (by LSN)
-/// 4. Apply INSERT/DELETE/UPDATE operations to tables
-/// 5. Rebuild HNSW index from recovered table data (see rebuildHnswFromTables)
-/// 6. Handle incomplete/corrupted records gracefully
-/// 7. Optionally checkpoint and clean up old WAL files
+/// 3. Build transaction state map (committed/aborted/active)
+/// 4. Merge recovered transaction state into CommitLog (Phase 4)
+/// 5. Replay committed transactions in order (by LSN)
+/// 6. Apply INSERT/DELETE/UPDATE operations preserving version chains (Phase 4)
+/// 7. Rebuild HNSW index from recovered table data (see rebuildHnswFromTables)
+/// 8. Handle incomplete/corrupted records gracefully
 ///
 /// Parameters:
 ///   - wal_dir: Directory containing WAL files (e.g., "data/wal")
@@ -244,7 +245,30 @@ pub fn recoverFromWal(db: *Database, wal_dir: []const u8) !usize {
         }
     }
 
-    // Step 4: Second pass - replay committed transactions
+    // Step 4 (Phase 4): Merge recovered transaction state into CommitLog
+    // This allows MVCC visibility checks to work correctly after recovery
+    const TxStatus = @import("../transaction.zig").TxStatus;
+    var recovered_tx_map = std.AutoHashMap(u64, TxStatus).init(db.allocator);
+    defer recovered_tx_map.deinit();
+
+    var tx_it = transactions.iterator();
+    while (tx_it.next()) |entry| {
+        const tx_id = entry.key_ptr.*;
+        const state = entry.value_ptr.*;
+
+        const status: TxStatus = switch (state) {
+            .active => .in_progress,
+            .committed => .committed,
+            .aborted => .aborted,
+        };
+
+        try recovered_tx_map.put(tx_id, status);
+    }
+
+    // Merge into CLOG (recovered state takes precedence)
+    try db.tx_manager.clog.mergeRecoveredState(recovered_tx_map);
+
+    // Step 5: Second pass - replay committed transactions
     var recovered_count: usize = 0;
     var applied_operations: usize = 0;
     var max_tx_id: u64 = 0;
@@ -333,7 +357,7 @@ pub fn recoverFromWal(db: *Database, wal_dir: []const u8) !usize {
     return recovered_count;
 }
 
-/// Replay an INSERT operation from WAL
+/// Replay an INSERT operation from WAL (Phase 4: MVCC-aware)
 fn replayInsert(db: *Database, record: *const WalRecord) !void {
     // Get or create the table
     const table = db.tables.get(record.table_name) orelse {
@@ -352,8 +376,10 @@ fn replayInsert(db: *Database, record: *const WalRecord) !void {
         return;
     }
 
-    // Create version for recovered row (tx_id = 0 for bootstrap/recovery)
-    const version = try @import("../table.zig").RowVersion.init(db.allocator, row.id, 0, row);
+    // Phase 4: Create version with actual transaction ID from WAL record
+    // This preserves MVCC metadata for proper visibility checks
+    const tx_id = record.tx_id;
+    const version = try @import("../table.zig").RowVersion.init(db.allocator, row.id, tx_id, row);
     try table.version_chains.put(row.id, version);
 
     // Update next_id to prevent ID conflicts with future inserts (atomic CAS loop)
@@ -365,7 +391,7 @@ fn replayInsert(db: *Database, record: *const WalRecord) !void {
     }
 }
 
-/// Replay a DELETE operation from WAL
+/// Replay a DELETE operation from WAL (Phase 4: MVCC-aware)
 fn replayDelete(db: *Database, record: *const WalRecord) !void {
     // Get the table
     const table = db.tables.get(record.table_name) orelse {
@@ -373,16 +399,17 @@ fn replayDelete(db: *Database, record: *const WalRecord) !void {
         return;
     };
 
-    // For MVCC: Mark the version as deleted (tx_id = 0 for recovery)
-    // In Phase 4, we'll properly handle WAL with transaction IDs
-    // For now, we physically remove during recovery (non-MVCC behavior)
-    if (table.version_chains.fetchRemove(record.row_id)) |entry| {
-        const version = entry.value;
-        version.deinitChain(db.allocator);
+    // Phase 4: MVCC-aware delete - set xmax instead of physical removal
+    // This preserves the version chain for MVCC visibility
+    if (table.version_chains.get(record.row_id)) |head| {
+        // Mark the current version as deleted by this transaction
+        head.xmax = record.tx_id;
+    } else {
+        std.debug.print("Warning: Row {} not found during DELETE replay, skipping\n", .{record.row_id});
     }
 }
 
-/// Replay an UPDATE operation from WAL
+/// Replay an UPDATE operation from WAL (Phase 4: MVCC-aware)
 fn replayUpdate(db: *Database, record: *const WalRecord) !void {
     // Get the table
     const table = db.tables.get(record.table_name) orelse {
@@ -411,17 +438,34 @@ fn replayUpdate(db: *Database, record: *const WalRecord) !void {
     var updated_row = try Row.deserialize(new_data, db.allocator);
     errdefer updated_row.deinit(db.allocator);
 
-    // For MVCC: Remove old version chain and create new one
-    // In Phase 4, we'll properly handle this with version chains
-    // For now during recovery, we replace the version chain with the latest state
-    if (table.version_chains.fetchRemove(record.row_id)) |old_entry| {
-        const old_version = old_entry.value;
-        old_version.deinitChain(db.allocator);
-    }
+    // Phase 4: MVCC-aware update - append to version chain, don't replace
+    if (table.version_chains.get(record.row_id)) |old_head| {
+        // Mark old version as updated by this transaction
+        old_head.xmax = record.tx_id;
 
-    // Create new version for updated row (tx_id = 0 for recovery)
-    const version = try @import("../table.zig").RowVersion.init(db.allocator, updated_row.id, 0, updated_row);
-    try table.version_chains.put(updated_row.id, version);
+        // Create new version and link to old chain
+        const new_version = try @import("../table.zig").RowVersion.init(
+            db.allocator,
+            updated_row.id,
+            record.tx_id,
+            updated_row,
+        );
+        new_version.next = old_head;
+
+        // Update chain head to new version
+        try table.version_chains.put(record.row_id, new_version);
+    } else {
+        // Row doesn't exist (shouldn't happen in normal operation)
+        // Treat as INSERT
+        std.debug.print("Warning: Row {} not found during UPDATE replay, treating as INSERT\n", .{record.row_id});
+        const version = try @import("../table.zig").RowVersion.init(
+            db.allocator,
+            updated_row.id,
+            record.tx_id,
+            updated_row,
+        );
+        try table.version_chains.put(updated_row.id, version);
+    }
 
     // Update next_id to prevent ID conflicts with future inserts (atomic CAS loop)
     const desired_next = updated_row.id + 1;
