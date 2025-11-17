@@ -1485,7 +1485,12 @@ test "complex: large number of invalid columns - 50 invalid" {
     defer table.deinit();
 
     var columns = std.array_list.Managed([]const u8).init(testing.allocator);
-    defer columns.deinit();
+    defer {
+        for (columns.items) |col_name| {
+            testing.allocator.free(col_name);
+        }
+        columns.deinit();
+    }
 
     var values = std.array_list.Managed(ColumnValue).init(testing.allocator);
     defer values.deinit();
@@ -1494,7 +1499,6 @@ test "complex: large number of invalid columns - 50 invalid" {
     var i: usize = 0;
     while (i < 50) : (i += 1) {
         const col_name = try std.fmt.allocPrint(testing.allocator, "invalid_{d}", .{i});
-        defer testing.allocator.free(col_name);
         try columns.append(col_name);
         try values.append(ColumnValue{ .int = @intCast(i) });
     }
