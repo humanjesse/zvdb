@@ -5,7 +5,8 @@
 ### Session Overview
 - ✅ **Priority 1:** Multiple embedding columns per row - COMPLETE
 - ✅ **Priority 2:** Hybrid query testing and documentation - COMPLETE
-- 🔜 **Priority 3:** SQL array literals - TODO
+- ✅ **Priority 3:** SQL array literals - COMPLETE
+- ✅ **Code Review:** Critical bug fixes - COMPLETE
 
 ### ✅ Completed: Multiple Embedding Columns Per Row
 
@@ -227,35 +228,76 @@ LIMIT 3
 
 ---
 
+## ✅ COMPLETE: SQL Array Literal Syntax for Embeddings (Priority 3)
+
+**Status:** ✅ IMPLEMENTED AND TESTED
+
+**What was implemented:**
+Major UX improvement - users can now insert embeddings directly via SQL using array literal syntax instead of requiring the table API.
+
+### Syntax Examples
+
+**Basic usage:**
+```sql
+-- 3-dimensional embedding
+INSERT INTO docs VALUES (1, "My Document", [0.1, 0.2, 0.3])
+
+-- 128-dimensional embedding
+INSERT INTO vectors VALUES (42, [0.01, 0.02, ..., 1.28])
+
+-- Multiple embeddings in one row
+INSERT INTO multi VALUES (1, [0.1, 0.2, 0.3], [1.0, 2.0, 3.0, 4.0, 5.0])
+
+-- Mixed with other types
+INSERT INTO products VALUES (99, "Widget", 19.99, true, [0.25, 0.5, 0.75, 1.0])
+```
+
+### Implementation Details
+
+**Parser changes:** (src/sql.zig)
+1. **Lexer:** Added `[` and `]` token recognition (lines 459-463)
+2. **parseArrayValue():** New function to parse array literals (lines 1147-1197)
+3. **parseInsert():** Integrated array literal detection (lines 741-746)
+
+**Features supported:**
+- ✅ Integer auto-conversion to float (`[1, 2, 3]` → `[1.0, 2.0, 3.0]`)
+- ✅ Negative values (`[-0.5, 0.0, 0.5]`)
+- ✅ Whitespace handling (`[ 0.1 , 0.2 , 0.3 ]`)
+- ✅ Large arrays (tested with 128 dimensions)
+- ✅ Multiple arrays per INSERT
+- ✅ Mixed with other value types (int, text, float, bool)
+- ✅ Automatic HNSW indexing after INSERT
+
+**Test Coverage:** (src/test_array_literals.zig)
+- 11 comprehensive tests covering all syntax variations
+- Basic 3D arrays
+- Large 128D arrays
+- Multiple embeddings per row
+- Mixed types
+- Whitespace and negative values
+- Integer auto-conversion
+- HNSW integration
+- Error cases (empty arrays)
+
+### Current Limitations
+
+⚠️ **Dimension validation not yet implemented**
+- Parser accepts any array length
+- Dimension mismatch with schema is detected at INSERT time but error handling could be improved
+- **TODO:** Add explicit dimension validation in validator
+
+### Files Changed
+- `src/sql.zig`: +58 lines (lexer + parseArrayValue + integration)
+- `src/test_array_literals.zig`: +311 lines (new test file)
+- `build.zig`: +14 lines (test registration)
+
+**Commit:** TBD (next commit)
+
+---
+
 ## 🚧 Still TODO (from original analysis)
 
-### Priority 2: SQL Array Literal Syntax for Embeddings
-
-**Status:** NOT IMPLEMENTED
-
-**Current workaround:** Use table API to insert embeddings
-```zig
-// Current: Must use table API
-const emb = try allocator.dupe(f32, &embedding);
-try values.put("embedding", ColumnValue{ .embedding = emb });
-```
-
-**Desired syntax:**
-```sql
-INSERT INTO docs VALUES (1, "Title", [0.1, 0.2, 0.3, ...])
-```
-
-**Estimated effort:** 2-3 hours
-- Extend lexer to recognize `[` `]` tokens in value context
-- Update parser to handle array literals
-- Validate dimension matches schema
-- Add tests
-
-**Files to modify:**
-- `src/sql.zig` (lexer and parser)
-- `src/database/executor/command_executor.zig` (validation)
-
-### Priority 3: Column-Specific SIMILARITY Syntax
+### Priority 4: Column-Specific SIMILARITY Syntax
 
 **Status:** NOT IMPLEMENTED
 
@@ -289,10 +331,12 @@ SELECT * FROM docs ORDER BY SIMILARITY(text_vec) TO "query"
 | Basic HNSW search | ✅ Working | Per-dimension indexes |
 | WHERE + SIMILARITY hybrid | ✅ **TESTED** | 6 comprehensive tests added |
 | Multiple embeddings per row | ✅ **NEW** | Implemented today (Priority 1) |
-| SQL array literals | ❌ Missing | Use table API for now |
+| SQL array literals | ✅ **NEW** | Implemented today (Priority 3) |
 | Column-specific SIMILARITY | ❌ Missing | Uses first embedding |
 | Real embedding models | ❌ Not planned | Use external tools |
 | MVCC recovery for HNSW | ✅ Working | Integrated in Phase 4C |
+| Schema validation (same-dim) | ✅ **NEW** | Prevents duplicate dimensions |
+| Resource limits | ✅ **NEW** | Max 10 embeddings per row |
 
 ---
 

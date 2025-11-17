@@ -456,6 +456,11 @@ fn tokenize(allocator: Allocator, sql: []const u8) !ArrayList(Token) {
             i += 1;
             try tokens.append(.{ .text = sql[start..i], .start = start });
         }
+        // Square brackets for array literals (embeddings)
+        else if (sql[i] == '[' or sql[i] == ']') {
+            i += 1;
+            try tokens.append(.{ .text = sql[start..i], .start = start });
+        }
         // Multi-character operators: <=, >=, !=
         else if (sql[i] == '<' or sql[i] == '>' or sql[i] == '!' or sql[i] == '=') {
             i += 1;
@@ -733,9 +738,16 @@ fn parseInsert(allocator: Allocator, tokens: []const Token) !InsertCmd {
             continue;
         }
 
+        // Check for array literal first: [0.1, 0.2, 0.3]
+        if (std.mem.eql(u8, tokens[i].text, "[")) {
+            const embedding_value = try parseArrayValue(allocator, tokens, &i);
+            try values.append(embedding_value);
+            continue; // i already advanced by parseArrayValue
+        }
+
         const token_text = tokens[i].text;
 
-        // Parse value
+        // Parse other value types
         if (token_text[0] == '"' or token_text[0] == '\'') {
             const str = parseString(token_text);
             const owned = try allocator.dupe(u8, str);
@@ -1137,6 +1149,58 @@ fn parseValue(allocator: Allocator, token_text: []const u8) !ColumnValue {
         const num = try std.fmt.parseInt(i64, token_text, 10);
         return ColumnValue{ .int = num };
     }
+}
+
+/// Parse array literal for embeddings: [0.1, 0.2, 0.3]
+/// Returns ColumnValue.embedding with owned f32 slice
+/// Advances idx past the closing ]
+fn parseArrayValue(allocator: Allocator, tokens: []const Token, idx: *usize) !ColumnValue {
+    // Expect opening [
+    if (idx.* >= tokens.len or !std.mem.eql(u8, tokens[idx.*].text, "[")) {
+        return SqlError.InvalidSyntax;
+    }
+    idx.* += 1;
+
+    var values = ArrayList(f32).init(allocator);
+    errdefer values.deinit();
+
+    // Parse comma-separated float values
+    while (idx.* < tokens.len) {
+        const token = tokens[idx.*];
+
+        // Check for closing ]
+        if (std.mem.eql(u8, token.text, "]")) {
+            idx.* += 1;
+            break;
+        }
+
+        // Skip commas
+        if (std.mem.eql(u8, token.text, ",")) {
+            idx.* += 1;
+            continue;
+        }
+
+        // Parse float value (try float first, then int)
+        const value = std.fmt.parseFloat(f64, token.text) catch |err| blk: {
+            // If float parsing fails, try int and convert to float
+            const int_val = std.fmt.parseInt(i64, token.text, 10) catch {
+                return err; // Return original float parse error
+            };
+            break :blk @as(f64, @floatFromInt(int_val));
+        };
+        try values.append(@floatCast(value));
+        idx.* += 1;
+    }
+
+    // Validate non-empty array
+    if (values.items.len == 0) {
+        values.deinit();
+        return SqlError.InvalidSyntax;
+    }
+
+    // Convert to owned slice
+    const owned_slice = try values.toOwnedSlice();
+    return ColumnValue{ .embedding = owned_slice };
 }
 
 /// Parse an expression (recursive descent parser)
