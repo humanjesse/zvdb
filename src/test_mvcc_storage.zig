@@ -651,7 +651,7 @@ test "saveMvcc and loadMvcc: multiple rows with different chain lengths" {
         // Check Row 1: 3 versions
         const chain1 = loaded.version_chains.get(1).?;
         var count1: u32 = 0;
-        var curr1 = chain1;
+        var curr1: ?*RowVersion = chain1;
         while (curr1) |v| : (curr1 = v.next) {
             count1 += 1;
         }
@@ -660,7 +660,7 @@ test "saveMvcc and loadMvcc: multiple rows with different chain lengths" {
         // Check Row 2: 1 version
         const chain2 = loaded.version_chains.get(2).?;
         var count2: u32 = 0;
-        var curr2 = chain2;
+        var curr2: ?*RowVersion = chain2;
         while (curr2) |v| : (curr2 = v.next) {
             count2 += 1;
         }
@@ -670,7 +670,7 @@ test "saveMvcc and loadMvcc: multiple rows with different chain lengths" {
         // Check Row 3: 2 versions
         const chain3 = loaded.version_chains.get(3).?;
         var count3: u32 = 0;
-        var curr3 = chain3;
+        var curr3: ?*RowVersion = chain3;
         while (curr3) |v| : (curr3 = v.next) {
             count3 += 1;
         }
@@ -868,7 +868,7 @@ test "saveMvcc and loadMvcc: long version chains (10+ versions)" {
 
         // Count versions
         var count: u32 = 0;
-        var curr = head;
+        var curr: ?*RowVersion = head;
         while (curr) |v| : (curr = v.next) {
             count += 1;
         }

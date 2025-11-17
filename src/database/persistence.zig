@@ -242,9 +242,9 @@ pub fn loadAllMvcc(allocator: Allocator, dir_path: []const u8) !Database {
 
             // Try to load as v3 (MVCC), fall back to v2 if needed
             var table = Table.loadMvcc(allocator, file_path) catch |err| switch (err) {
-                error.UnsupportedVersion => {
+                error.UnsupportedVersion => blk: {
                     // Fall back to old load method for v1/v2 files
-                    try Table.load(allocator, file_path)
+                    break :blk try Table.load(allocator, file_path);
                 },
                 else => return err,
             };

@@ -540,8 +540,12 @@ pub const Table = struct {
     pub fn get(self: *Table, id: u64, snapshot: ?*const Snapshot, clog: ?*CommitLog) ?*Row {
         const chain_head = self.version_chains.get(id) orelse return null;
 
-        // Non-MVCC mode: return newest version
+        // Non-MVCC mode: return newest version if not deleted
         if (snapshot == null or clog == null) {
+            // Check if row is deleted (xmax != 0 means deleted)
+            if (chain_head.xmax != 0) {
+                return null;
+            }
             return &chain_head.data;
         }
 
@@ -1016,11 +1020,11 @@ pub const Table = struct {
         var it = self.version_chains.iterator();
         while (it.next()) |entry| {
             const row_id = entry.key_ptr.*;
-            var version_head = entry.value_ptr.*;
+            const version_head = entry.value_ptr.*;
 
             // Count versions in this chain
             var version_count: u32 = 0;
-            var counter = version_head;
+            var counter: ?*RowVersion = version_head;
             while (counter) |v| : (counter = v.next) {
                 version_count += 1;
             }
@@ -1030,14 +1034,14 @@ pub const Table = struct {
             try utils.writeInt(file, u32, version_count);
 
             // Write each version in the chain (newest to oldest)
-            var current_version = version_head;
-            while (current_version) |version| : (current_version = version.next) {
+            var current_version: ?*RowVersion = version_head;
+            while (current_version) |ver| : (current_version = ver.next) {
                 // Write transaction metadata
-                try utils.writeInt(file, u64, version.xmin);
-                try utils.writeInt(file, u64, version.xmax);
+                try utils.writeInt(file, u64, ver.xmin);
+                try utils.writeInt(file, u64, ver.xmax);
 
                 // Write row data
-                const row = version.data;
+                const row = ver.data;
                 try utils.writeInt(file, u64, row.values.count());
 
                 var val_it = row.values.iterator();
