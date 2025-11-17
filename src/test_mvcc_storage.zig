@@ -533,3 +533,349 @@ test "save and load preserves newest version" {
         try testing.expectEqual(@as(i64, 31), row.get("age").?.int); // Newest version
     }
 }
+
+// ============================================================================
+// Phase 4B: MVCC Version Chain Persistence Tests
+// ============================================================================
+
+test "saveMvcc and loadMvcc: preserves single version chain" {
+    const allocator = testing.allocator;
+
+    const temp_path = "/tmp/test_mvcc_single_chain.zvdb";
+    defer std.fs.cwd().deleteFile(temp_path) catch {};
+
+    const checkpoint_txid: u64 = 5;
+
+    // Create and save table with version chain
+    {
+        var table = try Table.init(allocator, "mvcc_test");
+        defer table.deinit();
+
+        try table.addColumn("name", ColumnType.text);
+        try table.addColumn("value", ColumnType.int);
+
+        var values = StringHashMap(ColumnValue).init(allocator);
+        defer values.deinit();
+        try values.put("name", ColumnValue{ .text = "Test" });
+        try values.put("value", ColumnValue{ .int = 1 });
+        try table.insertWithId(1, values, 1);
+
+        // Create version chain with updates
+        try table.update(1, "value", ColumnValue{ .int = 2 }, 2, null);
+        try table.update(1, "value", ColumnValue{ .int = 3 }, 3, null);
+
+        try table.saveMvcc(temp_path, checkpoint_txid);
+    }
+
+    // Load and verify all versions preserved
+    {
+        var loaded = try Table.loadMvcc(allocator, temp_path);
+        defer loaded.deinit();
+
+        try testing.expectEqualStrings("mvcc_test", loaded.name);
+
+        // Get version chain head
+        const head = loaded.version_chains.get(1).?;
+
+        // Verify newest version (tx 3)
+        try testing.expectEqual(@as(u64, 3), head.xmin);
+        try testing.expectEqual(@as(u64, 0), head.xmax);
+        try testing.expectEqual(@as(i64, 3), head.data.get("value").?.int);
+
+        // Verify middle version (tx 2)
+        const v2 = head.next.?;
+        try testing.expectEqual(@as(u64, 2), v2.xmin);
+        try testing.expectEqual(@as(u64, 3), v2.xmax); // Marked as deleted by tx 3
+        try testing.expectEqual(@as(i64, 2), v2.data.get("value").?.int);
+
+        // Verify oldest version (tx 1)
+        const v1 = v2.next.?;
+        try testing.expectEqual(@as(u64, 1), v1.xmin);
+        try testing.expectEqual(@as(u64, 2), v1.xmax); // Marked as deleted by tx 2
+        try testing.expectEqual(@as(i64, 1), v1.data.get("value").?.int);
+
+        // Verify chain ends
+        try testing.expect(v1.next == null);
+    }
+}
+
+test "saveMvcc and loadMvcc: multiple rows with different chain lengths" {
+    const allocator = testing.allocator;
+
+    const temp_path = "/tmp/test_mvcc_multi_chains.zvdb";
+    defer std.fs.cwd().deleteFile(temp_path) catch {};
+
+    // Create table with multiple version chains
+    {
+        var table = try Table.init(allocator, "multi_chain");
+        defer table.deinit();
+
+        try table.addColumn("name", ColumnType.text);
+        try table.addColumn("count", ColumnType.int);
+
+        // Row 1: 3 versions
+        var values1 = StringHashMap(ColumnValue).init(allocator);
+        defer values1.deinit();
+        try values1.put("name", ColumnValue{ .text = "Row1" });
+        try values1.put("count", ColumnValue{ .int = 1 });
+        try table.insertWithId(1, values1, 1);
+        try table.update(1, "count", ColumnValue{ .int = 2 }, 2, null);
+        try table.update(1, "count", ColumnValue{ .int = 3 }, 3, null);
+
+        // Row 2: 1 version (no updates)
+        var values2 = StringHashMap(ColumnValue).init(allocator);
+        defer values2.deinit();
+        try values2.put("name", ColumnValue{ .text = "Row2" });
+        try values2.put("count", ColumnValue{ .int = 10 });
+        try table.insertWithId(2, values2, 4);
+
+        // Row 3: 2 versions
+        var values3 = StringHashMap(ColumnValue).init(allocator);
+        defer values3.deinit();
+        try values3.put("name", ColumnValue{ .text = "Row3" });
+        try values3.put("count", ColumnValue{ .int = 100 });
+        try table.insertWithId(3, values3, 5);
+        try table.update(3, "count", ColumnValue{ .int = 200 }, 6, null);
+
+        try table.saveMvcc(temp_path, 6);
+    }
+
+    // Load and verify
+    {
+        var loaded = try Table.loadMvcc(allocator, temp_path);
+        defer loaded.deinit();
+
+        // Verify row count
+        try testing.expectEqual(@as(u32, 3), loaded.version_chains.count());
+
+        // Check Row 1: 3 versions
+        const chain1 = loaded.version_chains.get(1).?;
+        var count1: u32 = 0;
+        var curr1 = chain1;
+        while (curr1) |v| : (curr1 = v.next) {
+            count1 += 1;
+        }
+        try testing.expectEqual(@as(u32, 3), count1);
+
+        // Check Row 2: 1 version
+        const chain2 = loaded.version_chains.get(2).?;
+        var count2: u32 = 0;
+        var curr2 = chain2;
+        while (curr2) |v| : (curr2 = v.next) {
+            count2 += 1;
+        }
+        try testing.expectEqual(@as(u32, 1), count2);
+        try testing.expectEqual(@as(i64, 10), chain2.data.get("count").?.int);
+
+        // Check Row 3: 2 versions
+        const chain3 = loaded.version_chains.get(3).?;
+        var count3: u32 = 0;
+        var curr3 = chain3;
+        while (curr3) |v| : (curr3 = v.next) {
+            count3 += 1;
+        }
+        try testing.expectEqual(@as(u32, 2), count3);
+    }
+}
+
+test "saveMvcc and loadMvcc: preserves xmin and xmax correctly" {
+    const allocator = testing.allocator;
+
+    const temp_path = "/tmp/test_mvcc_tx_metadata.zvdb";
+    defer std.fs.cwd().deleteFile(temp_path) catch {};
+
+    // Create table with specific transaction IDs
+    {
+        var table = try Table.init(allocator, "tx_test");
+        defer table.deinit();
+
+        try table.addColumn("data", ColumnType.int);
+
+        var values = StringHashMap(ColumnValue).init(allocator);
+        defer values.deinit();
+        try values.put("data", ColumnValue{ .int = 100 });
+        try table.insertWithId(1, values, 42); // tx 42
+
+        try table.update(1, "data", ColumnValue{ .int = 200 }, 123, null); // tx 123
+
+        try table.saveMvcc(temp_path, 123);
+    }
+
+    // Load and verify transaction metadata
+    {
+        var loaded = try Table.loadMvcc(allocator, temp_path);
+        defer loaded.deinit();
+
+        const head = loaded.version_chains.get(1).?;
+
+        // Newest version created by tx 123
+        try testing.expectEqual(@as(u64, 123), head.xmin);
+        try testing.expectEqual(@as(u64, 0), head.xmax); // Still current
+
+        // Old version created by tx 42, deleted by tx 123
+        const old = head.next.?;
+        try testing.expectEqual(@as(u64, 42), old.xmin);
+        try testing.expectEqual(@as(u64, 123), old.xmax);
+    }
+}
+
+test "saveMvcc and loadMvcc: empty table" {
+    const allocator = testing.allocator;
+
+    const temp_path = "/tmp/test_mvcc_empty.zvdb";
+    defer std.fs.cwd().deleteFile(temp_path) catch {};
+
+    // Create and save empty table
+    {
+        var table = try Table.init(allocator, "empty");
+        defer table.deinit();
+
+        try table.addColumn("col1", ColumnType.int);
+        try table.addColumn("col2", ColumnType.text);
+
+        try table.saveMvcc(temp_path, 0);
+    }
+
+    // Load and verify
+    {
+        var loaded = try Table.loadMvcc(allocator, temp_path);
+        defer loaded.deinit();
+
+        try testing.expectEqualStrings("empty", loaded.name);
+        try testing.expectEqual(@as(usize, 2), loaded.columns.items.len);
+        try testing.expectEqual(@as(u32, 0), loaded.version_chains.count());
+    }
+}
+
+test "saveMvcc and loadMvcc: preserves all column types" {
+    const allocator = testing.allocator;
+
+    const temp_path = "/tmp/test_mvcc_all_types.zvdb";
+    defer std.fs.cwd().deleteFile(temp_path) catch {};
+
+    // Create table with all column types
+    {
+        var table = try Table.init(allocator, "all_types");
+        defer table.deinit();
+
+        try table.addColumn("col_int", ColumnType.int);
+        try table.addColumn("col_float", ColumnType.float);
+        try table.addColumn("col_text", ColumnType.text);
+        try table.addColumn("col_bool", ColumnType.bool);
+        try table.addColumn("col_embedding", ColumnType.embedding);
+
+        var values = StringHashMap(ColumnValue).init(allocator);
+        defer values.deinit();
+        try values.put("col_int", ColumnValue{ .int = 42 });
+        try values.put("col_float", ColumnValue{ .float = 3.14 });
+        try values.put("col_text", ColumnValue{ .text = "Hello MVCC" });
+        try values.put("col_bool", ColumnValue{ .bool = true });
+
+        const embedding = try allocator.alloc(f32, 3);
+        defer allocator.free(embedding);
+        embedding[0] = 1.0;
+        embedding[1] = 2.0;
+        embedding[2] = 3.0;
+        try values.put("col_embedding", ColumnValue{ .embedding = embedding });
+
+        try table.insertWithId(1, values, 1);
+
+        try table.saveMvcc(temp_path, 1);
+    }
+
+    // Load and verify all types preserved
+    {
+        var loaded = try Table.loadMvcc(allocator, temp_path);
+        defer loaded.deinit();
+
+        const head = loaded.version_chains.get(1).?;
+        const row = head.data;
+
+        try testing.expectEqual(@as(i64, 42), row.get("col_int").?.int);
+        try testing.expectEqual(@as(f64, 3.14), row.get("col_float").?.float);
+        try testing.expectEqualStrings("Hello MVCC", row.get("col_text").?.text);
+        try testing.expectEqual(true, row.get("col_bool").?.bool);
+
+        const emb = row.get("col_embedding").?.embedding;
+        try testing.expectEqual(@as(usize, 3), emb.len);
+        try testing.expectEqual(@as(f32, 1.0), emb[0]);
+        try testing.expectEqual(@as(f32, 2.0), emb[1]);
+        try testing.expectEqual(@as(f32, 3.0), emb[2]);
+    }
+}
+
+test "loadMvcc: rejects non-v3 files" {
+    const allocator = testing.allocator;
+
+    const temp_path = "/tmp/test_mvcc_wrong_version.zvdb";
+    defer std.fs.cwd().deleteFile(temp_path) catch {};
+
+    // Create a v2 file (using old save method)
+    {
+        var table = try Table.init(allocator, "v2_table");
+        defer table.deinit();
+
+        try table.addColumn("data", ColumnType.int);
+
+        var values = StringHashMap(ColumnValue).init(allocator);
+        defer values.deinit();
+        try values.put("data", ColumnValue{ .int = 1 });
+        try table.insertWithId(1, values, 1);
+
+        try table.save(temp_path); // Saves as v2
+    }
+
+    // Try to load with loadMvcc - should fail
+    const result = Table.loadMvcc(allocator, temp_path);
+    try testing.expectError(error.UnsupportedVersion, result);
+}
+
+test "saveMvcc and loadMvcc: long version chains (10+ versions)" {
+    const allocator = testing.allocator;
+
+    const temp_path = "/tmp/test_mvcc_long_chain.zvdb";
+    defer std.fs.cwd().deleteFile(temp_path) catch {};
+
+    const num_updates: u64 = 15;
+
+    // Create long version chain
+    {
+        var table = try Table.init(allocator, "long_chain");
+        defer table.deinit();
+
+        try table.addColumn("counter", ColumnType.int);
+
+        var values = StringHashMap(ColumnValue).init(allocator);
+        defer values.deinit();
+        try values.put("counter", ColumnValue{ .int = 0 });
+        try table.insertWithId(1, values, 1);
+
+        // Create many versions
+        var tx: u64 = 2;
+        while (tx <= num_updates + 1) : (tx += 1) {
+            try table.update(1, "counter", ColumnValue{ .int = @intCast(tx - 1) }, tx, null);
+        }
+
+        try table.saveMvcc(temp_path, num_updates + 1);
+    }
+
+    // Load and verify chain length
+    {
+        var loaded = try Table.loadMvcc(allocator, temp_path);
+        defer loaded.deinit();
+
+        var head = loaded.version_chains.get(1).?;
+
+        // Count versions
+        var count: u32 = 0;
+        var curr = head;
+        while (curr) |v| : (curr = v.next) {
+            count += 1;
+        }
+
+        try testing.expectEqual(@as(u32, num_updates + 1), count);
+
+        // Verify newest has highest value
+        try testing.expectEqual(@as(i64, num_updates), head.data.get("counter").?.int);
+    }
+}
