@@ -208,8 +208,10 @@ pub fn executeAlterTable(db: *Database, cmd: sql.AlterTableCmd) !QueryResult {
     const table = db.tables.get(cmd.table_name) orelse return sql.SqlError.TableNotFound;
 
     var result = QueryResult.init(db.allocator);
+    errdefer result.deinit();
     try result.addColumn("status");
     var row = ArrayList(ColumnValue).init(db.allocator);
+    errdefer row.deinit();
 
     switch (cmd.operation) {
         .add_column => |add_op| {

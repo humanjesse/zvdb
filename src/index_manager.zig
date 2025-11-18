@@ -307,6 +307,54 @@ pub const IndexManager = struct {
     pub fn count(self: *const IndexManager) usize {
         return self.indexes.count();
     }
+
+    /// Remove all indexes on a specific column
+    /// Used when dropping a column via ALTER TABLE DROP COLUMN
+    pub fn removeIndexesForColumn(
+        self: *IndexManager,
+        table_name: []const u8,
+        column_name: []const u8,
+    ) !void {
+        // Collect index names to remove (can't modify while iterating)
+        var to_remove = ArrayList([]const u8).init(self.allocator);
+        defer to_remove.deinit();
+
+        var it = self.indexes.iterator();
+        while (it.next()) |entry| {
+            const info = entry.value_ptr.*;
+            if (std.mem.eql(u8, info.table_name, table_name) and
+                std.mem.eql(u8, info.column_name, column_name))
+            {
+                try to_remove.append(info.name);
+            }
+        }
+
+        // Remove the indexes
+        for (to_remove.items) |index_name| {
+            try self.dropIndex(index_name);
+        }
+    }
+
+    /// Rename a column in all indexes that reference it
+    /// Used when renaming a column via ALTER TABLE RENAME COLUMN
+    pub fn renameColumn(
+        self: *IndexManager,
+        table_name: []const u8,
+        old_column_name: []const u8,
+        new_column_name: []const u8,
+    ) !void {
+        var it = self.indexes.iterator();
+        while (it.next()) |entry| {
+            const info = entry.value_ptr.*;
+            if (std.mem.eql(u8, info.table_name, table_name) and
+                std.mem.eql(u8, info.column_name, old_column_name))
+            {
+                // Free old column name and update to new name
+                self.allocator.free(info.column_name);
+                info.column_name = try self.allocator.dupe(u8, new_column_name);
+            }
+        }
+    }
 };
 
 // ============================================================================
