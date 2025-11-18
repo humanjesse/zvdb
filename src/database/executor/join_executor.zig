@@ -567,39 +567,40 @@ pub fn executeJoinSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
             else
                 rows_after_offset;
 
-            // Free rows before offset (if any)
-            if (offset > 0) {
-                for (result.rows.items[0..offset]) |*row| {
-                    for (row.items) |*val| {
-                        var v = val.*;
-                        v.deinit(result.allocator);
-                    }
+            // Create new ArrayList with only the rows we want to keep
+            var new_rows = ArrayList(ArrayList(ColumnValue)).init(result.allocator);
+            errdefer {
+                for (new_rows.items) |*row| {
                     row.deinit();
                 }
-
-                // Shift remaining rows to the beginning
-                if (final_row_count > 0) {
-                    std.mem.copyForwards(
-                        std.ArrayList(ColumnValue),
-                        result.rows.items[0..final_row_count],
-                        result.rows.items[offset..offset + final_row_count]
-                    );
-                }
+                new_rows.deinit();
             }
 
-            // Free rows after limit (if any)
-            if (offset + final_row_count < total_rows) {
-                for (result.rows.items[offset + final_row_count..total_rows]) |*row| {
-                    for (row.items) |*val| {
-                        var v = val.*;
-                        v.deinit(result.allocator);
-                    }
-                    row.deinit();
-                }
+            // Copy rows we want to keep (shallow copy of ArrayList structs)
+            var i: usize = 0;
+            while (i < final_row_count) : (i += 1) {
+                try new_rows.append(result.rows.items[offset + i]);
             }
 
-            // Set final length
-            result.rows.items.len = final_row_count;
+            // Free rows we're not keeping
+            for (result.rows.items[0..offset]) |*row| {
+                for (row.items) |*val| {
+                    var v = val.*;
+                    v.deinit(result.allocator);
+                }
+                row.deinit();
+            }
+            for (result.rows.items[offset + final_row_count .. total_rows]) |*row| {
+                for (row.items) |*val| {
+                    var v = val.*;
+                    v.deinit(result.allocator);
+                }
+                row.deinit();
+            }
+
+            // Replace rows (don't deinit row data, just the backing array)
+            result.rows.deinit();
+            result.rows = new_rows;
         }
     }
 

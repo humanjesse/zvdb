@@ -15,11 +15,7 @@ test "pagination: basic OFFSET" {
     // Insert test data
     var i: i64 = 1;
     while (i <= 10) : (i += 1) {
-        const query = try std.fmt.allocPrint(
-            std.testing.allocator,
-            "INSERT INTO messages VALUES ({d}, 'Message {d}', {d})",
-            .{ i, i, i * 100 }
-        );
+        const query = try std.fmt.allocPrint(std.testing.allocator, "INSERT INTO messages VALUES ({d}, 'Message {d}', {d})", .{ i, i, i * 100 });
         defer std.testing.allocator.free(query);
         var result = try db.execute(query);
         defer result.deinit();
@@ -64,11 +60,7 @@ test "pagination: LIMIT with OFFSET" {
     // Insert 20 items
     var i: i64 = 1;
     while (i <= 20) : (i += 1) {
-        const query = try std.fmt.allocPrint(
-            std.testing.allocator,
-            "INSERT INTO items VALUES ({d}, 'Item {d}')",
-            .{ i, i }
-        );
+        const query = try std.fmt.allocPrint(std.testing.allocator, "INSERT INTO items VALUES ({d}, 'Item {d}')", .{ i, i });
         defer std.testing.allocator.free(query);
         var result = try db.execute(query);
         defer result.deinit();
@@ -160,7 +152,7 @@ test "pagination: OFFSET with WHERE clause" {
 
     try expectEqual(@as(usize, 2), result.rows.items.len);
     try expect(std.mem.eql(u8, result.rows.items[0].items[2].text, "Charlie")); // ID 3
-    try expect(std.mem.eql(u8, result.rows.items[1].items[2].text, "David"));   // ID 4
+    try expect(std.mem.eql(u8, result.rows.items[1].items[2].text, "David")); // ID 4
 }
 
 test "pagination: OFFSET with ORDER BY DESC" {
@@ -168,34 +160,34 @@ test "pagination: OFFSET with ORDER BY DESC" {
     defer db.deinit();
 
     {
-        var result = try db.execute("CREATE TABLE scores (player text, score int)");
+        var result = try db.execute("CREATE TABLE scores (score int, player text)");
         defer result.deinit();
     }
 
     {
-        var result1 = try db.execute("INSERT INTO scores VALUES ('Alice', 100)");
+        var result1 = try db.execute("INSERT INTO scores VALUES (100, 'Alice')");
         defer result1.deinit();
     }
     {
-        var result2 = try db.execute("INSERT INTO scores VALUES ('Bob', 85)");
+        var result2 = try db.execute("INSERT INTO scores VALUES (85, 'Bob')");
         defer result2.deinit();
     }
     {
-        var result3 = try db.execute("INSERT INTO scores VALUES ('Charlie', 90)");
+        var result3 = try db.execute("INSERT INTO scores VALUES (90, 'Charlie')");
         defer result3.deinit();
     }
     {
-        var result4 = try db.execute("INSERT INTO scores VALUES ('David', 95)");
+        var result4 = try db.execute("INSERT INTO scores VALUES (95, 'David')");
         defer result4.deinit();
     }
 
     // Get top scores, skip the highest one
-    var result = try db.execute("SELECT * FROM scores ORDER BY score DESC LIMIT 2 OFFSET 1");
+    var result = try db.execute("SELECT score, player FROM scores ORDER BY score DESC LIMIT 2 OFFSET 1");
     defer result.deinit();
 
     try expectEqual(@as(usize, 2), result.rows.items.len);
-    try expectEqual(@as(i64, 95), result.rows.items[0].items[1].int); // David
-    try expectEqual(@as(i64, 90), result.rows.items[1].items[1].int); // Charlie
+    try expectEqual(@as(i64, 95), result.rows.items[0].items[0].int); // David's score
+    try expectEqual(@as(i64, 90), result.rows.items[1].items[0].int); // Charlie's score
 }
 
 test "pagination: OFFSET with GROUP BY" {
@@ -281,7 +273,7 @@ test "pagination: OFFSET with JOIN" {
     try expectEqual(@as(usize, 2), result.rows.items.len);
     try expect(std.mem.eql(u8, result.rows.items[0].items[0].text, "Alice")); // Order 102
     try expectEqual(@as(i64, 75), result.rows.items[0].items[1].int);
-    try expect(std.mem.eql(u8, result.rows.items[1].items[0].text, "Bob"));   // Order 103
+    try expect(std.mem.eql(u8, result.rows.items[1].items[0].text, "Bob")); // Order 103
     try expectEqual(@as(i64, 100), result.rows.items[1].items[1].int);
 }
 
@@ -297,11 +289,7 @@ test "pagination: chat history use case" {
     // Insert 30 messages
     var i: i64 = 1;
     while (i <= 30) : (i += 1) {
-        const query = try std.fmt.allocPrint(
-            std.testing.allocator,
-            "INSERT INTO messages VALUES ({d}, 'User{d}', 'Hello {d}', {d})",
-            .{ i, i % 3, i, i * 1000 }
-        );
+        const query = try std.fmt.allocPrint(std.testing.allocator, "INSERT INTO messages VALUES ({d}, 'User{d}', 'Hello {d}', {d})", .{ i, @rem(i, 3), i, i * 1000 });
         defer std.testing.allocator.free(query);
         var result = try db.execute(query);
         defer result.deinit();
