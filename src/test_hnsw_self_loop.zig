@@ -97,11 +97,7 @@ test "HNSW: Concurrent self-loop creation stress test" {
 
     // Insert nodes
     for (&node_ids, 0..) |*id, i| {
-        const point = &[_]f32{
-            @as(f32, @floatFromInt(i)),
-            @as(f32, @floatFromInt(i * 2)),
-            @as(f32, @floatFromInt(i * 3))
-        };
+        const point = &[_]f32{ @as(f32, @floatFromInt(i)), @as(f32, @floatFromInt(i * 2)), @as(f32, @floatFromInt(i * 3)) };
         id.* = try hnsw.insert(point, null);
     }
 
@@ -115,12 +111,7 @@ test "HNSW: Concurrent self-loop creation stress test" {
 
     const selfLoopThreadFn = struct {
         fn func(context: *SelfLoopContext) void {
-            context.hnsw_ptr.addEdge(
-                context.node_id,
-                context.node_id,
-                context.edge_type,
-                1.0
-            ) catch {
+            context.hnsw_ptr.addEdge(context.node_id, context.node_id, context.edge_type, 1.0) catch {
                 context.result = false;
                 return;
             };
