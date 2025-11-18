@@ -301,6 +301,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_insert_atomicity_tests = b.addRunArtifact(insert_atomicity_tests);
 
+    const alter_table_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_alter_table.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_alter_table_tests = b.addRunArtifact(alter_table_tests);
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_hnsw_tests.step);
     test_step.dependOn(&run_sql_tests.step);
@@ -333,6 +342,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_hybrid_query_tests.step);
     test_step.dependOn(&run_array_literal_tests.step);
     test_step.dependOn(&run_insert_atomicity_tests.step);
+    test_step.dependOn(&run_alter_table_tests.step);
 
     // Add unit tests
     // const unit_tests = b.addTest(.{

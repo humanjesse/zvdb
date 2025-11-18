@@ -199,6 +199,218 @@ pub fn executeDropIndex(db: *Database, cmd: sql.DropIndexCmd) !QueryResult {
     return result;
 }
 
+/// Execute ALTER TABLE command
+/// Modifies an existing table structure:
+/// - ADD COLUMN: Adds a new column to the table, existing rows get NULL for the new column
+/// - DROP COLUMN: Removes a column from the table and all its data
+/// - RENAME COLUMN: Renames an existing column
+pub fn executeAlterTable(db: *Database, cmd: sql.AlterTableCmd) !QueryResult {
+    const table = db.tables.get(cmd.table_name) orelse return sql.SqlError.TableNotFound;
+
+    var result = QueryResult.init(db.allocator);
+    try result.addColumn("status");
+    var row = ArrayList(ColumnValue).init(db.allocator);
+
+    switch (cmd.operation) {
+        .add_column => |add_op| {
+            // Validate: Check column doesn't already exist
+            for (table.columns.items) |existing_col| {
+                if (std.mem.eql(u8, existing_col.name, add_op.column.name)) {
+                    return sql.SqlError.InvalidSyntax; // Column already exists
+                }
+            }
+
+            // Validate: Check for duplicate embedding dimensions
+            if (add_op.column.col_type == .embedding) {
+                if (add_op.column.embedding_dim) |new_dim| {
+                    for (table.columns.items) |existing_col| {
+                        if (existing_col.col_type == .embedding) {
+                            if (existing_col.embedding_dim) |existing_dim| {
+                                if (existing_dim == new_dim) {
+                                    std.debug.print(
+                                        "ERROR: Cannot add column '{s}': embedding dimension {d} already used by column '{s}'\n",
+                                        .{ add_op.column.name, new_dim, existing_col.name },
+                                    );
+                                    return sql.SqlError.DuplicateEmbeddingDimension;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Add column to table schema
+            try table.addColumnWithDim(
+                add_op.column.name,
+                add_op.column.col_type,
+                add_op.column.embedding_dim,
+            );
+
+            // Get MVCC context for updating existing rows
+            const snapshot = db.getCurrentSnapshot();
+            const clog = db.getClog();
+
+            // Add NULL value to all existing rows for the new column
+            const row_ids = try table.getAllRows(db.allocator, snapshot, clog);
+            defer db.allocator.free(row_ids);
+
+            for (row_ids) |row_id| {
+                // Get the row's current version
+                if (table.version_chains.get(row_id)) |version_ptr| {
+                    // Add the new column with NULL value to the current version
+                    const col_name_copy = try db.allocator.dupe(u8, add_op.column.name);
+                    try version_ptr.data.values.put(col_name_copy, ColumnValue.null_value);
+                }
+            }
+
+            const msg = try std.fmt.allocPrint(
+                db.allocator,
+                "Column '{s}' added to table '{s}'",
+                .{ add_op.column.name, cmd.table_name },
+            );
+            try row.append(ColumnValue{ .text = msg });
+        },
+
+        .drop_column => |drop_op| {
+            // Validate: Check column exists
+            var col_idx: ?usize = null;
+            var embedding_dim: ?usize = null;
+            for (table.columns.items, 0..) |col, idx| {
+                if (std.mem.eql(u8, col.name, drop_op.column_name)) {
+                    col_idx = idx;
+                    if (col.col_type == .embedding) {
+                        embedding_dim = col.embedding_dim;
+                    }
+                    break;
+                }
+            }
+
+            if (col_idx == null) {
+                return sql.SqlError.ColumnNotFound;
+            }
+
+            // Free the column name before removing from array
+            db.allocator.free(table.columns.items[col_idx.?].name);
+
+            // Remove column from table schema
+            _ = table.columns.orderedRemove(col_idx.?);
+
+            // Get MVCC context for updating existing rows
+            const snapshot = db.getCurrentSnapshot();
+            const clog = db.getClog();
+
+            // Remove column from all existing rows
+            const row_ids = try table.getAllRows(db.allocator, snapshot, clog);
+            defer db.allocator.free(row_ids);
+
+            for (row_ids) |row_id| {
+                if (table.version_chains.get(row_id)) |version_ptr| {
+                    // Remove the column from the current version
+                    if (version_ptr.data.values.fetchRemove(drop_op.column_name)) |kv| {
+                        // Free the key and value
+                        db.allocator.free(kv.key);
+                        var val = kv.value;
+                        val.deinit(db.allocator);
+                    }
+                }
+            }
+
+            // If this was an embedding column, check if we can clean up the HNSW index
+            // Only clean up if no other column uses this dimension
+            if (embedding_dim) |dim| {
+                var dim_still_used = false;
+                for (table.columns.items) |col| {
+                    if (col.col_type == .embedding and col.embedding_dim == dim) {
+                        dim_still_used = true;
+                        break;
+                    }
+                }
+
+                // Note: We don't actually remove the HNSW index here because:
+                // 1. Other tables might use the same dimension
+                // 2. The index cleanup logic is complex and dimension-specific
+                // Future enhancement: Track per-table, per-dimension HNSW usage
+            }
+
+            // Remove any B-tree indexes on this column
+            db.index_manager.removeIndexesForColumn(cmd.table_name, drop_op.column_name) catch |err| {
+                std.debug.print("Warning: Failed to remove indexes for column '{s}': {}\n", .{ drop_op.column_name, err });
+                // Continue anyway - the column is gone from the schema
+            };
+
+            const msg = try std.fmt.allocPrint(
+                db.allocator,
+                "Column '{s}' dropped from table '{s}'",
+                .{ drop_op.column_name, cmd.table_name },
+            );
+            try row.append(ColumnValue{ .text = msg });
+        },
+
+        .rename_column => |rename_op| {
+            // Validate: Check old column exists
+            var col_found = false;
+            for (table.columns.items) |*col| {
+                if (std.mem.eql(u8, col.name, rename_op.old_name)) {
+                    col_found = true;
+
+                    // Check new name doesn't conflict with existing columns
+                    for (table.columns.items) |existing_col| {
+                        if (std.mem.eql(u8, existing_col.name, rename_op.new_name)) {
+                            return sql.SqlError.InvalidSyntax; // Column name already exists
+                        }
+                    }
+
+                    // Update column name in schema
+                    db.allocator.free(col.name);
+                    col.name = try db.allocator.dupe(u8, rename_op.new_name);
+                    break;
+                }
+            }
+
+            if (!col_found) {
+                return sql.SqlError.ColumnNotFound;
+            }
+
+            // Get MVCC context for updating existing rows
+            const snapshot = db.getCurrentSnapshot();
+            const clog = db.getClog();
+
+            // Rename column in all existing rows
+            const row_ids = try table.getAllRows(db.allocator, snapshot, clog);
+            defer db.allocator.free(row_ids);
+
+            for (row_ids) |row_id| {
+                if (table.version_chains.get(row_id)) |version_ptr| {
+                    // Remove old key, add new key with same value
+                    if (version_ptr.data.values.fetchRemove(rename_op.old_name)) |kv| {
+                        // Free old key
+                        db.allocator.free(kv.key);
+                        // Add with new key name
+                        const new_key = try db.allocator.dupe(u8, rename_op.new_name);
+                        try version_ptr.data.values.put(new_key, kv.value);
+                    }
+                }
+            }
+
+            // Update B-tree indexes to use new column name
+            db.index_manager.renameColumn(cmd.table_name, rename_op.old_name, rename_op.new_name) catch |err| {
+                std.debug.print("Warning: Failed to rename indexes for column '{s}': {}\n", .{ rename_op.old_name, err });
+                // Continue anyway - the column is renamed in the schema and rows
+            };
+
+            const msg = try std.fmt.allocPrint(
+                db.allocator,
+                "Column '{s}' renamed to '{s}' in table '{s}'",
+                .{ rename_op.old_name, rename_op.new_name, cmd.table_name },
+            );
+            try row.append(ColumnValue{ .text = msg });
+        },
+    }
+
+    try result.addRow(row);
+    return result;
+}
+
 // ============================================================================
 // DML Commands - Data Manipulation
 // ============================================================================
