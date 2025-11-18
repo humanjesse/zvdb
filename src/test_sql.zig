@@ -48,6 +48,20 @@ test "SQL: CREATE TABLE IF NOT EXISTS" {
     try testing.expect(select_result2.rows.items.len == 1); // Data still intact
 }
 
+test "SQL: CREATE TABLE duplicate without IF NOT EXISTS" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    // First creation should succeed
+    var result1 = try db.execute("CREATE TABLE users (id int, name text, age int)");
+    defer result1.deinit();
+    try testing.expect(db.tables.count() == 1);
+
+    // Second creation without IF NOT EXISTS should fail with TableAlreadyExists
+    const result2 = db.execute("CREATE TABLE users (id int, name text, age int)");
+    try testing.expectError(error.TableAlreadyExists, result2);
+}
+
 test "SQL: INSERT and SELECT" {
     var db = Database.init(testing.allocator);
     defer db.deinit();

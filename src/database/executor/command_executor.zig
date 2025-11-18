@@ -118,9 +118,8 @@ pub fn executeCreateTable(db: *Database, cmd: sql.CreateTableCmd) !QueryResult {
             try result.addRow(row);
             return result;
         }
-        // Otherwise, this would be an error (table already exists)
-        // TODO: Add a proper error type for TableAlreadyExists
-        return sql.SqlError.InvalidSyntax; // Using this temporarily until we add a better error
+        // Otherwise, this is an error (table already exists)
+        return sql.SqlError.TableAlreadyExists;
     }
 
     // Validate: Check for duplicate embedding dimensions

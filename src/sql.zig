@@ -15,6 +15,7 @@ pub const SqlError = error{
     MissingColumn,
     InvalidColumnType,
     TableNotFound,
+    TableAlreadyExists, // Table already exists (use IF NOT EXISTS to ignore)
     ColumnNotFound,
     OutOfMemory,
     DimensionMismatch,
@@ -654,7 +655,8 @@ fn parseCreateTable(allocator: Allocator, tokens: []const Token) !CreateTableCmd
     if (tokens.len >= 6 and
         eqlIgnoreCase(tokens[2].text, "IF") and
         eqlIgnoreCase(tokens[3].text, "NOT") and
-        eqlIgnoreCase(tokens[4].text, "EXISTS")) {
+        eqlIgnoreCase(tokens[4].text, "EXISTS"))
+    {
         if_not_exists = true;
         table_name_idx = 5;
     }
