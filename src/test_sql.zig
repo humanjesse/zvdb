@@ -15,6 +15,53 @@ test "SQL: CREATE TABLE" {
     try testing.expect(db.tables.count() == 1);
 }
 
+test "SQL: CREATE TABLE IF NOT EXISTS" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    // First creation should succeed
+    var result1 = try db.execute("CREATE TABLE IF NOT EXISTS users (id int, name text, age int)");
+    defer result1.deinit();
+    try testing.expect(result1.rows.items.len == 1);
+    try testing.expect(db.tables.count() == 1);
+
+    // Second creation should succeed without error (idempotent)
+    var result2 = try db.execute("CREATE TABLE IF NOT EXISTS users (id int, name text, age int)");
+    defer result2.deinit();
+    try testing.expect(result2.rows.items.len == 1);
+    try testing.expect(db.tables.count() == 1); // Still only 1 table
+
+    // Insert some data to verify table is usable
+    var insert_result = try db.execute("INSERT INTO users VALUES (1, \"Alice\", 25)");
+    defer insert_result.deinit();
+
+    var select_result = try db.execute("SELECT * FROM users");
+    defer select_result.deinit();
+    try testing.expect(select_result.rows.items.len == 1);
+
+    // Running IF NOT EXISTS again should not affect existing data
+    var result3 = try db.execute("CREATE TABLE IF NOT EXISTS users (id int, name text, age int)");
+    defer result3.deinit();
+
+    var select_result2 = try db.execute("SELECT * FROM users");
+    defer select_result2.deinit();
+    try testing.expect(select_result2.rows.items.len == 1); // Data still intact
+}
+
+test "SQL: CREATE TABLE duplicate without IF NOT EXISTS" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    // First creation should succeed
+    var result1 = try db.execute("CREATE TABLE users (id int, name text, age int)");
+    defer result1.deinit();
+    try testing.expect(db.tables.count() == 1);
+
+    // Second creation without IF NOT EXISTS should fail with TableAlreadyExists
+    const result2 = db.execute("CREATE TABLE users (id int, name text, age int)");
+    try testing.expectError(error.TableAlreadyExists, result2);
+}
+
 test "SQL: INSERT and SELECT" {
     var db = Database.init(testing.allocator);
     defer db.deinit();

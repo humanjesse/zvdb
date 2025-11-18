@@ -106,6 +106,22 @@ fn handleValidationResult(db: *Database, validation_result: *ValidationResult) !
 /// Execute CREATE TABLE command
 /// Creates a new table with the specified columns and types
 pub fn executeCreateTable(db: *Database, cmd: sql.CreateTableCmd) !QueryResult {
+    // Check if table already exists
+    if (db.tables.get(cmd.table_name)) |_| {
+        // If IF NOT EXISTS is specified, return success without error
+        if (cmd.if_not_exists) {
+            var result = QueryResult.init(db.allocator);
+            try result.addColumn("status");
+            var row = ArrayList(ColumnValue).init(db.allocator);
+            const msg = try std.fmt.allocPrint(db.allocator, "Table '{s}' already exists", .{cmd.table_name});
+            try row.append(ColumnValue{ .text = msg });
+            try result.addRow(row);
+            return result;
+        }
+        // Otherwise, this is an error (table already exists)
+        return sql.SqlError.TableAlreadyExists;
+    }
+
     // Validate: Check for duplicate embedding dimensions
     // HNSW uses row_id as the unique key per dimension, so multiple embedding columns
     // with the same dimension in one table will cause DuplicateExternalId errors on INSERT

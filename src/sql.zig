@@ -15,6 +15,7 @@ pub const SqlError = error{
     MissingColumn,
     InvalidColumnType,
     TableNotFound,
+    TableAlreadyExists, // Table already exists (use IF NOT EXISTS to ignore)
     ColumnNotFound,
     OutOfMemory,
     DimensionMismatch,
@@ -93,6 +94,7 @@ pub const SqlCommand = union(enum) {
 pub const CreateTableCmd = struct {
     table_name: []const u8,
     columns: ArrayList(ColumnDef),
+    if_not_exists: bool,
 
     pub fn deinit(self: *CreateTableCmd, allocator: Allocator) void {
         allocator.free(self.table_name);
@@ -642,18 +644,32 @@ pub fn parse(allocator: Allocator, sql: []const u8) !SqlCommand {
 }
 
 fn parseCreateTable(allocator: Allocator, tokens: []const Token) !CreateTableCmd {
-    // CREATE TABLE name (col1 type1, col2 type2, ...)
+    // CREATE TABLE [IF NOT EXISTS] name (col1 type1, col2 type2, ...)
     if (tokens.len < 4) return SqlError.InvalidSyntax;
     if (!eqlIgnoreCase(tokens[1].text, "TABLE")) return SqlError.InvalidSyntax;
 
-    const table_name = try allocator.dupe(u8, tokens[2].text);
+    // Check for IF NOT EXISTS clause
+    var if_not_exists = false;
+    var table_name_idx: usize = 2;
+
+    if (tokens.len >= 6 and
+        eqlIgnoreCase(tokens[2].text, "IF") and
+        eqlIgnoreCase(tokens[3].text, "NOT") and
+        eqlIgnoreCase(tokens[4].text, "EXISTS"))
+    {
+        if_not_exists = true;
+        table_name_idx = 5;
+    }
+
+    const table_name = try allocator.dupe(u8, tokens[table_name_idx].text);
     var columns = ArrayList(ColumnDef).init(allocator);
 
-    if (tokens.len < 5 or !std.mem.eql(u8, tokens[3].text, "(")) {
+    const paren_idx = table_name_idx + 1;
+    if (tokens.len < paren_idx + 1 or !std.mem.eql(u8, tokens[paren_idx].text, "(")) {
         return SqlError.InvalidSyntax;
     }
 
-    var i: usize = 4;
+    var i: usize = paren_idx + 1;
     while (i < tokens.len) : (i += 1) {
         if (std.mem.eql(u8, tokens[i].text, ")")) break;
         if (std.mem.eql(u8, tokens[i].text, ",")) continue;
@@ -697,6 +713,7 @@ fn parseCreateTable(allocator: Allocator, tokens: []const Token) !CreateTableCmd
     return CreateTableCmd{
         .table_name = table_name,
         .columns = columns,
+        .if_not_exists = if_not_exists,
     };
 }
 
