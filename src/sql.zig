@@ -69,6 +69,7 @@ pub const SqlCommand = union(enum) {
     commit: void,
     rollback: void,
     vacuum: VacuumCmd,
+    alter_table: AlterTableCmd,
 
     pub fn deinit(self: *SqlCommand, allocator: Allocator) void {
         switch (self.*) {
@@ -83,6 +84,7 @@ pub const SqlCommand = union(enum) {
             .commit => {},
             .rollback => {},
             .vacuum => |*cmd| cmd.deinit(allocator),
+            .alter_table => |*cmd| cmd.deinit(allocator),
         }
     }
 };
@@ -139,6 +141,61 @@ pub const VacuumCmd = struct {
         if (self.table_name) |name| {
             allocator.free(name);
         }
+    }
+};
+
+/// ALTER TABLE command
+pub const AlterTableCmd = struct {
+    table_name: []const u8,
+    operation: AlterOperation,
+
+    pub fn deinit(self: *AlterTableCmd, allocator: Allocator) void {
+        allocator.free(self.table_name);
+        self.operation.deinit(allocator);
+    }
+};
+
+/// ALTER TABLE operations
+pub const AlterOperation = union(enum) {
+    add_column: AddColumnOp,
+    drop_column: DropColumnOp,
+    rename_column: RenameColumnOp,
+
+    pub fn deinit(self: *AlterOperation, allocator: Allocator) void {
+        switch (self.*) {
+            .add_column => |*op| op.deinit(allocator),
+            .drop_column => |*op| op.deinit(allocator),
+            .rename_column => |*op| op.deinit(allocator),
+        }
+    }
+};
+
+/// ADD COLUMN operation
+pub const AddColumnOp = struct {
+    column: ColumnDef,
+
+    pub fn deinit(self: *AddColumnOp, allocator: Allocator) void {
+        allocator.free(self.column.name);
+    }
+};
+
+/// DROP COLUMN operation
+pub const DropColumnOp = struct {
+    column_name: []const u8,
+
+    pub fn deinit(self: *DropColumnOp, allocator: Allocator) void {
+        allocator.free(self.column_name);
+    }
+};
+
+/// RENAME COLUMN operation
+pub const RenameColumnOp = struct {
+    old_name: []const u8,
+    new_name: []const u8,
+
+    pub fn deinit(self: *RenameColumnOp, allocator: Allocator) void {
+        allocator.free(self.old_name);
+        allocator.free(self.new_name);
     }
 };
 
@@ -546,6 +603,13 @@ pub fn parse(allocator: Allocator, sql: []const u8) !SqlCommand {
             return SqlCommand{ .create_index = try parseCreateIndex(allocator, tokens.items) };
         }
         return SqlError.InvalidSyntax;
+    } else if (eqlIgnoreCase(first, "ALTER")) {
+        // ALTER TABLE
+        if (tokens.items.len < 2) return SqlError.InvalidSyntax;
+        if (eqlIgnoreCase(tokens.items[1].text, "TABLE")) {
+            return SqlCommand{ .alter_table = try parseAlterTable(allocator, tokens.items) };
+        }
+        return SqlError.InvalidSyntax;
     } else if (eqlIgnoreCase(first, "DROP")) {
         // DROP INDEX
         if (tokens.items.len < 2) return SqlError.InvalidSyntax;
@@ -693,6 +757,115 @@ fn parseVacuum(allocator: Allocator, tokens: []const Token) !VacuumCmd {
         const table_name = try allocator.dupe(u8, tokens[1].text);
         return VacuumCmd{
             .table_name = table_name,
+        };
+    }
+
+    return SqlError.InvalidSyntax;
+}
+
+fn parseAlterTable(allocator: Allocator, tokens: []const Token) !AlterTableCmd {
+    // ALTER TABLE table_name ADD COLUMN col_name col_type
+    // ALTER TABLE table_name DROP COLUMN col_name
+    // ALTER TABLE table_name RENAME COLUMN old_name TO new_name
+    if (tokens.len < 5) return SqlError.InvalidSyntax;
+    if (!eqlIgnoreCase(tokens[1].text, "TABLE")) return SqlError.InvalidSyntax;
+
+    const table_name = try allocator.dupe(u8, tokens[2].text);
+    errdefer allocator.free(table_name);
+
+    // Parse operation type
+    if (eqlIgnoreCase(tokens[3].text, "ADD")) {
+        // ADD COLUMN col_name col_type [embedding(N)]
+        if (tokens.len < 6) return SqlError.InvalidSyntax;
+        if (!eqlIgnoreCase(tokens[4].text, "COLUMN")) return SqlError.InvalidSyntax;
+
+        const col_name = try allocator.dupe(u8, tokens[5].text);
+        errdefer allocator.free(col_name);
+
+        if (tokens.len < 7) {
+            allocator.free(col_name);
+            return SqlError.InvalidSyntax;
+        }
+
+        const col_type = try parseColumnType(tokens[6].text);
+
+        var embedding_dim: ?usize = null;
+
+        // For embedding type, dimension is required: embedding(N)
+        if (col_type == .embedding) {
+            // Expect: embedding ( number )
+            if (tokens.len < 10) {
+                allocator.free(col_name);
+                return SqlError.InvalidSyntax;
+            }
+            if (!std.mem.eql(u8, tokens[7].text, "(")) {
+                allocator.free(col_name);
+                return SqlError.InvalidSyntax;
+            }
+
+            const dim_value = std.fmt.parseInt(usize, tokens[8].text, 10) catch {
+                allocator.free(col_name);
+                return SqlError.InvalidSyntax;
+            };
+
+            if (!std.mem.eql(u8, tokens[9].text, ")")) {
+                allocator.free(col_name);
+                return SqlError.InvalidSyntax;
+            }
+
+            embedding_dim = dim_value;
+        }
+
+        return AlterTableCmd{
+            .table_name = table_name,
+            .operation = .{
+                .add_column = .{
+                    .column = .{
+                        .name = col_name,
+                        .col_type = col_type,
+                        .embedding_dim = embedding_dim,
+                    },
+                },
+            },
+        };
+    } else if (eqlIgnoreCase(tokens[3].text, "DROP")) {
+        // DROP COLUMN col_name
+        if (tokens.len < 6) return SqlError.InvalidSyntax;
+        if (!eqlIgnoreCase(tokens[4].text, "COLUMN")) return SqlError.InvalidSyntax;
+
+        const col_name = try allocator.dupe(u8, tokens[5].text);
+
+        return AlterTableCmd{
+            .table_name = table_name,
+            .operation = .{
+                .drop_column = .{
+                    .column_name = col_name,
+                },
+            },
+        };
+    } else if (eqlIgnoreCase(tokens[3].text, "RENAME")) {
+        // RENAME COLUMN old_name TO new_name
+        if (tokens.len < 8) return SqlError.InvalidSyntax;
+        if (!eqlIgnoreCase(tokens[4].text, "COLUMN")) return SqlError.InvalidSyntax;
+
+        const old_name = try allocator.dupe(u8, tokens[5].text);
+        errdefer allocator.free(old_name);
+
+        if (!eqlIgnoreCase(tokens[6].text, "TO")) {
+            allocator.free(old_name);
+            return SqlError.InvalidSyntax;
+        }
+
+        const new_name = try allocator.dupe(u8, tokens[7].text);
+
+        return AlterTableCmd{
+            .table_name = table_name,
+            .operation = .{
+                .rename_column = .{
+                    .old_name = old_name,
+                    .new_name = new_name,
+                },
+            },
         };
     }
 

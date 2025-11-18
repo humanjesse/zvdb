@@ -82,6 +82,7 @@ pub fn execute(db: *Database, query: []const u8) !QueryResult {
         .create_table => |create| try command_executor.executeCreateTable(db, create),
         .create_index => |create_idx| try command_executor.executeCreateIndex(db, create_idx),
         .drop_index => |drop_idx| try command_executor.executeDropIndex(db, drop_idx),
+        .alter_table => |alter| try command_executor.executeAlterTable(db, alter),
 
         // DML Commands (Data Manipulation Language)
         .insert => |insert| try command_executor.executeInsert(db, insert),
