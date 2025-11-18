@@ -65,6 +65,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_aggregate_tests = b.addRunArtifact(aggregate_tests);
 
+    const pagination_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_pagination.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_pagination_tests = b.addRunArtifact(pagination_tests);
+
     const group_by_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/test_group_by.zig"),
@@ -316,6 +325,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_wal_tests.step);
     test_step.dependOn(&run_btree_tests.step);
     test_step.dependOn(&run_aggregate_tests.step);
+    test_step.dependOn(&run_pagination_tests.step);
     test_step.dependOn(&run_group_by_tests.step);
     test_step.dependOn(&run_join_tests.step);
     test_step.dependOn(&run_sql_standards_tests.step);

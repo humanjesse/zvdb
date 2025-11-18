@@ -237,6 +237,7 @@ pub const SelectCmd = struct {
     group_by: ArrayList([]const u8), // GROUP BY columns
     having_expr: ?Expr, // HAVING clause for filtering grouped results
     limit: ?usize,
+    offset: ?usize,
 
     pub fn deinit(self: *SelectCmd, allocator: Allocator) void {
         allocator.free(self.table_name);
@@ -1095,6 +1096,7 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
         e.deinit(allocator);
     };
     var limit: ?usize = null;
+    var offset: ?usize = null;
 
     // Parse JOINs (before WHERE, GROUP BY, ORDER BY, LIMIT)
     while (i < tokens.len) {
@@ -1278,6 +1280,11 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
             if (i >= tokens.len) return SqlError.InvalidSyntax;
             limit = try std.fmt.parseInt(usize, tokens[i].text, 10);
             i += 1;
+        } else if (eqlIgnoreCase(tokens[i].text, "OFFSET")) {
+            i += 1;
+            if (i >= tokens.len) return SqlError.InvalidSyntax;
+            offset = try std.fmt.parseInt(usize, tokens[i].text, 10);
+            i += 1;
         } else {
             i += 1;
         }
@@ -1305,6 +1312,7 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
         .group_by = group_by,
         .having_expr = having_expr,
         .limit = limit,
+        .offset = offset,
     };
 
     return cmd;

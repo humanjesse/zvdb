@@ -544,19 +544,62 @@ pub fn executeGroupBySelect(db: *Database, table: *Table, cmd: sql.SelectCmd) !Q
         try sort_executor.applyOrderBy(&result, order_by);
     }
 
-    // Apply LIMIT if present
-    if (cmd.limit) |limit| {
-        if (result.rows.items.len > limit) {
-            // Free excess rows
-            for (result.rows.items[limit..]) |*row| {
+    // Apply OFFSET and LIMIT if present
+    const offset = cmd.offset orelse 0;
+    const total_rows = result.rows.items.len;
+
+    if (offset > 0 or cmd.limit != null) {
+        // If offset is beyond total rows, free all rows and return empty result
+        if (offset >= total_rows) {
+            for (result.rows.items) |*row| {
                 for (row.items) |*val| {
                     var v = val.*;
                     v.deinit(result.allocator);
                 }
                 row.deinit();
             }
-            // Truncate
-            result.rows.items.len = limit;
+            result.rows.items.len = 0;
+        } else {
+            // Calculate how many rows to keep after offset
+            const rows_after_offset = total_rows - offset;
+            const final_row_count = if (cmd.limit) |limit|
+                @min(limit, rows_after_offset)
+            else
+                rows_after_offset;
+
+            // Free rows before offset (if any)
+            if (offset > 0) {
+                for (result.rows.items[0..offset]) |*row| {
+                    for (row.items) |*val| {
+                        var v = val.*;
+                        v.deinit(result.allocator);
+                    }
+                    row.deinit();
+                }
+
+                // Shift remaining rows to the beginning
+                if (final_row_count > 0) {
+                    std.mem.copyForwards(
+                        std.ArrayList(ColumnValue),
+                        result.rows.items[0..final_row_count],
+                        result.rows.items[offset..offset + final_row_count]
+                    );
+                }
+            }
+
+            // Free rows after limit (if any)
+            if (offset + final_row_count < total_rows) {
+                for (result.rows.items[offset + final_row_count..total_rows]) |*row| {
+                    for (row.items) |*val| {
+                        var v = val.*;
+                        v.deinit(result.allocator);
+                    }
+                    row.deinit();
+                }
+            }
+
+            // Set final length
+            result.rows.items.len = final_row_count;
         }
     }
 

@@ -195,10 +195,13 @@ pub fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
 
     defer if (should_free_ids) db.allocator.free(row_ids);
 
-    // Determine if we need to process all rows (for ORDER BY) or can apply LIMIT early
-    // Don't apply LIMIT early if we have ORDER BY (unless it's similarity/vibes which already sorted)
+    // Determine if we need to process all rows (for ORDER BY or OFFSET) or can apply LIMIT early
+    // Don't apply LIMIT early if we have:
+    // - Generic ORDER BY (unless it's similarity/vibes which already sorted)
+    // - OFFSET (we need to know which rows to skip)
     const has_generic_order_by = cmd.order_by != null and cmd.order_by_similarity == null and !cmd.order_by_vibes;
-    const max_rows = if (!has_generic_order_by and cmd.limit != null)
+    const has_offset = cmd.offset != null;
+    const max_rows = if (!has_generic_order_by and !has_offset and cmd.limit != null)
         @min(cmd.limit.?, row_ids.len)
     else
         row_ids.len;
@@ -284,20 +287,63 @@ pub fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
         }
     }
 
-    // Apply LIMIT after ORDER BY (if we didn't apply it earlier)
-    if (has_generic_order_by and cmd.limit != null) {
-        const limit = cmd.limit.?;
-        if (result.rows.items.len > limit) {
-            // Free excess rows
-            for (result.rows.items[limit..]) |*row| {
+    // Apply OFFSET and LIMIT after ORDER BY (if we didn't apply LIMIT earlier)
+    // OFFSET is always applied here if present, since we need sorted results first
+    if (has_generic_order_by or has_offset) {
+        const offset = cmd.offset orelse 0;
+        const total_rows = result.rows.items.len;
+
+        // If offset is beyond total rows, free all rows and return empty result
+        if (offset >= total_rows) {
+            for (result.rows.items) |*row| {
                 for (row.items) |*val| {
                     var v = val.*;
                     v.deinit(result.allocator);
                 }
                 row.deinit();
             }
-            // Truncate
-            result.rows.items.len = limit;
+            result.rows.items.len = 0;
+        } else {
+            // Calculate how many rows to keep after offset
+            const rows_after_offset = total_rows - offset;
+            const final_row_count = if (cmd.limit) |limit|
+                @min(limit, rows_after_offset)
+            else
+                rows_after_offset;
+
+            // Free rows before offset (if any)
+            if (offset > 0) {
+                for (result.rows.items[0..offset]) |*row| {
+                    for (row.items) |*val| {
+                        var v = val.*;
+                        v.deinit(result.allocator);
+                    }
+                    row.deinit();
+                }
+
+                // Shift remaining rows to the beginning
+                if (final_row_count > 0) {
+                    std.mem.copyForwards(
+                        std.ArrayList(ColumnValue),
+                        result.rows.items[0..final_row_count],
+                        result.rows.items[offset..offset + final_row_count]
+                    );
+                }
+            }
+
+            // Free rows after limit (if any)
+            if (offset + final_row_count < total_rows) {
+                for (result.rows.items[offset + final_row_count..total_rows]) |*row| {
+                    for (row.items) |*val| {
+                        var v = val.*;
+                        v.deinit(result.allocator);
+                    }
+                    row.deinit();
+                }
+            }
+
+            // Set final length
+            result.rows.items.len = final_row_count;
         }
     }
 
