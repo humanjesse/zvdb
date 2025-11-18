@@ -706,8 +706,23 @@ fn parseInsert(allocator: Allocator, tokens: []const Token) !InsertCmd {
     if (!eqlIgnoreCase(tokens[1].text, "INTO")) return SqlError.InvalidSyntax;
 
     const table_name = try allocator.dupe(u8, tokens[2].text);
+    errdefer allocator.free(table_name);
+
     var columns = ArrayList([]const u8).init(allocator);
+    errdefer {
+        for (columns.items) |col| {
+            allocator.free(col);
+        }
+        columns.deinit();
+    }
+
     var values = ArrayList(ColumnValue).init(allocator);
+    errdefer {
+        for (values.items) |*val| {
+            val.deinit(allocator);
+        }
+        values.deinit();
+    }
 
     var i: usize = 3;
 
