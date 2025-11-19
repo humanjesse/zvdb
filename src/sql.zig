@@ -62,6 +62,7 @@ pub const SqlCommand = union(enum) {
     create_table: CreateTableCmd,
     create_index: CreateIndexCmd,
     drop_index: DropIndexCmd,
+    drop_table: DropTableCmd,
     insert: InsertCmd,
     select: SelectCmd,
     delete: DeleteCmd,
@@ -77,6 +78,7 @@ pub const SqlCommand = union(enum) {
             .create_table => |*cmd| cmd.deinit(allocator),
             .create_index => |*cmd| cmd.deinit(allocator),
             .drop_index => |*cmd| cmd.deinit(allocator),
+            .drop_table => |*cmd| cmd.deinit(allocator),
             .insert => |*cmd| cmd.deinit(allocator),
             .select => |*cmd| cmd.deinit(allocator),
             .delete => |*cmd| cmd.deinit(allocator),
@@ -130,6 +132,16 @@ pub const DropIndexCmd = struct {
 
     pub fn deinit(self: *DropIndexCmd, allocator: Allocator) void {
         allocator.free(self.index_name);
+    }
+};
+
+/// DROP TABLE command
+pub const DropTableCmd = struct {
+    table_name: []const u8,
+    if_exists: bool, // Support DROP TABLE IF EXISTS
+
+    pub fn deinit(self: *DropTableCmd, allocator: Allocator) void {
+        allocator.free(self.table_name);
     }
 };
 
@@ -615,10 +627,12 @@ pub fn parse(allocator: Allocator, sql: []const u8) !SqlCommand {
         }
         return SqlError.InvalidSyntax;
     } else if (eqlIgnoreCase(first, "DROP")) {
-        // DROP INDEX
+        // DROP INDEX or DROP TABLE
         if (tokens.items.len < 2) return SqlError.InvalidSyntax;
         if (eqlIgnoreCase(tokens.items[1].text, "INDEX")) {
             return SqlCommand{ .drop_index = try parseDropIndex(allocator, tokens.items) };
+        } else if (eqlIgnoreCase(tokens.items[1].text, "TABLE")) {
+            return SqlCommand{ .drop_table = try parseDropTable(allocator, tokens.items) };
         }
         return SqlError.InvalidSyntax;
     } else if (eqlIgnoreCase(first, "INSERT")) {
@@ -759,6 +773,31 @@ fn parseDropIndex(allocator: Allocator, tokens: []const Token) !DropIndexCmd {
 
     return DropIndexCmd{
         .index_name = index_name,
+    };
+}
+
+fn parseDropTable(allocator: Allocator, tokens: []const Token) !DropTableCmd {
+    // DROP TABLE [IF EXISTS] table_name
+    if (tokens.len < 3) return SqlError.InvalidSyntax;
+    if (!eqlIgnoreCase(tokens[1].text, "TABLE")) return SqlError.InvalidSyntax;
+
+    var idx: usize = 2; // After DROP TABLE
+    var if_exists = false;
+
+    // Check for IF EXISTS
+    if (tokens.len > idx and eqlIgnoreCase(tokens[idx].text, "IF")) {
+        if (tokens.len > idx + 1 and eqlIgnoreCase(tokens[idx + 1].text, "EXISTS")) {
+            if_exists = true;
+            idx += 2;
+        }
+    }
+
+    if (tokens.len <= idx) return SqlError.MissingTableName;
+    const table_name = try allocator.dupe(u8, tokens[idx].text);
+
+    return DropTableCmd{
+        .table_name = table_name,
+        .if_exists = if_exists,
     };
 }
 
