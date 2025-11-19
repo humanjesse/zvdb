@@ -355,6 +355,7 @@ pub const BinaryOp = enum {
     not_in_op, // NOT IN
     exists_op, // EXISTS
     not_exists_op, // NOT EXISTS
+    like, // LIKE (pattern matching with % and _)
 };
 
 /// Unary operators for WHERE expressions
@@ -1518,6 +1519,8 @@ fn parseComparisonExpr(allocator: Allocator, tokens: []const Token, idx: *usize)
             .lte
         else if (std.mem.eql(u8, op_text, ">="))
             .gte
+        else if (eqlIgnoreCase(op_text, "LIKE"))
+            .like
         else
             null;
 
@@ -1909,6 +1912,54 @@ fn getExprValue(expr: Expr, row_values: anytype, db: ?*anyopaque) ColumnValue {
     }
 }
 
+/// Pattern matching for LIKE operator
+/// Supports SQL wildcards:
+/// - % matches zero or more characters
+/// - _ matches exactly one character
+fn matchPattern(text: []const u8, pattern: []const u8) bool {
+    var text_idx: usize = 0;
+    var pattern_idx: usize = 0;
+    var star_idx: ?usize = null;
+    var match_idx: usize = 0;
+
+    while (text_idx < text.len) {
+        // Current pattern character
+        if (pattern_idx < pattern.len) {
+            const p = pattern[pattern_idx];
+
+            if (p == '%') {
+                // Remember the position of % and where we matched in text
+                star_idx = pattern_idx;
+                match_idx = text_idx;
+                pattern_idx += 1;
+                continue;
+            } else if (p == '_' or p == text[text_idx]) {
+                // _ matches any single char, or exact match
+                pattern_idx += 1;
+                text_idx += 1;
+                continue;
+            }
+        }
+
+        // No match, backtrack if we have a %
+        if (star_idx) |star| {
+            pattern_idx = star + 1;
+            match_idx += 1;
+            text_idx = match_idx;
+        } else {
+            return false;
+        }
+    }
+
+    // Skip trailing % in pattern
+    while (pattern_idx < pattern.len and pattern[pattern_idx] == '%') {
+        pattern_idx += 1;
+    }
+
+    // Match if we consumed entire pattern
+    return pattern_idx == pattern.len;
+}
+
 fn compareValues(left: ColumnValue, right: ColumnValue, op: BinaryOp) bool {
     // Handle NULL comparisons
     if (left == .null_value or right == .null_value) {
@@ -1955,6 +2006,13 @@ fn compareValues(left: ColumnValue, right: ColumnValue, op: BinaryOp) bool {
         },
         .text => |l| {
             if (right != .text) return false;
+
+            // Handle LIKE operator with pattern matching
+            if (op == .like) {
+                return matchPattern(l, right.text);
+            }
+
+            // Regular text comparisons
             const cmp = std.mem.order(u8, l, right.text);
             return switch (op) {
                 .eq => cmp == .eq,
