@@ -123,30 +123,9 @@ pub fn executeCreateTable(db: *Database, cmd: sql.CreateTableCmd) !QueryResult {
         return sql.SqlError.TableAlreadyExists;
     }
 
-    // Validate: Check for duplicate embedding dimensions
-    // HNSW uses row_id as the unique key per dimension, so multiple embedding columns
-    // with the same dimension in one table will cause DuplicateExternalId errors on INSERT
-    var seen_dims = std.AutoHashMap(usize, []const u8).init(db.allocator);
-    defer seen_dims.deinit();
-
-    for (cmd.columns.items) |col_def| {
-        if (col_def.col_type == .embedding) {
-            if (col_def.embedding_dim) |dim| {
-                if (seen_dims.get(dim)) |existing_col_name| {
-                    std.debug.print(
-                        "ERROR: Cannot create table '{s}': columns '{s}' and '{s}' both have embedding dimension {d}\n",
-                        .{ cmd.table_name, existing_col_name, col_def.name, dim },
-                    );
-                    std.debug.print(
-                        "HINT: Each embedding dimension can only appear once per table. Use different dimensions for different embedding columns.\n",
-                        .{},
-                    );
-                    return sql.SqlError.DuplicateEmbeddingDimension;
-                }
-                try seen_dims.put(dim, col_def.name);
-            }
-        }
-    }
+    // Note: We now support multiple embedding columns with the same dimension
+    // Each (dimension, column_name) pair gets its own HNSW index
+    // No validation needed here
 
     const table_ptr = try db.allocator.create(Table);
     table_ptr.* = try Table.init(db.allocator, cmd.table_name);
@@ -380,24 +359,9 @@ pub fn executeAlterTable(db: *Database, cmd: sql.AlterTableCmd) !QueryResult {
                 }
             }
 
-            // Validate: Check for duplicate embedding dimensions
-            if (add_op.column.col_type == .embedding) {
-                if (add_op.column.embedding_dim) |new_dim| {
-                    for (table.columns.items) |existing_col| {
-                        if (existing_col.col_type == .embedding) {
-                            if (existing_col.embedding_dim) |existing_dim| {
-                                if (existing_dim == new_dim) {
-                                    std.debug.print(
-                                        "ERROR: Cannot add column '{s}': embedding dimension {d} already used by column '{s}'\n",
-                                        .{ add_op.column.name, new_dim, existing_col.name },
-                                    );
-                                    return sql.SqlError.DuplicateEmbeddingDimension;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            // Note: We now support multiple embedding columns with the same dimension
+            // Each (dimension, column_name) pair gets its own HNSW index
+            // No validation needed here
 
             // Add column to table schema
             try table.addColumnWithDim(
@@ -685,19 +649,22 @@ pub fn executeInsert(db: *Database, cmd: sql.InsertCmd) !QueryResult {
     const snapshot = db.getCurrentSnapshot();
     const clog = db.getClog();
 
-    // If there's an embedding column, add to the appropriate dimension-specific HNSW index
+    // If there's an embedding column, add to the appropriate (dimension, column)-specific HNSW index
     const row = table.get(final_row_id, snapshot, clog).?;
-    var embedding_dims = ArrayList(usize).init(db.allocator); // Track all embedding dimensions for potential rollback
-    defer embedding_dims.deinit();
+    // Track all (dimension, column_name) pairs for potential rollback
+    const EmbeddingInfo = struct { dim: usize, col_name: []const u8 };
+    var embedding_infos = ArrayList(EmbeddingInfo).init(db.allocator);
+    defer embedding_infos.deinit();
     var it = row.values.iterator();
     while (it.next()) |entry| {
         if (entry.value_ptr.* == .embedding) {
+            const col_name = entry.key_ptr.*;
             const embedding = entry.value_ptr.embedding;
             const dim = embedding.len;
-            try embedding_dims.append(dim); // Store for potential rollback
+            try embedding_infos.append(.{ .dim = dim, .col_name = col_name });
 
-            // Get or create HNSW index for this dimension
-            const h = try db.getOrCreateHnswForDim(dim);
+            // Get or create HNSW index for this (dimension, column) pair
+            const h = try db.getOrCreateHnswForColumn(dim, col_name);
             _ = try h.insert(embedding, final_row_id);
             // Continue to process all embedding columns (removed break statement)
         }
@@ -706,16 +673,18 @@ pub fn executeInsert(db: *Database, cmd: sql.InsertCmd) !QueryResult {
     // Security: Enforce resource limit on embedding columns per row
     // This prevents resource exhaustion attacks where an attacker creates tables
     // with 100+ embedding columns, causing memory exhaustion on each INSERT
-    if (embedding_dims.items.len > db.max_embeddings_per_row) {
+    if (embedding_infos.items.len > db.max_embeddings_per_row) {
         return sql.SqlError.TooManyEmbeddings;
     }
 
     // Additional rollback for HNSW if B-tree index update fails
     errdefer {
-        for (embedding_dims.items) |dim| {
-            if (db.hnsw_indexes.get(dim)) |h| {
+        for (embedding_infos.items) |info| {
+            var key = core.HnswIndexKey.init(db.allocator, info.dim, info.col_name) catch continue;
+            defer key.deinit(db.allocator);
+            if (db.hnsw_indexes.get(key)) |h| {
                 h.removeNode(final_row_id) catch |err| {
-                    std.debug.print("CRITICAL: Failed to rollback HNSW insert for row {} in dim {}: {}\n", .{ final_row_id, dim, err });
+                    std.debug.print("CRITICAL: Failed to rollback HNSW insert for row {} in dim {} column {s}: {}\n", .{ final_row_id, info.dim, info.col_name, err });
                 };
             }
         }
@@ -1033,10 +1002,12 @@ pub fn executeUpdate(db: *Database, cmd: sql.UpdateCmd) !QueryResult {
         // Handle HNSW index updates BEFORE applying row updates (support multiple embeddings)
         for (embedding_updates.items) |update| {
             if (update.changed) {
-                // Remove old vector from its dimension-specific HNSW (if it existed)
+                // Remove old vector from its (dimension, column)-specific HNSW (if it existed)
                 if (update.old_backup) |old_emb| {
                     const old_dim = old_emb.len;
-                    if (db.hnsw_indexes.get(old_dim)) |h| {
+                    var old_key = try core.HnswIndexKey.init(db.allocator, old_dim, update.column_name);
+                    defer old_key.deinit(db.allocator);
+                    if (db.hnsw_indexes.get(old_key)) |h| {
                         h.removeNode(row_id) catch |err| {
                             std.debug.print("Error removing node from HNSW (column '{s}'): {}\n", .{ update.column_name, err });
                             return err;
@@ -1044,15 +1015,15 @@ pub fn executeUpdate(db: *Database, cmd: sql.UpdateCmd) !QueryResult {
                     }
                 }
 
-                // Insert new vector to its dimension-specific HNSW
+                // Insert new vector to its (dimension, column)-specific HNSW
                 const new_emb = update.new_value;
                 const new_dim = new_emb.len;
-                const h = try db.getOrCreateHnswForDim(new_dim);
+                const h = try db.getOrCreateHnswForColumn(new_dim, update.column_name);
                 _ = h.insert(new_emb, row_id) catch |err| {
                     // Rollback: Re-insert old embedding to restore HNSW state
                     if (update.old_backup) |old_clone| {
                         const old_dim = old_clone.len;
-                        const old_h = try db.getOrCreateHnswForDim(old_dim);
+                        const old_h = try db.getOrCreateHnswForColumn(old_dim, update.column_name);
                         _ = old_h.insert(old_clone, row_id) catch {
                             std.debug.print("CRITICAL: Failed to rollback HNSW state after insert failure (column '{s}')\n", .{update.column_name});
                         };

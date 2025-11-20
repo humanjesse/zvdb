@@ -126,7 +126,7 @@ pub fn writeWalRecord(
 /// 4. Merge recovered transaction state into CommitLog (Phase 4)
 /// 5. Replay committed transactions in order (by LSN)
 /// 6. Apply INSERT/DELETE/UPDATE operations preserving version chains (Phase 4)
-/// 7. Rebuild HNSW index from recovered table data (see rebuildHnswFromTables)
+/// 7. Auto-rebuild HNSW indexes from recovered table data (automatic since v1.1)
 /// 8. Handle incomplete/corrupted records gracefully
 ///
 /// Parameters:
@@ -378,6 +378,14 @@ pub fn recoverFromWal(db: *Database, wal_dir: []const u8) !usize {
     // Update TransactionManager to prevent ID reuse in future transactions
     if (max_tx_id > 0) {
         db.tx_manager.next_tx_id.store(max_tx_id + 1, .monotonic);
+    }
+
+    // Rebuild HNSW indexes from recovered table data
+    // This is critical because HNSW operations are not logged in the WAL
+    // Without this, vector search will be broken after crash recovery
+    const vectors_indexed = try @import("vector_ops.zig").rebuildHnswFromTables(db);
+    if (vectors_indexed > 0) {
+        std.debug.print("HNSW auto-rebuild: {} vectors re-indexed\n", .{vectors_indexed});
     }
 
     return recovered_count;

@@ -13,6 +13,45 @@ const Snapshot = @import("../transaction.zig").Snapshot;
 const CommitLog = @import("../transaction.zig").CommitLog;
 
 // ============================================================================
+// HNSW Index Key (for supporting multiple same-dimension embeddings)
+// ============================================================================
+
+/// Composite key for HNSW indexes: (dimension, column_name)
+/// This allows multiple embedding columns with the same dimension in one table
+/// Example: title_vec embedding(128) and content_vec embedding(128) in one table
+pub const HnswIndexKey = struct {
+    dimension: usize,
+    column_name: []const u8, // Owned string
+
+    pub fn init(allocator: Allocator, dimension: usize, column_name: []const u8) !HnswIndexKey {
+        const owned_name = try allocator.dupe(u8, column_name);
+        return HnswIndexKey{
+            .dimension = dimension,
+            .column_name = owned_name,
+        };
+    }
+
+    pub fn deinit(self: *HnswIndexKey, allocator: Allocator) void {
+        allocator.free(self.column_name);
+    }
+
+    /// Hash function for use in HashMap
+    pub fn hash(ctx: @This(), key: HnswIndexKey) u64 {
+        _ = ctx;
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(std.mem.asBytes(&key.dimension));
+        hasher.update(key.column_name);
+        return hasher.final();
+    }
+
+    /// Equality function for use in HashMap
+    pub fn eql(ctx: @This(), a: HnswIndexKey, b: HnswIndexKey) bool {
+        _ = ctx;
+        return a.dimension == b.dimension and std.mem.eql(u8, a.column_name, b.column_name);
+    }
+};
+
+// ============================================================================
 // Validation Configuration
 // ============================================================================
 
@@ -111,7 +150,7 @@ pub const VacuumConfig = struct {
 /// Main database with SQL and vector search
 pub const Database = struct {
     tables: StringHashMap(*Table),
-    hnsw_indexes: AutoHashMap(usize, *HNSW(f32)), // Per-dimension vector indexes (key=dimension, value=HNSW)
+    hnsw_indexes: std.HashMap(HnswIndexKey, *HNSW(f32), HnswIndexKey, std.hash_map.default_max_load_percentage), // Per-(dimension,column) vector indexes
     index_manager: IndexManager, // B-tree indexes for fast queries
     allocator: Allocator,
     data_dir: ?[]const u8, // Data directory for persistence (owned)
@@ -133,7 +172,7 @@ pub const Database = struct {
     pub fn init(allocator: Allocator) Database {
         return Database{
             .tables = StringHashMap(*Table).init(allocator),
-            .hnsw_indexes = AutoHashMap(usize, *HNSW(f32)).init(allocator),
+            .hnsw_indexes = std.HashMap(HnswIndexKey, *HNSW(f32), HnswIndexKey, std.hash_map.default_max_load_percentage).initContext(allocator, .{ .dimension = 0, .column_name = "" }),
             .index_manager = IndexManager.init(allocator),
             .allocator = allocator,
             .data_dir = null,
@@ -151,9 +190,9 @@ pub const Database = struct {
     pub fn deinit(self: *Database) void {
         // Auto-save if enabled and data_dir is set
         if (self.auto_save and self.data_dir != null) {
-            // Import persistence module to call saveAll
+            // Import persistence module to call saveAllMvcc (full MVCC support)
             const persistence = @import("persistence.zig");
-            persistence.saveAll(self, self.data_dir.?) catch |err| {
+            persistence.saveAllMvcc(self, self.data_dir.?) catch |err| {
                 std.debug.print("Warning: Failed to auto-save database: {}\n", .{err});
             };
         }
@@ -176,10 +215,12 @@ pub const Database = struct {
         self.tables.deinit();
 
         // Clean up all HNSW indexes
-        var hnsw_it = self.hnsw_indexes.valueIterator();
-        while (hnsw_it.next()) |h| {
-            h.*.deinit();
-            self.allocator.destroy(h.*);
+        var hnsw_it = self.hnsw_indexes.iterator();
+        while (hnsw_it.next()) |entry| {
+            var key = entry.key_ptr.*;
+            key.deinit(self.allocator); // Free column_name
+            entry.value_ptr.*.deinit();
+            self.allocator.destroy(entry.value_ptr.*);
         }
         self.hnsw_indexes.deinit();
 
@@ -191,27 +232,47 @@ pub const Database = struct {
         }
     }
 
-    /// Get or create HNSW index for a specific dimension
-    pub fn getOrCreateHnswForDim(self: *Database, dim: usize) !*HNSW(f32) {
-        // Check if HNSW index for this dimension already exists
-        if (self.hnsw_indexes.get(dim)) |existing_hnsw| {
+    /// Get or create HNSW index for a specific (dimension, column_name) pair
+    /// This allows multiple embedding columns with the same dimension
+    pub fn getOrCreateHnswForColumn(self: *Database, dim: usize, column_name: []const u8) !*HNSW(f32) {
+        // Create the composite key
+        var key = try HnswIndexKey.init(self.allocator, dim, column_name);
+        errdefer key.deinit(self.allocator);
+
+        // Check if HNSW index for this (dimension, column) already exists
+        if (self.hnsw_indexes.get(key)) |existing_hnsw| {
+            // Found existing index, free the temporary key
+            var temp_key = key;
+            temp_key.deinit(self.allocator);
             return existing_hnsw;
         }
 
-        // Create new HNSW index for this dimension
+        // Create new HNSW index for this (dimension, column)
         const hnsw_ptr = try self.allocator.create(HNSW(f32));
+        errdefer self.allocator.destroy(hnsw_ptr);
         // Use standard HNSW parameters: M=16, efConstruction=200
         hnsw_ptr.* = HNSW(f32).init(self.allocator, 16, 200);
-        try self.hnsw_indexes.put(dim, hnsw_ptr);
+
+        // Store in map (key is now owned by the map)
+        try self.hnsw_indexes.put(key, hnsw_ptr);
         return hnsw_ptr;
     }
 
-    /// Initialize vector search capabilities (deprecated - use getOrCreateHnswForDim instead)
+    /// Get or create HNSW index for a specific dimension (deprecated)
+    /// Use getOrCreateHnswForColumn instead for new code
+    /// This is kept for backward compatibility with tests
+    pub fn getOrCreateHnswForDim(self: *Database, dim: usize) !*HNSW(f32) {
+        // Use a default column name for backward compatibility
+        return self.getOrCreateHnswForColumn(dim, "default");
+    }
+
+    /// Initialize vector search capabilities (deprecated - use getOrCreateHnswForColumn instead)
     pub fn initVectorSearch(self: *Database, m: usize, ef_construction: usize) !void {
-        // For backward compatibility, initialize a default 768-dimensional HNSW
+        // For backward compatibility, initialize a default 768-dimensional HNSW with column name "default"
+        const key = try HnswIndexKey.init(self.allocator, 768, "default");
         const hnsw_ptr = try self.allocator.create(HNSW(f32));
         hnsw_ptr.* = HNSW(f32).init(self.allocator, m, ef_construction);
-        try self.hnsw_indexes.put(768, hnsw_ptr);
+        try self.hnsw_indexes.put(key, hnsw_ptr);
     }
 
     /// Enable persistence with specified data directory

@@ -99,16 +99,23 @@ test "ALTER TABLE: ADD COLUMN fails for duplicate column name" {
     try testing.expectError(error.InvalidSyntax, result);
 }
 
-test "ALTER TABLE: ADD COLUMN fails for duplicate embedding dimension" {
+test "ALTER TABLE: ADD COLUMN allows duplicate embedding dimension" {
     var db = Database.init(testing.allocator);
     defer db.deinit();
 
     var create_result = try db.execute("CREATE TABLE docs (id int, vec1 embedding(128))");
     defer create_result.deinit();
 
-    // Try to add another embedding column with same dimension
-    const result = db.execute("ALTER TABLE docs ADD COLUMN vec2 embedding(128)");
-    try testing.expectError(error.DuplicateEmbeddingDimension, result);
+    // Add another embedding column with same dimension - now allowed!
+    var result = try db.execute("ALTER TABLE docs ADD COLUMN vec2 embedding(128)");
+    defer result.deinit();
+
+    // Verify the column was added
+    const table = db.tables.get("docs").?;
+    const has_vec2 = for (table.columns.items) |col| {
+        if (std.mem.eql(u8, col.name, "vec2")) break true;
+    } else false;
+    try testing.expect(has_vec2);
 }
 
 test "ALTER TABLE: DROP COLUMN" {

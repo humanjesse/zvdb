@@ -29,13 +29,15 @@ const HNSW = @import("../hnsw.zig").HNSW;
 ///                 .{recovered_tx, vectors_indexed});
 /// ```
 pub fn rebuildHnswFromTables(db: *Database) !usize {
-    // Phase 2.4: Per-Dimension HNSW Index Rebuild Implementation
+    // Phase 2.4: Per-(Dimension,Column) HNSW Index Rebuild Implementation
 
     // Step 1: Clear all existing HNSW indexes
-    var hnsw_it = db.hnsw_indexes.valueIterator();
-    while (hnsw_it.next()) |h| {
-        h.*.deinit();
-        db.allocator.destroy(h.*);
+    var hnsw_it = db.hnsw_indexes.iterator();
+    while (hnsw_it.next()) |entry| {
+        var key = entry.key_ptr.*;
+        key.deinit(db.allocator); // Free column_name
+        entry.value_ptr.*.deinit();
+        db.allocator.destroy(entry.value_ptr.*);
     }
     db.hnsw_indexes.clearRetainingCapacity();
 
@@ -65,8 +67,8 @@ pub fn rebuildHnswFromTables(db: *Database) !usize {
                     const embedding = value.embedding;
                     const dim = embedding.len;
 
-                    // Get or create HNSW index for this dimension
-                    const h = try db.getOrCreateHnswForDim(dim);
+                    // Get or create HNSW index for this (dimension, column) pair
+                    const h = try db.getOrCreateHnswForColumn(dim, col_name);
 
                     // Insert into HNSW with row_id as external_id
                     _ = try h.insert(embedding, row_id);
@@ -76,12 +78,8 @@ pub fn rebuildHnswFromTables(db: *Database) !usize {
                         std.debug.print("HNSW rebuild progress: {} vectors indexed from table '{s}'\n", .{ vectors_indexed, table_name });
                     }
 
-                    // Only process first embedding column per row
-                    // (current limitation: one embedding per row)
-                    break;
+                    // Continue processing all embedding columns (no break)
                 }
-
-                _ = col_name; // Unused but kept for clarity
             }
         }
     }

@@ -956,8 +956,17 @@ pub const Table = struct {
     }
 
     /// Save table to a binary file (.zvdb format v2)
-    /// NOTE: Currently saves only the newest version of each row (no MVCC history)
-    /// For full MVCC recovery, use saveMvcc() instead
+    ///
+    /// ⚠️ WARNING: This method only saves the newest row versions and does NOT preserve:
+    ///   - Transaction history (xmin/xmax values)
+    ///   - Version chains for MVCC
+    ///   - Uncommitted or in-progress transaction data
+    ///
+    /// Database restart after save() will lose all transaction history.
+    /// For production use with full MVCC support, use saveMvcc() instead.
+    ///
+    /// This method is provided for backward compatibility and simple use cases
+    /// where transaction history is not needed.
     pub fn save(self: *Table, path: []const u8) !void {
         // Ensure parent directory exists
         if (std.fs.path.dirname(path)) |dir_path| {
