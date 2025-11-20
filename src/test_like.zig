@@ -126,10 +126,10 @@ test "LIKE: combined wildcards _%n" {
     var insert4 = try db.execute("INSERT INTO users VALUES (4, \"Justin\")");
     defer insert4.deinit();
 
-    var result = try db.execute("SELECT * FROM users WHERE name LIKE \"J_%n\"");
+    var result = try db.execute("SELECT * FROM users WHERE name LIKE \"J__%n\"");
     defer result.deinit();
 
-    try testing.expect(result.rows.items.len == 3); // John, Jason, Justin (not Jon - too short)
+    try testing.expect(result.rows.items.len == 3); // John, Jason, Justin (not Jon - too short with pattern J__%n)
 }
 
 test "LIKE: multiple % wildcards" {

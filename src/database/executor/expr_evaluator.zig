@@ -339,7 +339,7 @@ fn evaluateExprWithSubqueriesInternal(
         },
 
         // For comparison operators, check if either side is a scalar subquery
-        .eq, .neq, .lt, .gt, .lte, .gte => {
+        .eq, .neq, .lt, .gt, .lte, .gte, .like => {
             // Check if left side is a subquery
             if (bin.left == .subquery) {
                 const left_val = try evaluateScalarSubquery(

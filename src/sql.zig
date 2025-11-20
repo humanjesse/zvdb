@@ -1864,7 +1864,7 @@ fn evaluateBinaryExpr(expr: BinaryExpr, row_values: anytype, db: ?*anyopaque) bo
         .or_op => {
             return evaluateExpr(expr.left, row_values, db) or evaluateExpr(expr.right, row_values, db);
         },
-        .eq, .neq, .lt, .gt, .lte, .gte => {
+        .eq, .neq, .lt, .gt, .lte, .gte, .like => {
             const left_val = getExprValue(expr.left, row_values, db);
             const right_val = getExprValue(expr.right, row_values, db);
             return compareValues(left_val, right_val, expr.op);
