@@ -284,17 +284,73 @@ test "SQL: Dimension mismatch - error" {
     defer create_result.deinit();
 
     // Try to insert 3-dimensional array into 128-dimensional column
-    // This should fail during validation
+    // This should fail during validation with a clear error message
+    const result = db.execute("INSERT INTO dim_test VALUES (1, [0.1, 0.2, 0.3])");
+    try testing.expectError(error.ValidationFailed, result);
 
-    // TODO: Dimension validation in INSERT path not yet implemented
-    // Known limitation: You can insert wrong-dimension vectors, which will cause
-    // runtime errors later when querying. Schema validation prevents same-dimension
-    // columns, but doesn't validate INSERT dimension matches schema dimension.
-    if (db.execute("INSERT INTO dim_test VALUES (1, [0.1, 0.2, 0.3])")) |r| {
-        var result = r;
-        defer result.deinit();
-        std.debug.print("⚠ Dimension validation in INSERT not yet implemented (known limitation)\n", .{});
-    } else |err| {
-        std.debug.print("✓ Dimension mismatch correctly rejected: {}\n", .{err});
+    std.debug.print("✓ Dimension mismatch correctly rejected by validator\n", .{});
+}
+
+test "SQL: Correct dimension - passes validation" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    try db.initVectorSearch(16, 200);
+
+    var create_result = try db.execute("CREATE TABLE vec_test (id int, vec embedding(3))");
+    defer create_result.deinit();
+
+    // Insert 3-dimensional array into 3-dimensional column - should succeed
+    var insert_result = try db.execute("INSERT INTO vec_test VALUES (1, [0.1, 0.2, 0.3])");
+    defer insert_result.deinit();
+
+    // Verify the row was inserted
+    var select_result = try db.execute("SELECT * FROM vec_test");
+    defer select_result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), select_result.rows.items.len);
+    const vec = select_result.rows.items[0].items[1].embedding;
+    try testing.expectEqual(@as(usize, 3), vec.len);
+    try testing.expectEqual(@as(f32, 0.1), vec[0]);
+
+    std.debug.print("✓ Correct dimension validation passes\n", .{});
+}
+
+test "SQL: Multiple embeddings - dimension validation" {
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    try db.initVectorSearch(16, 200);
+
+    // Create table with multiple embedding columns
+    var create_result = try db.execute("CREATE TABLE multi_vec (id int, vec1 embedding(2), vec2 embedding(4))");
+    defer create_result.deinit();
+
+    // Test 1: Both correct dimensions - should succeed
+    {
+        var insert_result = try db.execute("INSERT INTO multi_vec VALUES (1, [0.1, 0.2], [0.3, 0.4, 0.5, 0.6])");
+        defer insert_result.deinit();
+        std.debug.print("✓ Multiple embeddings with correct dimensions accepted\n", .{});
+    }
+
+    // Test 2: First wrong, second correct - should fail
+    {
+        const result = db.execute("INSERT INTO multi_vec VALUES (2, [0.1], [0.3, 0.4, 0.5, 0.6])");
+        try testing.expectError(error.ValidationFailed, result);
+        std.debug.print("✓ First embedding dimension mismatch detected\n", .{});
+    }
+
+    // Test 3: First correct, second wrong - should fail
+    {
+        const result = db.execute("INSERT INTO multi_vec VALUES (3, [0.1, 0.2], [0.3, 0.4])");
+        try testing.expectError(error.ValidationFailed, result);
+        std.debug.print("✓ Second embedding dimension mismatch detected\n", .{});
+    }
+
+    // Test 4: Both wrong - should fail
+    {
+        const result = db.execute("INSERT INTO multi_vec VALUES (4, [0.1], [0.3])");
+        try testing.expectError(error.ValidationFailed, result);
+        std.debug.print("✓ Multiple embedding dimension mismatches detected\n", .{});
     }
 }

@@ -12,6 +12,7 @@
 const std = @import("std");
 const sql = @import("../sql.zig");
 const Table = @import("../table.zig").Table;
+const Column = @import("../table.zig").Column;
 const ColumnType = @import("../table.zig").ColumnType;
 const column_resolver = @import("column_resolver.zig");
 const ColumnResolver = column_resolver.ColumnResolver;
@@ -552,6 +553,46 @@ pub fn validateInsert(
                 "Either specify column names or provide values for all columns",
             );
         }
+
+        // Validate embedding dimensions for values in table column order
+        for (table.columns.items, 0..) |col, i| {
+            if (i >= cmd.values.items.len) break;
+
+            // Check if it's an embedding column with dimension specified
+            if (col.col_type == .embedding and col.embedding_dim != null) {
+                const expected_dim = col.embedding_dim.?;
+
+                // Check if the value is an embedding
+                if (cmd.values.items[i] == .embedding) {
+                    const actual_dim = cmd.values.items[i].embedding.len;
+
+                    if (actual_dim != expected_dim) {
+                        const msg = try std.fmt.allocPrint(
+                            allocator,
+                            "dimension mismatch for column \"{s}\": expected {d} dimensions but got {d}",
+                            .{ col.name, expected_dim, actual_dim },
+                        );
+                        defer allocator.free(msg);
+
+                        const hint = try std.fmt.allocPrint(
+                            allocator,
+                            "Column \"{s}\" is defined as embedding({d}). Provide an array with exactly {d} values.",
+                            .{ col.name, expected_dim, expected_dim },
+                        );
+
+                        try result.addError(
+                            ValidationError.InvalidExpression,
+                            col.name,
+                            msg,
+                            hint,
+                        );
+
+                        allocator.free(hint);
+                    }
+                }
+            }
+        }
+
         return result;
     }
 
@@ -634,6 +675,56 @@ pub fn validateInsert(
 
             // Free hint if allocated
             if (hint) |h| allocator.free(h);
+        }
+    }
+
+    // Validate embedding dimensions match schema expectations
+    for (cmd.columns.items, 0..) |col_name, i| {
+        if (i >= cmd.values.items.len) break;
+
+        // Find column in schema
+        var schema_col: ?Column = null;
+        for (table.columns.items) |col| {
+            if (std.mem.eql(u8, col_name, col.name)) {
+                schema_col = col;
+                break;
+            }
+        }
+
+        if (schema_col) |col| {
+            // Check if it's an embedding column with dimension specified
+            if (col.col_type == .embedding and col.embedding_dim != null) {
+                const expected_dim = col.embedding_dim.?;
+
+                // Check if the value is an embedding
+                if (cmd.values.items[i] == .embedding) {
+                    const actual_dim = cmd.values.items[i].embedding.len;
+
+                    if (actual_dim != expected_dim) {
+                        const msg = try std.fmt.allocPrint(
+                            allocator,
+                            "dimension mismatch for column \"{s}\": expected {d} dimensions but got {d}",
+                            .{ col_name, expected_dim, actual_dim },
+                        );
+                        defer allocator.free(msg);
+
+                        const hint = try std.fmt.allocPrint(
+                            allocator,
+                            "Column \"{s}\" is defined as embedding({d}). Provide an array with exactly {d} values.",
+                            .{ col_name, expected_dim, expected_dim },
+                        );
+
+                        try result.addError(
+                            ValidationError.InvalidExpression,
+                            col_name,
+                            msg,
+                            hint,
+                        );
+
+                        allocator.free(hint);
+                    }
+                }
+            }
         }
     }
 

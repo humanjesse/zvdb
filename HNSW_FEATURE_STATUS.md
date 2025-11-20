@@ -279,12 +279,14 @@ INSERT INTO products VALUES (99, "Widget", 19.99, true, [0.25, 0.5, 0.75, 1.0])
 - HNSW integration
 - Error cases (empty arrays)
 
-### Current Limitations
+### Dimension Validation
 
-⚠️ **Dimension validation not yet implemented**
-- Parser accepts any array length
-- Dimension mismatch with schema is detected at INSERT time but error handling could be improved
-- **TODO:** Add explicit dimension validation in validator
+✅ **Dimension validation implemented** (as of this commit)
+- Validator checks array dimensions match schema expectations
+- Clear error messages: "expected 128 dimensions but got 3"
+- Helpful hints guide users to fix dimension mismatches
+- Validates ALL embedding columns in a single INSERT
+- Works for both explicit and implicit column specifications
 
 ### Files Changed
 - `src/sql.zig`: +58 lines (lexer + parseArrayValue + integration)
