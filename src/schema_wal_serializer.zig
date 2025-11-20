@@ -39,17 +39,17 @@ pub fn serializeCreateTable(allocator: Allocator, cmd: sql.CreateTableCmd) ![]u8
     try writer.writeByte(if (cmd.if_not_exists) 1 else 0);
 
     // Write column count
-    try writer.writeInt(u32, @intCast(cmd.columns.len), .little);
+    try writer.writeInt(u32, @intCast(cmd.columns.items.len), .little);
 
     // Write each column
-    for (cmd.columns) |col| {
+    for (cmd.columns.items) |col| {
         try writer.writeInt(u32, @intCast(col.name.len), .little);
         try writer.writeAll(col.name);
-        try writer.writeByte(@intFromEnum(col.column_type));
+        try writer.writeByte(@intFromEnum(col.col_type));
 
         // If embedding type, write dimension
-        if (col.column_type == .embedding) {
-            try writer.writeInt(u32, @intCast(col.embedding_dim), .little);
+        if (col.col_type == .embedding) {
+            try writer.writeInt(u32, @intCast(col.embedding_dim.?), .little);
         }
     }
 
@@ -98,14 +98,14 @@ pub fn deserializeCreateTable(allocator: Allocator, data: []const u8) !sql.Creat
 
         try columns.append(sql.ColumnDef{
             .name = col_name,
-            .column_type = col_type,
+            .col_type = col_type,
             .embedding_dim = embedding_dim,
         });
     }
 
     return sql.CreateTableCmd{
         .table_name = table_name,
-        .columns = try columns.toOwnedSlice(),
+        .columns = columns,
         .if_not_exists = if_not_exists,
     };
 }
@@ -176,17 +176,17 @@ pub fn serializeAlterTable(allocator: Allocator, cmd: sql.AlterTableCmd) ![]u8 {
     switch (cmd.operation) {
         .add_column => |add| {
             try writer.writeByte(0); // operation type
-            try writer.writeInt(u32, @intCast(add.name.len), .little);
-            try writer.writeAll(add.name);
-            try writer.writeByte(@intFromEnum(add.column_type));
-            if (add.column_type == .embedding) {
-                try writer.writeInt(u32, @intCast(add.embedding_dim), .little);
+            try writer.writeInt(u32, @intCast(add.column.name.len), .little);
+            try writer.writeAll(add.column.name);
+            try writer.writeByte(@intFromEnum(add.column.col_type));
+            if (add.column.col_type == .embedding) {
+                try writer.writeInt(u32, @intCast(add.column.embedding_dim.?), .little);
             }
         },
-        .drop_column => |col_name| {
+        .drop_column => |drop| {
             try writer.writeByte(1); // operation type
-            try writer.writeInt(u32, @intCast(col_name.len), .little);
-            try writer.writeAll(col_name);
+            try writer.writeInt(u32, @intCast(drop.column_name.len), .little);
+            try writer.writeAll(drop.column_name);
         },
         .rename_column => |rename| {
             try writer.writeByte(2); // operation type
@@ -230,10 +230,12 @@ pub fn deserializeAlterTable(allocator: Allocator, data: []const u8) !sql.AlterT
             }
 
             break :blk sql.AlterOperation{
-                .add_column = sql.ColumnDef{
-                    .name = col_name,
-                    .column_type = col_type,
-                    .embedding_dim = embedding_dim,
+                .add_column = sql.AddColumnOp{
+                    .column = sql.ColumnDef{
+                        .name = col_name,
+                        .col_type = col_type,
+                        .embedding_dim = embedding_dim,
+                    },
                 },
             };
         },
@@ -243,7 +245,9 @@ pub fn deserializeAlterTable(allocator: Allocator, data: []const u8) !sql.AlterT
             errdefer allocator.free(col_name);
             _ = try reader.readAll(col_name);
 
-            break :blk sql.AlterOperation{ .drop_column = col_name };
+            break :blk sql.AlterOperation{
+                .drop_column = sql.DropColumnOp{ .column_name = col_name },
+            };
         },
         2 => blk: { // rename_column
             const old_name_len = try reader.readInt(u32, .little);
@@ -257,7 +261,7 @@ pub fn deserializeAlterTable(allocator: Allocator, data: []const u8) !sql.AlterT
             _ = try reader.readAll(new_name);
 
             break :blk sql.AlterOperation{
-                .rename_column = .{ .old_name = old_name, .new_name = new_name },
+                .rename_column = sql.RenameColumnOp{ .old_name = old_name, .new_name = new_name },
             };
         },
         else => return error.InvalidAlterOperation,
@@ -370,10 +374,10 @@ pub fn deserializeDropIndex(allocator: Allocator, data: []const u8) !sql.DropInd
 /// Free memory allocated during deserialization of CREATE TABLE
 pub fn freeCreateTableCmd(allocator: Allocator, cmd: sql.CreateTableCmd) void {
     allocator.free(cmd.table_name);
-    for (cmd.columns) |col| {
+    for (cmd.columns.items) |col| {
         allocator.free(col.name);
     }
-    allocator.free(cmd.columns);
+    cmd.columns.deinit();
 }
 
 /// Free memory allocated during deserialization of DROP TABLE
@@ -385,8 +389,8 @@ pub fn freeDropTableCmd(allocator: Allocator, cmd: sql.DropTableCmd) void {
 pub fn freeAlterTableCmd(allocator: Allocator, cmd: sql.AlterTableCmd) void {
     allocator.free(cmd.table_name);
     switch (cmd.operation) {
-        .add_column => |col| allocator.free(col.name),
-        .drop_column => |name| allocator.free(name),
+        .add_column => |col| allocator.free(col.column.name),
+        .drop_column => |drop| allocator.free(drop.column_name),
         .rename_column => |rename| {
             allocator.free(rename.old_name);
             allocator.free(rename.new_name);

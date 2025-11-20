@@ -209,12 +209,12 @@ test "VACUUM: removes versions from aborted transactions" {
         defer result.deinit();
     }
 
-    // With physical undo, the aborted version is removed immediately by ROLLBACK
-    // (In MVCC-native rollback, it would remain until VACUUM - see TODO in transaction_executor.zig)
+    // With MVCC-native rollback (Phase 2), the aborted version remains in table
+    // but is invisible via CLOG. VACUUM will clean it up.
     const stats_after_rollback = table.getVacuumStats();
-    try testing.expectEqual(@as(usize, 1), stats_after_rollback.total_versions);
+    try testing.expectEqual(@as(usize, 2), stats_after_rollback.total_versions);
 
-    // VACUUM should have no effect (version already removed by ROLLBACK)
+    // VACUUM should remove the aborted version
     var result = try db.execute("VACUUM users");
     defer result.deinit();
 

@@ -4,7 +4,7 @@ const ArrayList = std.array_list.Managed;
 const StringHashMap = std.StringHashMap;
 const Table = @import("table.zig").Table;
 const ColumnValue = @import("table.zig").ColumnValue;
-const ColumnType = @import("table.zig").ColumnType;
+pub const ColumnType = @import("table.zig").ColumnType;
 
 /// SQL parsing errors
 pub const SqlError = error{

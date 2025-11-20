@@ -1,0 +1,71 @@
+test
++- run test stderr
+=== VALIDATION ERRORS ===
+ERROR: column "invalid_col" does not exist in table "users"
+=========================
+
+
+=== VALIDATION ERRORS ===
+ERROR: column "invalid_col" does not exist in table "users"
+=========================
+
+
+=== VALIDATION ERRORS ===
+ERROR: column does not exist
+HINT: Check that all columns in WHERE clause exist in the table
+=========================
+
+
+=== VALIDATION ERRORS ===
+ERROR: column "id" specified more than once
+HINT: Remove duplicate column references
+=========================
+
+
+=== VALIDATION ERRORS ===
+ERROR: column "name" assigned more than once
+HINT: Remove duplicate assignments
+=========================
+test
++- run test stderr
+=== VALIDATION ERRORS ===
+ERROR: column "nonexistent" does not exist in table "users"
+=========================
+
+WAL Recovery complete: 2 transactions, 2 operations applied
+WAL Recovery complete: 1 transactions, 1 operations applied
+WAL Recovery complete: 10 transactions, 10 operations applied
+WAL Recovery complete: 4 transactions, 4 operations applied
+WAL Recovery complete: 2 transactions, 2 operations applied
+WAL Recovery complete: 2 transactions, 2 operations applied
+WAL Recovery complete: 2 transactions, 2 operations applied
+WAL Recovery complete: 3 transactions, 6 operations applied
+HNSW rebuild complete: 3 vectors indexed
+WAL Recovery complete: 1 transactions, 1 operations applied
+WAL Recovery complete: 1 transactions, 1 operations applied
+WAL Recovery complete: 1 transactions, 1 operations applied
+WAL Recovery complete: 2 transactions, 2 operations applied
+WAL Recovery complete: 3 transactions, 3 operations applied
+WAL Recovery complete: 1000 transactions, 1000 operations applied
+WAL Recovery complete: 7 transactions, 7 operations applied
+WAL Recovery complete: 100 transactions, 100 operations applied
+WAL Recovery complete: 5000 transactions, 5000 operations applied
+
+Recovery Performance:
+  Records: 5000
+  Time: 598.98 ms
+  Throughput: 8347 ops/sec
+
+Index Performance Comparison (1000 records):
+  Without index: 2381161 ns
+  With index:    779234 ns
+  Speedup:       3.1x faster
+Warning: Skipping corrupted record in test_data/wal_recovery_corrupt/wal.000000: error.ChecksumMismatch
+Warning: Skipping corrupted record in test_data/wal_recovery_corrupt/wal.000000 (pass 2): error.ChecksumMismatch
+WAL Recovery complete: 0 transactions, 0 operations applied (1 corrupted records skipped)
+Warning: Skipping corrupted record in test_data/wal_recovery_truncated/wal.000000: error.BufferTooSmall
+Warning: Skipping corrupted record in test_data/wal_recovery_truncated/wal.000000 (pass 2): error.BufferTooSmall
+WAL Recovery complete: 1 transactions, 1 operations applied (1 corrupted records skipped)
+Warning: Skipping corrupted record in test_data/wal_recovery_partial/wal.000000: error.ChecksumMismatch
+Warning: Skipping corrupted record in test_data/wal_recovery_partial/wal.000000 (pass 2): error.ChecksumMismatch
+WAL Recovery complete: 0 transactions, 0 operations applied (1 corrupted records skipped)

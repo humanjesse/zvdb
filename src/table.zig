@@ -540,13 +540,33 @@ pub const Table = struct {
     pub fn get(self: *Table, id: u64, snapshot: ?*const Snapshot, clog: ?*CommitLog) ?*Row {
         const chain_head = self.version_chains.get(id) orelse return null;
 
-        // Non-MVCC mode: return newest version if not deleted
-        if (snapshot == null or clog == null) {
-            // Check if row is deleted (xmax != 0 means deleted)
-            if (chain_head.xmax != 0) {
-                return null;
+        // Non-MVCC mode: return newest version if not deleted and not from aborted transaction
+        // IMPORTANT: Even in non-MVCC mode, we must check CLOG to filter out rows
+        // created by aborted transactions (Phase 2: MVCC-native rollback leaves them in table)
+        if (snapshot == null) {
+            if (clog) |log| {
+                // Walk the version chain to find the first non-aborted version
+                var current: ?*RowVersion = chain_head;
+                while (current) |version| {
+                    // Skip versions from aborted transactions
+                    if (log.isAborted(version.xmin)) {
+                        current = version.next;
+                        continue;
+                    }
+                    // Check if row was deleted by a committed transaction
+                    if (version.xmax != 0 and !log.isAborted(version.xmax)) {
+                        return null; // Row is deleted
+                    }
+                    return &version.data;
+                }
+                return null; // No valid version found
+            } else {
+                // No CLOG available: use simple xmax != 0 check (backward compatibility)
+                if (chain_head.xmax != 0) {
+                    return null;
+                }
+                return &chain_head.data;
             }
-            return &chain_head.data;
         }
 
         // MVCC mode: Walk version chain from newest to oldest
@@ -732,10 +752,35 @@ pub const Table = struct {
             const row_id = entry.key_ptr.*;
             const head_version = entry.value_ptr.*;
 
-            // Non-MVCC mode: include non-deleted rows (xmax == 0)
-            if (snapshot == null or clog == null) {
-                if (head_version.xmax == 0) {
-                    try visible_ids.append(row_id);
+            // Non-MVCC mode: include non-deleted, non-aborted rows
+            // IMPORTANT: Even in non-MVCC mode, we must check CLOG to filter out rows
+            // created by aborted transactions (Phase 2: MVCC-native rollback leaves them in table)
+            if (snapshot == null) {
+                if (clog) |log| {
+                    // Walk the version chain to find the first non-aborted version
+                    var version: ?*RowVersion = entry.value_ptr.*;
+                    var found_valid = false;
+                    while (version) |v| {
+                        // Skip versions from aborted transactions
+                        if (log.isAborted(v.xmin)) {
+                            version = v.next;
+                            continue;
+                        }
+                        // Check if row was deleted by a committed transaction
+                        if (v.xmax != 0 and !log.isAborted(v.xmax)) {
+                            break; // Row is deleted
+                        }
+                        found_valid = true;
+                        break;
+                    }
+                    if (found_valid) {
+                        try visible_ids.append(row_id);
+                    }
+                } else {
+                    // No CLOG available: use simple xmax == 0 check (backward compatibility)
+                    if (head_version.xmax == 0) {
+                        try visible_ids.append(row_id);
+                    }
                 }
                 continue;
             }
@@ -828,9 +873,27 @@ pub const Table = struct {
         while (it.next()) |entry| {
             const head = entry.value_ptr.*;
 
+            // MVCC-native rollback: HEAD version might be from an aborted transaction
+            // If so, promote the next version to HEAD (or remove the row entirely)
+            if (clog.isAborted(head.xmin)) {
+                if (head.next) |next_version| {
+                    // Replace head with next version
+                    entry.value_ptr.* = next_version;
+                    head.deinit(self.allocator);
+                    stats.versions_removed += 1;
+                } else {
+                    // No other versions, remove the entire row
+                    // (This will be handled by the iterator removal below)
+                    head.deinit(self.allocator);
+                    _ = self.version_chains.remove(entry.key_ptr.*);
+                    stats.versions_removed += 1;
+                    continue;
+                }
+            }
+
             // Walk the version chain and clean up old versions
-            var current: ?*RowVersion = head.next; // Start from second version (never remove head)
-            var prev: *RowVersion = head;
+            var current: ?*RowVersion = entry.value_ptr.*.next; // Start from second version
+            var prev: *RowVersion = entry.value_ptr.*;
 
             while (current) |version| {
                 const next = version.next;

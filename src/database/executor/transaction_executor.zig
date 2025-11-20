@@ -194,9 +194,9 @@ fn undoOperation(db: *Database, op: Operation) !void {
                 // New version (invisible)
                 const new_row_data = &head.data;
 
-                // Old version (visible) is in the prev chain
-                if (head.prev) |prev| {
-                    const old_row_data = &prev.data;
+                // Old version (visible) is in the next chain
+                if (head.next) |next| {
+                    const old_row_data = &next.data;
 
                     // Update indexes: remove new values, restore old values
                     // This is the only physical operation we need to do
