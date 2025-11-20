@@ -62,6 +62,7 @@ pub const SqlCommand = union(enum) {
     create_table: CreateTableCmd,
     create_index: CreateIndexCmd,
     drop_index: DropIndexCmd,
+    drop_table: DropTableCmd,
     insert: InsertCmd,
     select: SelectCmd,
     delete: DeleteCmd,
@@ -77,6 +78,7 @@ pub const SqlCommand = union(enum) {
             .create_table => |*cmd| cmd.deinit(allocator),
             .create_index => |*cmd| cmd.deinit(allocator),
             .drop_index => |*cmd| cmd.deinit(allocator),
+            .drop_table => |*cmd| cmd.deinit(allocator),
             .insert => |*cmd| cmd.deinit(allocator),
             .select => |*cmd| cmd.deinit(allocator),
             .delete => |*cmd| cmd.deinit(allocator),
@@ -130,6 +132,16 @@ pub const DropIndexCmd = struct {
 
     pub fn deinit(self: *DropIndexCmd, allocator: Allocator) void {
         allocator.free(self.index_name);
+    }
+};
+
+/// DROP TABLE command
+pub const DropTableCmd = struct {
+    table_name: []const u8,
+    if_exists: bool, // Support DROP TABLE IF EXISTS
+
+    pub fn deinit(self: *DropTableCmd, allocator: Allocator) void {
+        allocator.free(self.table_name);
     }
 };
 
@@ -355,6 +367,7 @@ pub const BinaryOp = enum {
     not_in_op, // NOT IN
     exists_op, // EXISTS
     not_exists_op, // NOT EXISTS
+    like, // LIKE (pattern matching with % and _)
 };
 
 /// Unary operators for WHERE expressions
@@ -614,10 +627,12 @@ pub fn parse(allocator: Allocator, sql: []const u8) !SqlCommand {
         }
         return SqlError.InvalidSyntax;
     } else if (eqlIgnoreCase(first, "DROP")) {
-        // DROP INDEX
+        // DROP INDEX or DROP TABLE
         if (tokens.items.len < 2) return SqlError.InvalidSyntax;
         if (eqlIgnoreCase(tokens.items[1].text, "INDEX")) {
             return SqlCommand{ .drop_index = try parseDropIndex(allocator, tokens.items) };
+        } else if (eqlIgnoreCase(tokens.items[1].text, "TABLE")) {
+            return SqlCommand{ .drop_table = try parseDropTable(allocator, tokens.items) };
         }
         return SqlError.InvalidSyntax;
     } else if (eqlIgnoreCase(first, "INSERT")) {
@@ -758,6 +773,31 @@ fn parseDropIndex(allocator: Allocator, tokens: []const Token) !DropIndexCmd {
 
     return DropIndexCmd{
         .index_name = index_name,
+    };
+}
+
+fn parseDropTable(allocator: Allocator, tokens: []const Token) !DropTableCmd {
+    // DROP TABLE [IF EXISTS] table_name
+    if (tokens.len < 3) return SqlError.InvalidSyntax;
+    if (!eqlIgnoreCase(tokens[1].text, "TABLE")) return SqlError.InvalidSyntax;
+
+    var idx: usize = 2; // After DROP TABLE
+    var if_exists = false;
+
+    // Check for IF EXISTS
+    if (tokens.len > idx and eqlIgnoreCase(tokens[idx].text, "IF")) {
+        if (tokens.len > idx + 1 and eqlIgnoreCase(tokens[idx + 1].text, "EXISTS")) {
+            if_exists = true;
+            idx += 2;
+        }
+    }
+
+    if (tokens.len <= idx) return SqlError.MissingTableName;
+    const table_name = try allocator.dupe(u8, tokens[idx].text);
+
+    return DropTableCmd{
+        .table_name = table_name,
+        .if_exists = if_exists,
     };
 }
 
@@ -1518,6 +1558,8 @@ fn parseComparisonExpr(allocator: Allocator, tokens: []const Token, idx: *usize)
             .lte
         else if (std.mem.eql(u8, op_text, ">="))
             .gte
+        else if (eqlIgnoreCase(op_text, "LIKE"))
+            .like
         else
             null;
 
@@ -1822,7 +1864,7 @@ fn evaluateBinaryExpr(expr: BinaryExpr, row_values: anytype, db: ?*anyopaque) bo
         .or_op => {
             return evaluateExpr(expr.left, row_values, db) or evaluateExpr(expr.right, row_values, db);
         },
-        .eq, .neq, .lt, .gt, .lte, .gte => {
+        .eq, .neq, .lt, .gt, .lte, .gte, .like => {
             const left_val = getExprValue(expr.left, row_values, db);
             const right_val = getExprValue(expr.right, row_values, db);
             return compareValues(left_val, right_val, expr.op);
@@ -1909,6 +1951,54 @@ fn getExprValue(expr: Expr, row_values: anytype, db: ?*anyopaque) ColumnValue {
     }
 }
 
+/// Pattern matching for LIKE operator
+/// Supports SQL wildcards:
+/// - % matches zero or more characters
+/// - _ matches exactly one character
+fn matchPattern(text: []const u8, pattern: []const u8) bool {
+    var text_idx: usize = 0;
+    var pattern_idx: usize = 0;
+    var star_idx: ?usize = null;
+    var match_idx: usize = 0;
+
+    while (text_idx < text.len) {
+        // Current pattern character
+        if (pattern_idx < pattern.len) {
+            const p = pattern[pattern_idx];
+
+            if (p == '%') {
+                // Remember the position of % and where we matched in text
+                star_idx = pattern_idx;
+                match_idx = text_idx;
+                pattern_idx += 1;
+                continue;
+            } else if (p == '_' or p == text[text_idx]) {
+                // _ matches any single char, or exact match
+                pattern_idx += 1;
+                text_idx += 1;
+                continue;
+            }
+        }
+
+        // No match, backtrack if we have a %
+        if (star_idx) |star| {
+            pattern_idx = star + 1;
+            match_idx += 1;
+            text_idx = match_idx;
+        } else {
+            return false;
+        }
+    }
+
+    // Skip trailing % in pattern
+    while (pattern_idx < pattern.len and pattern[pattern_idx] == '%') {
+        pattern_idx += 1;
+    }
+
+    // Match if we consumed entire pattern
+    return pattern_idx == pattern.len;
+}
+
 fn compareValues(left: ColumnValue, right: ColumnValue, op: BinaryOp) bool {
     // Handle NULL comparisons
     if (left == .null_value or right == .null_value) {
@@ -1955,6 +2045,13 @@ fn compareValues(left: ColumnValue, right: ColumnValue, op: BinaryOp) bool {
         },
         .text => |l| {
             if (right != .text) return false;
+
+            // Handle LIKE operator with pattern matching
+            if (op == .like) {
+                return matchPattern(l, right.text);
+            }
+
+            // Regular text comparisons
             const cmp = std.mem.order(u8, l, right.text);
             return switch (op) {
                 .eq => cmp == .eq,
