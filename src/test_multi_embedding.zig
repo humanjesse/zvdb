@@ -2,6 +2,7 @@ const std = @import("std");
 const testing = std.testing;
 const Database = @import("database.zig").Database;
 const ColumnValue = @import("table.zig").ColumnValue;
+const core = @import("database/core.zig");
 
 test "SQL: Multiple embedding columns per row - INSERT" {
     var db = Database.init(testing.allocator);
@@ -51,14 +52,18 @@ test "SQL: Multiple embedding columns per row - INSERT" {
     // The INSERT code should now iterate through ALL embeddings (no break statement)
 
     // Verify text_emb (128-dim) is in HNSW
-    const hnsw_128 = db.hnsw_indexes.get(128);
+    var key_128 = try core.HnswIndexKey.init(testing.allocator, 128, "text_emb");
+    defer key_128.deinit(testing.allocator);
+    const hnsw_128 = db.hnsw_indexes.get(key_128);
     try testing.expect(hnsw_128 != null);
     const internal_id_128 = hnsw_128.?.getInternalId(row_id);
     try testing.expect(internal_id_128 != null);
     std.debug.print("✓ Text embedding (128-dim) found in HNSW at row_id {}\n", .{row_id});
 
     // Verify image_emb (256-dim) is in HNSW
-    const hnsw_256 = db.hnsw_indexes.get(256);
+    var key_256 = try core.HnswIndexKey.init(testing.allocator, 256, "image_emb");
+    defer key_256.deinit(testing.allocator);
+    const hnsw_256 = db.hnsw_indexes.get(key_256);
     try testing.expect(hnsw_256 != null);
     const internal_id_256 = hnsw_256.?.getInternalId(row_id);
     try testing.expect(internal_id_256 != null);
@@ -119,10 +124,14 @@ test "SQL: Multiple embedding columns per row - UPDATE" {
     const table = db.tables.get("multi_emb").?;
 
     // Verify both are in HNSW initially
-    try testing.expect(db.hnsw_indexes.get(64) != null);
-    try testing.expect(db.hnsw_indexes.get(128) != null);
-    try testing.expect(db.hnsw_indexes.get(64).?.getInternalId(row_id) != null);
-    try testing.expect(db.hnsw_indexes.get(128).?.getInternalId(row_id) != null);
+    var key_emb1 = try core.HnswIndexKey.init(testing.allocator, 64, "emb1");
+    defer key_emb1.deinit(testing.allocator);
+    var key_emb2 = try core.HnswIndexKey.init(testing.allocator, 128, "emb2");
+    defer key_emb2.deinit(testing.allocator);
+    try testing.expect(db.hnsw_indexes.get(key_emb1) != null);
+    try testing.expect(db.hnsw_indexes.get(key_emb2) != null);
+    try testing.expect(db.hnsw_indexes.get(key_emb1).?.getInternalId(row_id) != null);
+    try testing.expect(db.hnsw_indexes.get(key_emb2).?.getInternalId(row_id) != null);
 
     std.debug.print("✓ Initial INSERT: both embeddings in HNSW\n", .{});
 
@@ -144,8 +153,12 @@ test "SQL: Multiple embedding columns per row - UPDATE" {
 
     // With our fix, UPDATE should handle both embeddings
     // Simulate what command_executor does:
-    const hnsw_64 = db.hnsw_indexes.get(64).?;
-    const hnsw_128 = db.hnsw_indexes.get(128).?;
+    var key_64 = try core.HnswIndexKey.init(testing.allocator, 64, "emb1");
+    defer key_64.deinit(testing.allocator);
+    var key_128 = try core.HnswIndexKey.init(testing.allocator, 128, "emb2");
+    defer key_128.deinit(testing.allocator);
+    const hnsw_64 = db.hnsw_indexes.get(key_64).?;
+    const hnsw_128 = db.hnsw_indexes.get(key_128).?;
 
     // Remove old, insert new for both
     try hnsw_64.removeNode(row_id);
@@ -216,8 +229,12 @@ test "SQL: Multiple rows with multiple embeddings" {
     }
 
     // Verify all 3 rows have entries in BOTH HNSW indexes
-    const hnsw_128 = db.hnsw_indexes.get(128).?;
-    const hnsw_64 = db.hnsw_indexes.get(64).?;
+    var key_text = try core.HnswIndexKey.init(testing.allocator, 128, "text_vec");
+    defer key_text.deinit(testing.allocator);
+    var key_meta = try core.HnswIndexKey.init(testing.allocator, 64, "meta_vec");
+    defer key_meta.deinit(testing.allocator);
+    const hnsw_128 = db.hnsw_indexes.get(key_text).?;
+    const hnsw_64 = db.hnsw_indexes.get(key_meta).?;
 
     for (inserted_row_ids) |row_id| {
         try testing.expect(hnsw_128.getInternalId(row_id) != null);
@@ -233,20 +250,16 @@ test "SQL: Same dimension embeddings in different columns" {
 
     try db.initVectorSearch(16, 200);
 
-    // Attempt to create table with TWO embedding columns of the SAME dimension
-    // This should FAIL due to schema validation preventing duplicate dimensions
-    // Rationale: HNSW indexes by (dimension, row_id), so multiple same-dimension
-    // embeddings in one row would overwrite each other, causing silent data loss
-    const sql = @import("sql.zig");
-    const result = db.execute("CREATE TABLE same_dim (id int, vec_a embedding(128), vec_b embedding(128))");
+    // Create table with TWO embedding columns of the SAME dimension
+    // This is now ALLOWED thanks to the composite (dimension, column_name) key!
+    // Each column gets its own HNSW index: (128, "vec_a") and (128, "vec_b")
+    var result = try db.execute("CREATE TABLE same_dim (id int, vec_a embedding(128), vec_b embedding(128))");
+    defer result.deinit();
 
-    // Verify that the validation correctly prevents this invalid schema
-    try testing.expectError(sql.SqlError.DuplicateEmbeddingDimension, result);
+    // Verify that the table WAS created successfully
+    try testing.expect(db.tables.get("same_dim") != null);
 
-    // Verify the table was NOT created
-    try testing.expect(db.tables.get("same_dim") == null);
-
-    std.debug.print("✓ Schema validation: correctly prevents duplicate embedding dimensions\n", .{});
+    std.debug.print("✓ Multiple same-dimension embeddings: now supported with composite keys!\n", .{});
 }
 
 // ============================================================================
@@ -344,8 +357,8 @@ test "SQL executeInsert path: INSERT regular columns, verify multi-embedding ind
     try row.set(testing.allocator, "image_emb", ColumnValue{ .embedding = img_emb });
 
     // Simulate executeInsert's embedding indexing logic
-    const hnsw_64 = try db.getOrCreateHnswForDim(64);
-    const hnsw_128 = try db.getOrCreateHnswForDim(128);
+    const hnsw_64 = try db.getOrCreateHnswForColumn(64, "desc_emb");
+    const hnsw_128 = try db.getOrCreateHnswForColumn(128, "image_emb");
     _ = try hnsw_64.insert(&desc_emb_data, row_id);
     _ = try hnsw_128.insert(&img_emb_data, row_id);
 
@@ -403,17 +416,21 @@ test "SQL executeInsert path: Multiple INSERTs with multiple embeddings each" {
         defer testing.allocator.free(vec_b);
         try row.set(testing.allocator, "vec_b", ColumnValue{ .embedding = vec_b });
 
-        // Index both embeddings (each in their own dimension-specific HNSW)
-        const hnsw_64 = try db.getOrCreateHnswForDim(64);
+        // Index both embeddings (each in their own (dimension, column)-specific HNSW)
+        const hnsw_64 = try db.getOrCreateHnswForColumn(64, "vec_a");
         _ = try hnsw_64.insert(&vec_a_data, row_id);
 
-        const hnsw_128 = try db.getOrCreateHnswForDim(128);
+        const hnsw_128 = try db.getOrCreateHnswForColumn(128, "vec_b");
         _ = try hnsw_128.insert(&vec_b_data, row_id);
     }
 
     // Verify all 3 rows are in BOTH HNSW indexes (64D and 128D)
-    const hnsw_64 = db.hnsw_indexes.get(64).?;
-    const hnsw_128 = db.hnsw_indexes.get(128).?;
+    var key_a = try core.HnswIndexKey.init(testing.allocator, 64, "vec_a");
+    defer key_a.deinit(testing.allocator);
+    var key_b = try core.HnswIndexKey.init(testing.allocator, 128, "vec_b");
+    defer key_b.deinit(testing.allocator);
+    const hnsw_64 = db.hnsw_indexes.get(key_a).?;
+    const hnsw_128 = db.hnsw_indexes.get(key_b).?;
     var row_id: u64 = 1;
     while (row_id <= 3) : (row_id += 1) {
         try testing.expect(hnsw_64.getInternalId(row_id) != null);

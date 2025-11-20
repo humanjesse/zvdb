@@ -3,6 +3,7 @@ const testing = std.testing;
 const Database = @import("database.zig").Database;
 const ColumnValue = @import("table.zig").ColumnValue;
 const sql = @import("sql.zig");
+const core = @import("database/core.zig");
 
 test "SQL: INSERT with array literal - basic 3D embedding" {
     var db = Database.init(testing.allocator);
@@ -247,7 +248,9 @@ test "SQL: INSERT array literal - HNSW indexing" {
     defer insert_result.deinit();
 
     // Verify HNSW index contains the row
-    const hnsw_128 = db.hnsw_indexes.get(128);
+    var key = try core.HnswIndexKey.init(testing.allocator, 128, "vec");
+    defer key.deinit(testing.allocator);
+    const hnsw_128 = db.hnsw_indexes.get(key);
     try testing.expect(hnsw_128 != null);
     const internal_id = hnsw_128.?.getInternalId(1);
     try testing.expect(internal_id != null);

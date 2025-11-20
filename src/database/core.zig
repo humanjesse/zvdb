@@ -172,7 +172,7 @@ pub const Database = struct {
     pub fn init(allocator: Allocator) Database {
         return Database{
             .tables = StringHashMap(*Table).init(allocator),
-            .hnsw_indexes = std.HashMap(HnswIndexKey, *HNSW(f32), HnswIndexKey, std.hash_map.default_max_load_percentage).init(allocator),
+            .hnsw_indexes = std.HashMap(HnswIndexKey, *HNSW(f32), HnswIndexKey, std.hash_map.default_max_load_percentage).initContext(allocator, .{ .dimension = 0, .column_name = "" }),
             .index_manager = IndexManager.init(allocator),
             .allocator = allocator,
             .data_dir = null,
@@ -236,7 +236,7 @@ pub const Database = struct {
     /// This allows multiple embedding columns with the same dimension
     pub fn getOrCreateHnswForColumn(self: *Database, dim: usize, column_name: []const u8) !*HNSW(f32) {
         // Create the composite key
-        const key = try HnswIndexKey.init(self.allocator, dim, column_name);
+        var key = try HnswIndexKey.init(self.allocator, dim, column_name);
         errdefer key.deinit(self.allocator);
 
         // Check if HNSW index for this (dimension, column) already exists

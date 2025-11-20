@@ -657,9 +657,9 @@ test "Persistence: Auto-save on deinit" {
         // deinit will trigger auto-save
     }
 
-    // Verify data was auto-saved
+    // Verify data was auto-saved (auto-save uses saveAllMvcc format)
     {
-        var db = try Database.loadAll(testing.allocator, test_dir);
+        var db = try Database.loadAllMvcc(testing.allocator, test_dir);
         defer db.deinit();
 
         try testing.expect(db.tables.count() == 1);
@@ -1733,7 +1733,7 @@ test "WAL Recovery: HNSW index rebuild after recovery" {
         const table = db.tables.get("docs").?;
         try testing.expectEqual(@as(usize, 3), table.count());
 
-        const hnsw = try db.getOrCreateHnswForDim(128);
+        const hnsw = try db.getOrCreateHnswForColumn(128, "vec");
         var row_it = table.version_chains.iterator();
         while (row_it.next()) |entry| {
             const row_id = entry.key_ptr.*;

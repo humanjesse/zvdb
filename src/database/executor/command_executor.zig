@@ -576,7 +576,7 @@ pub fn executeInsert(db: *Database, cmd: sql.InsertCmd) !QueryResult {
     // Additional rollback for HNSW if B-tree index update fails
     errdefer {
         for (embedding_infos.items) |info| {
-            const key = core.HnswIndexKey.init(db.allocator, info.dim, info.col_name) catch continue;
+            var key = core.HnswIndexKey.init(db.allocator, info.dim, info.col_name) catch continue;
             defer key.deinit(db.allocator);
             if (db.hnsw_indexes.get(key)) |h| {
                 h.removeNode(final_row_id) catch |err| {
@@ -898,10 +898,12 @@ pub fn executeUpdate(db: *Database, cmd: sql.UpdateCmd) !QueryResult {
         // Handle HNSW index updates BEFORE applying row updates (support multiple embeddings)
         for (embedding_updates.items) |update| {
             if (update.changed) {
-                // Remove old vector from its dimension-specific HNSW (if it existed)
+                // Remove old vector from its (dimension, column)-specific HNSW (if it existed)
                 if (update.old_backup) |old_emb| {
                     const old_dim = old_emb.len;
-                    if (db.hnsw_indexes.get(old_dim)) |h| {
+                    var old_key = try core.HnswIndexKey.init(db.allocator, old_dim, update.column_name);
+                    defer old_key.deinit(db.allocator);
+                    if (db.hnsw_indexes.get(old_key)) |h| {
                         h.removeNode(row_id) catch |err| {
                             std.debug.print("Error removing node from HNSW (column '{s}'): {}\n", .{ update.column_name, err });
                             return err;
@@ -909,15 +911,15 @@ pub fn executeUpdate(db: *Database, cmd: sql.UpdateCmd) !QueryResult {
                     }
                 }
 
-                // Insert new vector to its dimension-specific HNSW
+                // Insert new vector to its (dimension, column)-specific HNSW
                 const new_emb = update.new_value;
                 const new_dim = new_emb.len;
-                const h = try db.getOrCreateHnswForDim(new_dim);
+                const h = try db.getOrCreateHnswForColumn(new_dim, update.column_name);
                 _ = h.insert(new_emb, row_id) catch |err| {
                     // Rollback: Re-insert old embedding to restore HNSW state
                     if (update.old_backup) |old_clone| {
                         const old_dim = old_clone.len;
-                        const old_h = try db.getOrCreateHnswForDim(old_dim);
+                        const old_h = try db.getOrCreateHnswForColumn(old_dim, update.column_name);
                         _ = old_h.insert(old_clone, row_id) catch {
                             std.debug.print("CRITICAL: Failed to rollback HNSW state after insert failure (column '{s}')\n", .{update.column_name});
                         };
