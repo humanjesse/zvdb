@@ -7,7 +7,14 @@ const CommitLog = @import("../transaction.zig").CommitLog;
 const Allocator = std.mem.Allocator;
 
 /// Save all tables and HNSW index to the data directory (v2 format - no MVCC)
-/// For full MVCC recovery, use saveAllMvcc() instead
+///
+/// ⚠️ WARNING: This method only saves the newest row versions and does NOT preserve:
+///   - Transaction history (committed/aborted status)
+///   - Uncommitted or in-progress transaction data
+///   - MVCC version chains
+///
+/// For production use with full MVCC support, use saveAllMvcc() instead.
+/// This method is provided for backward compatibility and simple use cases.
 pub fn saveAll(db: *Database, dir_path: []const u8) !void {
     // Create directory if it doesn't exist
     std.fs.cwd().makePath(dir_path) catch |err| switch (err) {
@@ -31,16 +38,20 @@ pub fn saveAll(db: *Database, dir_path: []const u8) !void {
         try table.save(file_path);
     }
 
-    // Save all per-dimension HNSW indexes
+    // Save all per-(dimension,column) HNSW indexes
     var hnsw_it = db.hnsw_indexes.iterator();
     while (hnsw_it.next()) |entry| {
-        const dim = entry.key_ptr.*;
+        const key = entry.key_ptr.*;
         const h = entry.value_ptr.*;
+
+        // Encode column name for filesystem safety (replace / with _)
+        const safe_col_name = try std.mem.replaceOwned(u8, db.allocator, key.column_name, "/", "_");
+        defer db.allocator.free(safe_col_name);
 
         const hnsw_path = try std.fmt.allocPrint(
             db.allocator,
-            "{s}/vectors_{d}.hnsw",
-            .{ dir_path, dim },
+            "{s}/vectors_{d}_{s}.hnsw",
+            .{ dir_path, key.dimension, safe_col_name },
         );
         defer db.allocator.free(hnsw_path);
 
@@ -93,23 +104,56 @@ pub fn loadAll(allocator: Allocator, dir_path: []const u8) !Database {
             // Add to database
             try db.tables.put(table_name_key, table_ptr);
         } else if (std.mem.startsWith(u8, entry.name, "vectors_") and std.mem.endsWith(u8, entry.name, ".hnsw")) {
-            // Load per-dimension HNSW index
-            // Parse dimension from filename: vectors_{dim}.hnsw
+            // Load per-(dimension,column) HNSW index
+            // Parse from filename: vectors_{dim}_{column}.hnsw
             const prefix_len = "vectors_".len;
             const suffix_len = ".hnsw".len;
-            const dim_str = entry.name[prefix_len .. entry.name.len - suffix_len];
-            const dim = try std.fmt.parseInt(usize, dim_str, 10);
+            const middle_part = entry.name[prefix_len .. entry.name.len - suffix_len];
 
-            const file_path = try std.fmt.allocPrint(
-                allocator,
-                "{s}/{s}",
-                .{ dir_path, entry.name },
-            );
-            defer allocator.free(file_path);
+            // Find the first underscore to separate dimension from column name
+            if (std.mem.indexOf(u8, middle_part, "_")) |underscore_pos| {
+                const dim_str = middle_part[0..underscore_pos];
+                const col_name_encoded = middle_part[underscore_pos + 1 ..];
 
-            const hnsw = try allocator.create(HNSW(f32));
-            hnsw.* = try HNSW(f32).load(allocator, file_path);
-            try db.hnsw_indexes.put(dim, hnsw);
+                // Decode column name (replace _ with /)
+                const col_name = try std.mem.replaceOwned(u8, allocator, col_name_encoded, "_", "/");
+
+                const dim = try std.fmt.parseInt(usize, dim_str, 10);
+
+                const file_path = try std.fmt.allocPrint(
+                    allocator,
+                    "{s}/{s}",
+                    .{ dir_path, entry.name },
+                );
+                defer allocator.free(file_path);
+
+                const hnsw = try allocator.create(HNSW(f32));
+                hnsw.* = try HNSW(f32).load(allocator, file_path);
+
+                const key = core.HnswIndexKey{
+                    .dimension = dim,
+                    .column_name = col_name,  // Owned by the key
+                };
+                try db.hnsw_indexes.put(key, hnsw);
+            } else {
+                // Old format: vectors_{dim}.hnsw (backward compatibility)
+                const dim_str = middle_part;
+                const dim = try std.fmt.parseInt(usize, dim_str, 10);
+
+                const file_path = try std.fmt.allocPrint(
+                    allocator,
+                    "{s}/{s}",
+                    .{ dir_path, entry.name },
+                );
+                defer allocator.free(file_path);
+
+                const hnsw = try allocator.create(HNSW(f32));
+                hnsw.* = try HNSW(f32).load(allocator, file_path);
+
+                // Use "default" as column name for old format
+                const key = try core.HnswIndexKey.init(allocator, dim, "default");
+                try db.hnsw_indexes.put(key, hnsw);
+            }
         } else if (std.mem.eql(u8, entry.name, "vectors.hnsw")) {
             // Legacy: Load old single HNSW index as 768-dimensional for backward compatibility
             const file_path = try std.fmt.allocPrint(
@@ -121,7 +165,10 @@ pub fn loadAll(allocator: Allocator, dir_path: []const u8) !Database {
 
             const hnsw = try allocator.create(HNSW(f32));
             hnsw.* = try HNSW(f32).load(allocator, file_path);
-            try db.hnsw_indexes.put(768, hnsw);
+
+            // Use "default" as column name for legacy format
+            const key = try core.HnswIndexKey.init(allocator, 768, "default");
+            try db.hnsw_indexes.put(key, hnsw);
         }
     }
 
@@ -166,16 +213,20 @@ pub fn saveAllMvcc(db: *Database, dir_path: []const u8) !void {
         try table.saveMvcc(file_path, checkpoint_txid);
     }
 
-    // Step 3: Save all per-dimension HNSW indexes (unchanged from saveAll)
+    // Step 3: Save all per-(dimension,column) HNSW indexes
     var hnsw_it = db.hnsw_indexes.iterator();
     while (hnsw_it.next()) |entry| {
-        const dim = entry.key_ptr.*;
+        const key = entry.key_ptr.*;
         const h = entry.value_ptr.*;
+
+        // Encode column name for filesystem safety (replace / with _)
+        const safe_col_name = try std.mem.replaceOwned(u8, db.allocator, key.column_name, "/", "_");
+        defer db.allocator.free(safe_col_name);
 
         const hnsw_path = try std.fmt.allocPrint(
             db.allocator,
-            "{s}/vectors_{d}.hnsw",
-            .{ dir_path, dim },
+            "{s}/vectors_{d}_{s}.hnsw",
+            .{ dir_path, key.dimension, safe_col_name },
         );
         defer db.allocator.free(hnsw_path);
 
@@ -260,22 +311,55 @@ pub fn loadAllMvcc(allocator: Allocator, dir_path: []const u8) !Database {
             // Add to database
             try db.tables.put(table_name_key, table_ptr);
         } else if (std.mem.startsWith(u8, entry.name, "vectors_") and std.mem.endsWith(u8, entry.name, ".hnsw")) {
-            // Load per-dimension HNSW index (unchanged from loadAll)
+            // Load per-(dimension,column) HNSW index (same as loadAll)
             const prefix_len = "vectors_".len;
             const suffix_len = ".hnsw".len;
-            const dim_str = entry.name[prefix_len .. entry.name.len - suffix_len];
-            const dim = try std.fmt.parseInt(usize, dim_str, 10);
+            const middle_part = entry.name[prefix_len .. entry.name.len - suffix_len];
 
-            const file_path = try std.fmt.allocPrint(
-                allocator,
-                "{s}/{s}",
-                .{ dir_path, entry.name },
-            );
-            defer allocator.free(file_path);
+            // Find the first underscore to separate dimension from column name
+            if (std.mem.indexOf(u8, middle_part, "_")) |underscore_pos| {
+                const dim_str = middle_part[0..underscore_pos];
+                const col_name_encoded = middle_part[underscore_pos + 1 ..];
 
-            const hnsw = try allocator.create(HNSW(f32));
-            hnsw.* = try HNSW(f32).load(allocator, file_path);
-            try db.hnsw_indexes.put(dim, hnsw);
+                // Decode column name (replace _ with /)
+                const col_name = try std.mem.replaceOwned(u8, allocator, col_name_encoded, "_", "/");
+
+                const dim = try std.fmt.parseInt(usize, dim_str, 10);
+
+                const file_path = try std.fmt.allocPrint(
+                    allocator,
+                    "{s}/{s}",
+                    .{ dir_path, entry.name },
+                );
+                defer allocator.free(file_path);
+
+                const hnsw = try allocator.create(HNSW(f32));
+                hnsw.* = try HNSW(f32).load(allocator, file_path);
+
+                const key = core.HnswIndexKey{
+                    .dimension = dim,
+                    .column_name = col_name,  // Owned by the key
+                };
+                try db.hnsw_indexes.put(key, hnsw);
+            } else {
+                // Old format: vectors_{dim}.hnsw (backward compatibility)
+                const dim_str = middle_part;
+                const dim = try std.fmt.parseInt(usize, dim_str, 10);
+
+                const file_path = try std.fmt.allocPrint(
+                    allocator,
+                    "{s}/{s}",
+                    .{ dir_path, entry.name },
+                );
+                defer allocator.free(file_path);
+
+                const hnsw = try allocator.create(HNSW(f32));
+                hnsw.* = try HNSW(f32).load(allocator, file_path);
+
+                // Use "default" as column name for old format
+                const key = try core.HnswIndexKey.init(allocator, dim, "default");
+                try db.hnsw_indexes.put(key, hnsw);
+            }
         } else if (std.mem.eql(u8, entry.name, "vectors.hnsw")) {
             // Legacy: Load old single HNSW index as 768-dimensional
             const file_path = try std.fmt.allocPrint(
@@ -287,7 +371,10 @@ pub fn loadAllMvcc(allocator: Allocator, dir_path: []const u8) !Database {
 
             const hnsw = try allocator.create(HNSW(f32));
             hnsw.* = try HNSW(f32).load(allocator, file_path);
-            try db.hnsw_indexes.put(768, hnsw);
+
+            // Use "default" as column name for legacy format
+            const key = try core.HnswIndexKey.init(allocator, 768, "default");
+            try db.hnsw_indexes.put(key, hnsw);
         }
     }
 

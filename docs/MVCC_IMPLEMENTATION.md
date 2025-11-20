@@ -214,8 +214,141 @@ db.vacuum_config.enabled = false;
 
 **Not Provided**:
 - ❌ **Full Serializability**: Some anomalies possible with concurrent writes
-  - Example: Write skew (T1 reads X, T2 reads Y, T1 writes Y, T2 writes X)
-  - Can be added later with predicate locking or serialization graph testing
+
+### Snapshot Isolation vs. Serializability
+
+**Current Implementation**: Snapshot Isolation (SI)
+**Missing Feature**: Serializable Snapshot Isolation (SSI)
+
+zvdb currently implements **Snapshot Isolation**, which prevents many concurrency anomalies but does not guarantee full serializability. This means certain concurrent transaction patterns can produce results that wouldn't occur if transactions ran sequentially.
+
+#### Write Skew Anomaly (The Classic Example)
+
+The most common anomaly in Snapshot Isolation is **write skew**, where two transactions read overlapping data and make non-conflicting writes based on stale reads.
+
+**Example: Bank Account Constraint**
+```sql
+-- Constraint: sum(account1.balance + account2.balance) >= 0
+-- Initial state: account1 = $100, account2 = $100
+
+-- Transaction T1 (withdraw from account1):
+BEGIN;
+SELECT balance FROM accounts WHERE id IN (1, 2);  -- Sees: 100, 100
+-- T1 thinks: "100 + 100 = 200, I can withdraw $150 from account1"
+UPDATE accounts SET balance = -50 WHERE id = 1;   -- OK in isolation
+COMMIT;
+
+-- Transaction T2 (withdraw from account2, runs concurrently):
+BEGIN;
+SELECT balance FROM accounts WHERE id IN (1, 2);  -- Sees: 100, 100
+-- T2 thinks: "100 + 100 = 200, I can withdraw $150 from account2"
+UPDATE accounts SET balance = -50 WHERE id = 2;   -- OK in isolation
+COMMIT;
+
+-- Result: account1 = -50, account2 = -50 (CONSTRAINT VIOLATED!)
+```
+
+**Why SI Allows This**:
+- Each transaction sees a consistent snapshot
+- The writes are to *different* rows (no write-write conflict)
+- Conflict detection only catches updates to the *same* row
+- Neither transaction sees the other's changes until after commit
+
+**In True Serializable Isolation**: One transaction would be aborted
+
+#### Other Anomalies Not Prevented by SI
+
+**Read-Only Transaction Anomaly**:
+```sql
+-- T1: Transfer $50 from account1 to account2
+-- T2: Read-only audit (sees inconsistent state)
+
+-- Without proper ordering, T2 might see the debit but not the credit
+```
+
+**Phantom Reads in Predicate Queries** (already prevented by our implementation):
+- Our SI implementation actually handles this correctly
+- Phantom reads are prevented by reading from a consistent snapshot
+
+#### Workarounds for Write Skew
+
+Since full SSI is not yet implemented, here are practical workarounds:
+
+**1. SELECT FOR UPDATE (Manual Locking)**
+```sql
+-- Force a write-write conflict by updating a dummy column
+BEGIN;
+SELECT * FROM accounts WHERE id IN (1, 2) FOR UPDATE;  -- Not yet implemented
+UPDATE accounts SET last_checked = now() WHERE id IN (1, 2);
+-- Now check constraint and proceed...
+COMMIT;
+```
+
+**2. Application-Level Locking**
+```zig
+// Use a mutex or semaphore at the application level
+// to serialize transactions that might have write skew
+const constraint_mutex = std.Thread.Mutex{};
+
+constraint_mutex.lock();
+defer constraint_mutex.unlock();
+_ = try db.execute("BEGIN");
+// ... check constraint and update ...
+_ = try db.execute("COMMIT");
+```
+
+**3. Materialize Conflicts**
+```sql
+-- Add a "sum" row that both transactions must update
+-- This creates a write-write conflict that SI can detect
+UPDATE account_totals SET total = total - 150 WHERE account_group = 1;
+```
+
+**4. Retry on Constraint Violation**
+```zig
+// Check constraint after commit, retry if violated
+while (true) {
+    _ = try db.execute("BEGIN");
+    // ... do updates ...
+    _ = try db.execute("COMMIT");
+
+    // Check constraint
+    const sum = try checkAccountSum();
+    if (sum >= 0) break;  // Success
+
+    // Constraint violated, rollback and retry
+    _ = try db.execute("ROLLBACK");
+    std.time.sleep(std.time.ns_per_ms * 10);  // Backoff
+}
+```
+
+#### When You Need Full Serializability
+
+Most applications work fine with Snapshot Isolation. You **do** need SSI if:
+- Complex multi-row constraints that must be enforced atomically
+- Financial applications with strict consistency requirements
+- Inventory systems with allocation constraints
+- Any scenario where "constraint violations visible only after commit" is unacceptable
+
+#### Future Enhancement: Serializable Snapshot Isolation
+
+To add full serializability, we would need to implement SSI (Serializable Snapshot Isolation):
+
+**Approach 1: Predicate Locking**
+- Track read predicates (WHERE clauses) per transaction
+- Detect dangerous structures before commit
+- Abort transactions that would violate serializability
+
+**Approach 2: Serialization Graph Testing**
+- Build rw-antidependency graph between transactions
+- Detect cycles that indicate non-serializable execution
+- Abort one transaction in each cycle
+
+**Implementation Complexity**: HIGH (~2-3 days)
+**Performance Impact**: ~5-15% overhead for conflict tracking
+**Benefit**: True ACID serializability
+
+**Status**: Deferred until there's a concrete use case requiring it. Snapshot Isolation is sufficient for 95% of database workloads
 
 **How It Works**:
 1. Transaction T1 begins → Snapshot captures active transactions
