@@ -39,6 +39,7 @@ const TxRow = Transaction.Row;
 const Snapshot = Transaction.Snapshot;
 const CommitLog = Transaction.CommitLog;
 const Allocator = std.mem.Allocator;
+const schema_serializer = @import("../../schema_wal_serializer.zig");
 
 // Forward declaration for expression evaluation (still in main executor)
 // This will be moved to expr_evaluator once that module is fully extracted
@@ -157,6 +158,27 @@ pub fn executeCreateTable(db: *Database, cmd: sql.CreateTableCmd) !QueryResult {
     const owned_name = try db.allocator.dupe(u8, cmd.table_name);
     try db.tables.put(owned_name, table_ptr);
 
+    // Phase 3: Log CREATE TABLE to WAL for crash safety
+    if (db.wal) |w| {
+        // Serialize the CREATE TABLE command
+        const schema_data = try schema_serializer.serializeCreateTable(db.allocator, cmd);
+        defer db.allocator.free(schema_data);
+
+        // Write to WAL
+        _ = try w.writeRecord(.{
+            .record_type = .create_table,
+            .tx_id = 0, // Schema operations are typically outside transactions
+            .lsn = 0, // Will be assigned by writeRecord
+            .table_name = cmd.table_name,
+            .row_id = 0, // Not applicable for schema operations
+            .data = schema_data,
+            .checksum = 0, // Will be calculated during serialization
+        });
+
+        // Flush to ensure durability (schema changes are critical)
+        try w.flush();
+    }
+
     var result = QueryResult.init(db.allocator);
     try result.addColumn("status");
     var row = ArrayList(ColumnValue).init(db.allocator);
@@ -181,6 +203,24 @@ pub fn executeCreateIndex(db: *Database, cmd: sql.CreateIndexCmd) !QueryResult {
         table,
     );
 
+    // Phase 3: Log CREATE INDEX to WAL for crash safety
+    if (db.wal) |w| {
+        const schema_data = try schema_serializer.serializeCreateIndex(db.allocator, cmd);
+        defer db.allocator.free(schema_data);
+
+        _ = try w.writeRecord(.{
+            .record_type = .create_index,
+            .tx_id = 0,
+            .lsn = 0,
+            .table_name = cmd.table_name,
+            .row_id = 0,
+            .data = schema_data,
+            .checksum = 0,
+        });
+
+        try w.flush();
+    }
+
     var result = QueryResult.init(db.allocator);
     try result.addColumn("status");
     var row = ArrayList(ColumnValue).init(db.allocator);
@@ -200,6 +240,24 @@ pub fn executeCreateIndex(db: *Database, cmd: sql.CreateIndexCmd) !QueryResult {
 pub fn executeDropIndex(db: *Database, cmd: sql.DropIndexCmd) !QueryResult {
     // Drop the index
     try db.index_manager.dropIndex(cmd.index_name);
+
+    // Phase 3: Log DROP INDEX to WAL for crash safety
+    if (db.wal) |w| {
+        const schema_data = try schema_serializer.serializeDropIndex(db.allocator, cmd);
+        defer db.allocator.free(schema_data);
+
+        _ = try w.writeRecord(.{
+            .record_type = .drop_index,
+            .tx_id = 0,
+            .lsn = 0,
+            .table_name = "", // DROP INDEX doesn't reference a specific table
+            .row_id = 0,
+            .data = schema_data,
+            .checksum = 0,
+        });
+
+        try w.flush();
+    }
 
     var result = QueryResult.init(db.allocator);
     try result.addColumn("status");
@@ -224,6 +282,24 @@ pub fn executeDropTable(db: *Database, cmd: sql.DropTableCmd) !QueryResult {
     if (table_entry) |entry| {
         const table_name_key = entry.key;
         const table_ptr = entry.value;
+
+        // Phase 3: Log DROP TABLE to WAL for crash safety (before actual deletion)
+        if (db.wal) |w| {
+            const schema_data = try schema_serializer.serializeDropTable(db.allocator, cmd);
+            defer db.allocator.free(schema_data);
+
+            _ = try w.writeRecord(.{
+                .record_type = .drop_table,
+                .tx_id = 0,
+                .lsn = 0,
+                .table_name = cmd.table_name,
+                .row_id = 0,
+                .data = schema_data,
+                .checksum = 0,
+            });
+
+            try w.flush();
+        }
 
         // 1. Drop all indexes associated with this table
         var indexes_to_drop = ArrayList([]const u8).init(db.allocator);
@@ -489,6 +565,34 @@ pub fn executeAlterTable(db: *Database, cmd: sql.AlterTableCmd) !QueryResult {
             );
             try row.append(ColumnValue{ .text = msg });
         },
+    }
+
+    // Phase 3: Log ALTER TABLE to WAL for crash safety
+    if (db.wal) |w| {
+        // Serialize the ALTER TABLE command
+        const schema_data = try schema_serializer.serializeAlterTable(db.allocator, cmd);
+        defer db.allocator.free(schema_data);
+
+        // Determine the specific record type based on operation
+        const record_type = switch (cmd.operation) {
+            .add_column => WalRecordType.alter_table_add_column,
+            .drop_column => WalRecordType.alter_table_drop_column,
+            .rename_column => WalRecordType.alter_table_rename_column,
+        };
+
+        // Write to WAL
+        _ = try w.writeRecord(.{
+            .record_type = record_type,
+            .tx_id = 0, // Schema operations are typically outside transactions
+            .lsn = 0, // Will be assigned by writeRecord
+            .table_name = cmd.table_name,
+            .row_id = 0, // Not applicable for schema operations
+            .data = schema_data,
+            .checksum = 0, // Will be calculated during serialization
+        });
+
+        // Flush to ensure durability (schema changes are critical)
+        try w.flush();
     }
 
     try result.addRow(row);

@@ -445,7 +445,8 @@ test "IndexManager: automatic index updates on insert" {
     const row_id = try table.insert(values);
 
     // Update index
-    // TODO Phase 3: Pass snapshot for MVCC visibility
+    // Note: MVCC visibility is handled by SELECT executor when filtering results
+    // Index stores all row IDs; filtering happens in table.get(row_id, snapshot, clog)
     const row = table.get(row_id, null, null).?;
     try mgr.onInsert("users", row_id, row);
 
@@ -476,10 +477,11 @@ test "IndexManager: automatic index updates on delete" {
     try mgr.createIndex("idx_users_id", "users", "id", &table);
 
     // Delete row and update index
-    // TODO Phase 3: Pass snapshot for MVCC visibility
+    // Note: MVCC visibility is handled by SELECT executor when filtering results
+    // Index stores all row IDs; filtering happens in table.get(row_id, snapshot, clog)
     const row = table.get(row_id, null, null).?;
     try mgr.onDelete("users", row_id, row);
-    // TODO Phase 3: Pass transaction ID
+    // Transaction ID 0 is used for non-transactional operations
     try table.delete(row_id, 0, null);
 
     // Query index - should be empty

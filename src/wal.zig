@@ -45,6 +45,28 @@ pub const WalRecordType = enum(u8) {
     /// Checkpoint marker - all data before this point is flushed to disk
     checkpoint = 0x20,
 
+    /// DDL Operations (Schema Changes) - Phase 3
+    /// CREATE TABLE - create new table with columns
+    create_table = 0x30,
+
+    /// DROP TABLE - remove table and all its data
+    drop_table = 0x31,
+
+    /// ALTER TABLE ADD COLUMN - add new column to existing table
+    alter_table_add_column = 0x32,
+
+    /// ALTER TABLE DROP COLUMN - remove column from table
+    alter_table_drop_column = 0x33,
+
+    /// ALTER TABLE RENAME COLUMN - rename a column
+    alter_table_rename_column = 0x34,
+
+    /// CREATE INDEX - create B-tree index on table column
+    create_index = 0x40,
+
+    /// DROP INDEX - remove index
+    drop_index = 0x41,
+
     pub fn fromU8(value: u8) !WalRecordType {
         return std.meta.intToEnum(WalRecordType, value) catch error.InvalidRecordType;
     }

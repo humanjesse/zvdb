@@ -9,6 +9,8 @@ const WalRecordType = wal.WalRecordType;
 const Row = @import("../table.zig").Row;
 const Allocator = std.mem.Allocator;
 const ArrayList = std.array_list.Managed;
+const schema_serializer = @import("../schema_wal_serializer.zig");
+const command_executor = @import("executor/command_executor.zig");
 
 // Transaction state for recovery
 const TransactionState = enum {
@@ -330,6 +332,30 @@ pub fn recoverFromWal(db: *Database, wal_dir: []const u8) !usize {
                         try replayUpdate(db, &record);
                         applied_operations += 1;
                     },
+                    // Phase 3: Schema operations
+                    .create_table => {
+                        try replayCreateTable(db, &record);
+                        applied_operations += 1;
+                    },
+                    .drop_table => {
+                        try replayDropTable(db, &record);
+                        applied_operations += 1;
+                    },
+                    .alter_table_add_column,
+                    .alter_table_drop_column,
+                    .alter_table_rename_column,
+                    => {
+                        try replayAlterTable(db, &record);
+                        applied_operations += 1;
+                    },
+                    .create_index => {
+                        try replayCreateIndex(db, &record);
+                        applied_operations += 1;
+                    },
+                    .drop_index => {
+                        try replayDropIndex(db, &record);
+                        applied_operations += 1;
+                    },
                     .commit_tx => {
                         recovered_count += 1;
                     },
@@ -474,4 +500,103 @@ fn replayUpdate(db: *Database, record: *const WalRecord) !void {
         if (current >= desired_next) break;
         _ = table.next_id.cmpxchgWeak(current, desired_next, .monotonic, .monotonic) orelse break;
     }
+}
+
+// ============================================================================
+// Phase 3: Schema Operation Replay Functions
+// ============================================================================
+
+/// Replay a CREATE TABLE operation from WAL
+fn replayCreateTable(db: *Database, record: *const WalRecord) !void {
+    // Deserialize CREATE TABLE command
+    const cmd = try schema_serializer.deserializeCreateTable(db.allocator, record.data);
+    defer schema_serializer.freeCreateTableCmd(db.allocator, cmd);
+
+    // Check if table already exists (idempotency)
+    if (db.tables.contains(cmd.table_name)) {
+        std.debug.print("Table '{s}' already exists during recovery, skipping CREATE TABLE\n", .{cmd.table_name});
+        return;
+    }
+
+    // Execute CREATE TABLE (suppress error output during recovery)
+    _ = command_executor.executeCreateTable(db, cmd) catch |err| {
+        std.debug.print("Warning: Failed to replay CREATE TABLE '{s}': {}\n", .{ cmd.table_name, err });
+        return err;
+    };
+}
+
+/// Replay a DROP TABLE operation from WAL
+fn replayDropTable(db: *Database, record: *const WalRecord) !void {
+    // Deserialize DROP TABLE command
+    const cmd = try schema_serializer.deserializeDropTable(db.allocator, record.data);
+    defer schema_serializer.freeDropTableCmd(db.allocator, cmd);
+
+    // Check if table exists (idempotency)
+    if (!db.tables.contains(cmd.table_name)) {
+        std.debug.print("Table '{s}' doesn't exist during recovery, skipping DROP TABLE\n", .{cmd.table_name});
+        return;
+    }
+
+    // Execute DROP TABLE
+    _ = command_executor.executeDropTable(db, cmd) catch |err| {
+        std.debug.print("Warning: Failed to replay DROP TABLE '{s}': {}\n", .{ cmd.table_name, err });
+        return err;
+    };
+}
+
+/// Replay an ALTER TABLE operation from WAL
+fn replayAlterTable(db: *Database, record: *const WalRecord) !void {
+    // Deserialize ALTER TABLE command
+    const cmd = try schema_serializer.deserializeAlterTable(db.allocator, record.data);
+    defer schema_serializer.freeAlterTableCmd(db.allocator, cmd);
+
+    // Check if table exists
+    if (!db.tables.contains(cmd.table_name)) {
+        std.debug.print("Table '{s}' doesn't exist during recovery, skipping ALTER TABLE\n", .{cmd.table_name});
+        return;
+    }
+
+    // Execute ALTER TABLE
+    _ = command_executor.executeAlterTable(db, cmd) catch |err| {
+        std.debug.print("Warning: Failed to replay ALTER TABLE '{s}': {}\n", .{ cmd.table_name, err });
+        return err;
+    };
+}
+
+/// Replay a CREATE INDEX operation from WAL
+fn replayCreateIndex(db: *Database, record: *const WalRecord) !void {
+    // Deserialize CREATE INDEX command
+    const cmd = try schema_serializer.deserializeCreateIndex(db.allocator, record.data);
+    defer schema_serializer.freeCreateIndexCmd(db.allocator, cmd);
+
+    // Check if index already exists (idempotency)
+    if (db.index_manager.getIndex(cmd.index_name) != null) {
+        std.debug.print("Index '{s}' already exists during recovery, skipping CREATE INDEX\n", .{cmd.index_name});
+        return;
+    }
+
+    // Execute CREATE INDEX
+    _ = command_executor.executeCreateIndex(db, cmd) catch |err| {
+        std.debug.print("Warning: Failed to replay CREATE INDEX '{s}': {}\n", .{ cmd.index_name, err });
+        return err;
+    };
+}
+
+/// Replay a DROP INDEX operation from WAL
+fn replayDropIndex(db: *Database, record: *const WalRecord) !void {
+    // Deserialize DROP INDEX command
+    const cmd = try schema_serializer.deserializeDropIndex(db.allocator, record.data);
+    defer schema_serializer.freeDropIndexCmd(db.allocator, cmd);
+
+    // Check if index exists (idempotency)
+    if (db.index_manager.getIndex(cmd.index_name) == null) {
+        std.debug.print("Index '{s}' doesn't exist during recovery, skipping DROP INDEX\n", .{cmd.index_name});
+        return;
+    }
+
+    // Execute DROP INDEX
+    _ = command_executor.executeDropIndex(db, cmd) catch |err| {
+        std.debug.print("Warning: Failed to replay DROP INDEX '{s}': {}\n", .{ cmd.index_name, err });
+        return err;
+    };
 }
