@@ -50,6 +50,13 @@ test "DROP TABLE: IF EXISTS when table doesn't exist" {
     defer drop_result.deinit();
 
     try testing.expect(db.tables.count() == 0);
+
+    // NOTE: Current implementation returns "Table 'X' dropped" even when table
+    // doesn't exist with IF EXISTS. This is arguably misleading - ideally it should
+    // return "Table 'X' does not exist (skipped)" or similar.
+    // See: src/database/executor/command_executor.zig:320-336
+    // TODO: Consider improving the message to distinguish between "actually dropped"
+    // vs "didn't exist but IF EXISTS was used"
     try testing.expectEqualStrings("Table 'nonexistent' dropped", drop_result.rows.items[0].items[0].text);
 }
 

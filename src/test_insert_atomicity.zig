@@ -1,20 +1,31 @@
 // ============================================================================
-// Bug Fix #6: INSERT Atomicity Tests
+// Bug Fix #6: INSERT Atomicity Tests - HAPPY PATH ONLY
 // ============================================================================
 //
-// These tests verify that the INSERT operation maintains atomicity between
-// table and index operations. When index updates fail, the table insert
-// must be rolled back to prevent inconsistency.
+// IMPORTANT: These tests ONLY verify the happy path where INSERT operations
+// succeed. They DO NOT test atomicity failure scenarios or rollback behavior.
 //
-// Test Coverage:
+// What these tests verify:
 // 1. Successful INSERT maintains table-index consistency
-// 2. B-tree index presence after INSERT
-// 3. HNSW index presence after INSERT
-// 4. Multiple indexes are updated atomically
+// 2. B-tree index is updated after successful INSERT
+// 3. HNSW index is updated after successful INSERT
+// 4. Multiple indexes are updated when INSERT succeeds
+//
+// WHAT IS NOT TESTED (Critical Limitations):
+// - Rollback behavior when index updates fail
+// - Table cleanup when HNSW insert fails
+// - Index cleanup when subsequent B-tree updates fail
+// - Partial failure scenarios
 //
 // Note: Direct failure injection tests are difficult without mocking.
 // The rollback logic uses errdefer to automatically clean up on any error
-// from HNSW or B-tree index updates.
+// from HNSW or B-tree index updates, but this behavior is NOT verified by
+// these tests.
+//
+// TODO: Add failure injection tests or integration tests that verify:
+//   1. Failed HNSW insert rolls back table insert
+//   2. Failed B-tree update rolls back both table and HNSW
+//   3. No partial state remains after any failure
 //
 // ============================================================================
 
@@ -26,7 +37,7 @@ const Table = @import("table.zig").Table;
 const ColumnValue = @import("table.zig").ColumnValue;
 
 // Test that successful INSERT maintains consistency between table and B-tree indexes
-test "INSERT atomicity: successful insert updates both table and B-tree index" {
+test "INSERT atomicity (happy path): successful insert updates both table and B-tree index" {
     const allocator = testing.allocator;
 
     // Create database
@@ -76,7 +87,7 @@ test "INSERT atomicity: successful insert updates both table and B-tree index" {
 }
 
 // Test that successful INSERT with embedding maintains consistency with HNSW index
-test "INSERT atomicity: successful insert updates both table and HNSW index" {
+test "INSERT atomicity (happy path): successful insert updates both table and HNSW index" {
     const allocator = testing.allocator;
 
     // Create database
@@ -145,7 +156,7 @@ test "INSERT atomicity: successful insert updates both table and HNSW index" {
 }
 
 // Test that INSERT updates multiple B-tree indexes atomically
-test "INSERT atomicity: multiple B-tree indexes updated together" {
+test "INSERT atomicity (happy path): multiple B-tree indexes updated together" {
     const allocator = testing.allocator;
 
     // Create database
@@ -189,7 +200,7 @@ test "INSERT atomicity: multiple B-tree indexes updated together" {
 }
 
 // Test that rollback logic doesn't interfere with normal operation
-test "INSERT atomicity: rollback mechanism doesn't affect successful inserts" {
+test "INSERT atomicity (happy path): rollback mechanism doesn't affect successful inserts" {
     const allocator = testing.allocator;
 
     // Create database
@@ -243,7 +254,7 @@ test "INSERT atomicity: rollback mechanism doesn't affect successful inserts" {
 }
 
 // Test that INSERT maintains atomicity with both HNSW and B-tree indexes
-test "INSERT atomicity: HNSW and B-tree indexes updated together" {
+test "INSERT atomicity (happy path): HNSW and B-tree indexes updated together" {
     const allocator = testing.allocator;
 
     // Create database
