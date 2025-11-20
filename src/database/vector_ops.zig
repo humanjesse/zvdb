@@ -35,7 +35,7 @@ pub fn rebuildHnswFromTables(db: *Database) !usize {
     var hnsw_it = db.hnsw_indexes.iterator();
     while (hnsw_it.next()) |entry| {
         var key = entry.key_ptr.*;
-        key.deinit(db.allocator);  // Free column_name
+        key.deinit(db.allocator); // Free column_name
         entry.value_ptr.*.deinit();
         db.allocator.destroy(entry.value_ptr.*);
     }

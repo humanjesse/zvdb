@@ -132,7 +132,7 @@ pub fn loadAll(allocator: Allocator, dir_path: []const u8) !Database {
 
                 const key = core.HnswIndexKey{
                     .dimension = dim,
-                    .column_name = col_name,  // Owned by the key
+                    .column_name = col_name, // Owned by the key
                 };
                 try db.hnsw_indexes.put(key, hnsw);
             } else {
@@ -338,7 +338,7 @@ pub fn loadAllMvcc(allocator: Allocator, dir_path: []const u8) !Database {
 
                 const key = core.HnswIndexKey{
                     .dimension = dim,
-                    .column_name = col_name,  // Owned by the key
+                    .column_name = col_name, // Owned by the key
                 };
                 try db.hnsw_indexes.put(key, hnsw);
             } else {

@@ -21,7 +21,7 @@ const CommitLog = @import("../transaction.zig").CommitLog;
 /// Example: title_vec embedding(128) and content_vec embedding(128) in one table
 pub const HnswIndexKey = struct {
     dimension: usize,
-    column_name: []const u8,  // Owned string
+    column_name: []const u8, // Owned string
 
     pub fn init(allocator: Allocator, dimension: usize, column_name: []const u8) !HnswIndexKey {
         const owned_name = try allocator.dupe(u8, column_name);
@@ -218,7 +218,7 @@ pub const Database = struct {
         var hnsw_it = self.hnsw_indexes.iterator();
         while (hnsw_it.next()) |entry| {
             var key = entry.key_ptr.*;
-            key.deinit(self.allocator);  // Free column_name
+            key.deinit(self.allocator); // Free column_name
             entry.value_ptr.*.deinit();
             self.allocator.destroy(entry.value_ptr.*);
         }
