@@ -8,8 +8,8 @@ const StringHashMap = std.StringHashMap;
 // Index MVCC Tests - Verify indexes respect transaction isolation
 // ============================================================================
 
-/// Test that index queries respect MVCC snapshot isolation
-/// TX1 inserts a row, TX2 (started before TX1 commits) should NOT see it via index
+// Test that index queries respect MVCC snapshot isolation
+// TX1 inserts a row, TX2 (started before TX1 commits) should NOT see it via index
 test "Index MVCC: query respects snapshot isolation" {
     const allocator = testing.allocator;
     var db = Database.init(allocator);
@@ -56,7 +56,7 @@ test "Index MVCC: query respects snapshot isolation" {
     _ = try db.execute("COMMIT");
 }
 
-/// Test that index range scans filter out rows from aborted transactions
+// Test that index range scans filter out rows from aborted transactions
 test "Index MVCC: range scan filters aborted transaction rows" {
     const allocator = testing.allocator;
     var db = Database.init(allocator);
@@ -99,7 +99,7 @@ test "Index MVCC: range scan filters aborted transaction rows" {
     _ = try db.execute("COMMIT");
 }
 
-/// Test that concurrent transactions see correct data via indexes
+// Test that concurrent transactions see correct data via indexes
 test "Index MVCC: concurrent transactions with different snapshots" {
     const allocator = testing.allocator;
     var db = Database.init(allocator);
@@ -148,7 +148,7 @@ test "Index MVCC: concurrent transactions with different snapshots" {
     _ = try db.execute("COMMIT");
 }
 
-/// Test that deleted rows are filtered correctly in index queries
+// Test that deleted rows are filtered correctly in index queries
 test "Index MVCC: deleted rows filtered in index queries" {
     const allocator = testing.allocator;
     var db = Database.init(allocator);
@@ -202,7 +202,7 @@ test "Index MVCC: deleted rows filtered in index queries" {
     _ = try db.execute("COMMIT");
 }
 
-/// Test that updated rows are handled correctly in index queries
+// Test that updated rows are handled correctly in index queries
 test "Index MVCC: updated rows filtered correctly" {
     const allocator = testing.allocator;
     var db = Database.init(allocator);
