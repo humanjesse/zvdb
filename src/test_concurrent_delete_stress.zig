@@ -121,8 +121,8 @@ test "Concurrent Delete Stress Test: 100 threads deleting same row" {
 
     for (contexts) |ctx| {
         const result = ctx.result orelse {
-            try testing.expect(false); // Should never be null
-            continue;
+            std.debug.print("ERROR: Thread result is unexpectedly null\n", .{});
+            return error.ThreadResultNull;
         };
 
         switch (result) {
@@ -145,8 +145,8 @@ test "Concurrent Delete Stress Test: 100 threads deleting same row" {
 
     // 4. The row should be marked as deleted (xmax != 0)
     const chain_head = table.version_chains.get(1) orelse {
-        try testing.expect(false); // Row should still exist
-        return;
+        std.debug.print("ERROR: Row 1 should still exist in version_chains after delete\n", .{});
+        return error.RowNotFoundInVersionChains;
     };
     try testing.expect(chain_head.xmax != 0);
 }

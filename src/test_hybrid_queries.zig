@@ -69,7 +69,8 @@ test "SQL: Hybrid query - SIMILARITY with simple WHERE" {
             for (result.columns.items, 0..) |col, i| {
                 if (std.mem.eql(u8, col, "category")) break :blk i;
             }
-            unreachable;
+            std.debug.print("ERROR: 'category' column not found in result columns\n", .{});
+            return error.CategoryColumnNotFound;
         };
         const category = row.items[category_idx].text;
         try testing.expect(std.mem.eql(u8, category, "tech"));
@@ -78,7 +79,8 @@ test "SQL: Hybrid query - SIMILARITY with simple WHERE" {
             for (result.columns.items, 0..) |col, i| {
                 if (std.mem.eql(u8, col, "id")) break :blk i;
             }
-            unreachable;
+            std.debug.print("ERROR: 'id' column not found in result columns\n", .{});
+            return error.IdColumnNotFound;
         };
         const id = row.items[id_idx].int;
         std.debug.print("  Row {}: category='{s}', id={}\n", .{ id, category, id });

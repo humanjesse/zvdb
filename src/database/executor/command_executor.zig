@@ -257,6 +257,7 @@ pub fn executeDropIndex(db: *Database, cmd: sql.DropIndexCmd) !QueryResult {
 pub fn executeDropTable(db: *Database, cmd: sql.DropTableCmd) !QueryResult {
     // Check if table exists
     const table_entry = db.tables.fetchRemove(cmd.table_name);
+    const table_existed = table_entry != null;
 
     if (table_entry) |entry| {
         const table_name_key = entry.key;
@@ -325,11 +326,18 @@ pub fn executeDropTable(db: *Database, cmd: sql.DropTableCmd) !QueryResult {
     var result = QueryResult.init(db.allocator);
     try result.addColumn("status");
     var row = ArrayList(ColumnValue).init(db.allocator);
-    const msg = try std.fmt.allocPrint(
-        db.allocator,
-        "Table '{s}' dropped",
-        .{cmd.table_name},
-    );
+    const msg = if (table_existed)
+        try std.fmt.allocPrint(
+            db.allocator,
+            "Table '{s}' dropped",
+            .{cmd.table_name},
+        )
+    else
+        try std.fmt.allocPrint(
+            db.allocator,
+            "Table '{s}' does not exist (skipped)",
+            .{cmd.table_name},
+        );
     try row.append(ColumnValue{ .text = msg });
     try result.addRow(row);
 
