@@ -98,7 +98,7 @@ test "MVCC: transaction can see its own updates" {
     }
 }
 
-test "MVCC: concurrent transactions are isolated (snapshot isolation)" {
+test "MVCC: sequential transactions see committed changes" {
     const allocator = testing.allocator;
     var db = Database.init(allocator);
     defer db.deinit();
@@ -113,7 +113,7 @@ test "MVCC: concurrent transactions are isolated (snapshot isolation)" {
         defer result.deinit();
     }
 
-    // Transaction 1: Begin and read
+    // Transaction 1: Begin, read, and commit
     {
         var result = try db.execute("BEGIN");
         defer result.deinit();
@@ -123,13 +123,12 @@ test "MVCC: concurrent transactions are isolated (snapshot isolation)" {
     defer result1.deinit();
     try testing.expectEqual(@as(i64, 1000), result1.rows.items[0].items[0].int);
 
-    // Commit T1 to free up the transaction slot
     {
         var result = try db.execute("COMMIT");
         defer result.deinit();
     }
 
-    // Transaction 2: Begin, update, and commit (different transaction)
+    // Transaction 2: Begin, update, and commit (runs after T1 completes)
     {
         var result = try db.execute("BEGIN");
         defer result.deinit();
@@ -148,9 +147,11 @@ test "MVCC: concurrent transactions are isolated (snapshot isolation)" {
     defer result3.deinit();
     try testing.expectEqual(@as(i64, 2000), result3.rows.items[0].items[0].int);
 
-    // Note: We can't easily test that T1 would still see 1000 after T2 commits
-    // because T1 has already committed. In a real system, T1 would maintain
-    // its snapshot throughout its lifetime and continue seeing 1000.
+    // NOTE: This test verifies sequential transaction behavior, not true snapshot
+    // isolation. A proper snapshot isolation test would require T1 to remain
+    // active while T2 commits, then verify T1 still sees the old value (1000).
+    // TODO: Add true concurrent snapshot isolation test when multi-transaction
+    // support within a single Database instance is implemented.
 }
 
 test "MVCC: rolled back transaction is invisible to others" {
@@ -288,7 +289,7 @@ test "MVCC: write-write conflict on DELETE is detected" {
 // Dirty Read Prevention Tests
 // ============================================================================
 
-test "MVCC: no dirty reads (can't see uncommitted changes)" {
+test "MVCC: transaction sees committed changes after commit" {
     const allocator = testing.allocator;
     var db = Database.init(allocator);
     defer db.deinit();
@@ -303,7 +304,7 @@ test "MVCC: no dirty reads (can't see uncommitted changes)" {
         defer result.deinit();
     }
 
-    // Transaction 1: Begin and update (but don't commit)
+    // Transaction 1: Begin, update, and commit
     {
         var result = try db.execute("BEGIN");
         defer result.deinit();
@@ -312,22 +313,21 @@ test "MVCC: no dirty reads (can't see uncommitted changes)" {
         var result = try db.execute("UPDATE accounts SET balance = 2000 WHERE id = 1");
         defer result.deinit();
     }
-
-    // Commit T1 temporarily to allow T2 to start
-    // (In real implementation, multiple concurrent transactions would be supported)
     {
         var result = try db.execute("COMMIT");
         defer result.deinit();
     }
 
-    // Transaction 2: Should not see T1's uncommitted changes
-    // Note: Since we had to commit T1 above, this test is limited
-    // In a full concurrent implementation, T2 would start while T1 is still active
-
-    // For now, T2 sees committed changes (which is correct after commit)
+    // New query should see committed changes
     var result = try db.execute("SELECT balance FROM accounts WHERE id = 1");
     defer result.deinit();
     try testing.expectEqual(@as(i64, 2000), result.rows.items[0].items[0].int);
+
+    // NOTE: This test verifies committed changes are visible. A proper dirty read
+    // prevention test would require starting T2 while T1 has uncommitted changes,
+    // then verifying T2 cannot see those uncommitted changes.
+    // TODO: Add true dirty read prevention test when multi-transaction support
+    // within a single Database instance is implemented.
 }
 
 // ============================================================================

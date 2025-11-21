@@ -263,7 +263,7 @@ fn emitNestedLoopJoinRow(
         // Add all columns from base table
         for (base_table.columns.items) |col| {
             const val = if (base_row) |br|
-                br.get(col.name) orelse ColumnValue.null_value
+                column_matching.resolveColumnValue(col.name, br.values) orelse ColumnValue.null_value
             else
                 ColumnValue.null_value;
             try result_row.append(try val.clone(allocator));
@@ -271,7 +271,7 @@ fn emitNestedLoopJoinRow(
         // Add all columns from join table
         for (join_table.columns.items) |col| {
             const val = if (join_row) |jr|
-                jr.get(col.name) orelse ColumnValue.null_value
+                column_matching.resolveColumnValue(col.name, jr.values) orelse ColumnValue.null_value
             else
                 ColumnValue.null_value;
             try result_row.append(try val.clone(allocator));
@@ -286,13 +286,13 @@ fn emitNestedLoopJoinRow(
                 const val = if (parts.table) |tbl| blk: {
                     if (std.mem.eql(u8, tbl, base_table_name)) {
                         if (base_row) |br| {
-                            break :blk br.get(parts.column) orelse ColumnValue.null_value;
+                            break :blk column_matching.resolveColumnValue(parts.column, br.values) orelse ColumnValue.null_value;
                         } else {
                             break :blk ColumnValue.null_value;
                         }
                     } else {
                         if (join_row) |jr| {
-                            break :blk jr.get(parts.column) orelse ColumnValue.null_value;
+                            break :blk column_matching.resolveColumnValue(parts.column, jr.values) orelse ColumnValue.null_value;
                         } else {
                             break :blk ColumnValue.null_value;
                         }
@@ -300,10 +300,10 @@ fn emitNestedLoopJoinRow(
                 } else blk: {
                     // Try both tables (unqualified column name)
                     if (base_row) |br| {
-                        if (br.get(col_name)) |v| break :blk v;
+                        if (column_matching.resolveColumnValue(col_name, br.values)) |v| break :blk v;
                     }
                     if (join_row) |jr| {
-                        if (jr.get(col_name)) |v| break :blk v;
+                        if (column_matching.resolveColumnValue(col_name, jr.values)) |v| break :blk v;
                     }
                     break :blk ColumnValue.null_value;
                 };

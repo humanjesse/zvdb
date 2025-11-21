@@ -436,3 +436,34 @@ test "aggregate: result column names" {
     try expect(std.mem.eql(u8, result.columns.items[3], "MIN(amount)"));
     try expect(std.mem.eql(u8, result.columns.items[4], "MAX(amount)"));
 }
+
+// Moved from test_pagination.zig - these tests aggregate functionality, not pagination
+test "aggregate: COUNT(*) with WHERE range clause" {
+    var db = Database.init(std.testing.allocator);
+    defer db.deinit();
+
+    {
+        var result = try db.execute("CREATE TABLE users (id int, age int)");
+        defer result.deinit();
+    }
+
+    {
+        var result1 = try db.execute("INSERT INTO users VALUES (1, 25)");
+        defer result1.deinit();
+    }
+    {
+        var result2 = try db.execute("INSERT INTO users VALUES (2, 30)");
+        defer result2.deinit();
+    }
+    {
+        var result3 = try db.execute("INSERT INTO users VALUES (3, 35)");
+        defer result3.deinit();
+    }
+
+    // Count users with age >= 30
+    var result = try db.execute("SELECT COUNT(*) FROM users WHERE age >= 30");
+    defer result.deinit();
+
+    try expectEqual(@as(usize, 1), result.rows.items.len);
+    try expectEqual(@as(i64, 2), result.rows.items[0].items[0].int);
+}

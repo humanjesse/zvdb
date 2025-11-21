@@ -147,3 +147,150 @@ test "findColumnIndex: not found" {
 
     try testing.expectEqual(@as(?usize, null), findColumnIndex("invalid", &columns));
 }
+
+// ============================================================================
+// Integration Tests - Column Matching in Actual SQL Queries
+// ============================================================================
+
+test "integration: SELECT with qualified column names" {
+    const Database = @import("database.zig").Database;
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    // Create table
+    {
+        var result = try db.execute("CREATE TABLE users (id int, name text)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO users VALUES (1, 'Alice')");
+        defer result.deinit();
+    }
+
+    // SELECT with qualified column name
+    var result = try db.execute("SELECT users.name FROM users");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.rows.items.len);
+    try testing.expect(std.mem.eql(u8, "Alice", result.rows.items[0].items[0].text));
+}
+
+test "integration: JOIN with qualified column names" {
+    const Database = @import("database.zig").Database;
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    // Create tables
+    {
+        var result = try db.execute("CREATE TABLE users (id int, name text)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("CREATE TABLE orders (id int, user_id int, amount int)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO users VALUES (1, 'Alice')");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO orders VALUES (100, 1, 50)");
+        defer result.deinit();
+    }
+
+    // JOIN with qualified column names
+    var result = try db.execute("SELECT users.name, orders.amount FROM users JOIN orders ON users.id = orders.user_id");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.rows.items.len);
+    try testing.expect(std.mem.eql(u8, "Alice", result.rows.items[0].items[0].text));
+    try testing.expectEqual(@as(i64, 50), result.rows.items[0].items[1].int);
+}
+
+// TODO: Table alias support (e.g., "FROM users u") is not fully implemented yet.
+// The parser may accept the syntax but doesn't properly map aliases to table names
+// in the executor. This needs proper alias tracking in SelectCmd and JoinClause structures.
+// See: test_subqueries.zig which has a similar query that might be passing accidentally.
+// test "integration: JOIN with table aliases" {
+//     const Database = @import("database.zig").Database;
+//     var db = Database.init(testing.allocator);
+//     defer db.deinit();
+//
+//     // Create tables
+//     {
+//         var result = try db.execute("CREATE TABLE users (id int, name text)");
+//         defer result.deinit();
+//     }
+//     {
+//         var result = try db.execute("CREATE TABLE orders (id int, user_id int, amount int)");
+//         defer result.deinit();
+//     }
+//     {
+//         var result = try db.execute("INSERT INTO users VALUES (1, 'Bob')");
+//         defer result.deinit();
+//     }
+//     {
+//         var result = try db.execute("INSERT INTO orders VALUES (200, 1, 75)");
+//         defer result.deinit();
+//     }
+//
+//     // JOIN with table aliases (u for users, o for orders)
+//     var result = try db.execute("SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id");
+//     defer result.deinit();
+//
+//     try testing.expectEqual(@as(usize, 1), result.rows.items.len);
+//     try testing.expect(std.mem.eql(u8, "Bob", result.rows.items[0].items[0].text));
+//     try testing.expectEqual(@as(i64, 75), result.rows.items[0].items[1].int);
+// }
+
+test "integration: WHERE clause with qualified column" {
+    const Database = @import("database.zig").Database;
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    // Create table
+    {
+        var result = try db.execute("CREATE TABLE products (id int, name text, price int)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO products VALUES (1, 'Widget', 10)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO products VALUES (2, 'Gadget', 20)");
+        defer result.deinit();
+    }
+
+    // WHERE with qualified column name
+    var result = try db.execute("SELECT products.name FROM products WHERE products.price > 15");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.rows.items.len);
+    try testing.expect(std.mem.eql(u8, "Gadget", result.rows.items[0].items[0].text));
+}
+
+test "integration: mixed qualified and unqualified column names" {
+    const Database = @import("database.zig").Database;
+    var db = Database.init(testing.allocator);
+    defer db.deinit();
+
+    // Create table
+    {
+        var result = try db.execute("CREATE TABLE items (id int, name text, stock int)");
+        defer result.deinit();
+    }
+    {
+        var result = try db.execute("INSERT INTO items VALUES (1, 'Item1', 100)");
+        defer result.deinit();
+    }
+
+    // Mix qualified and unqualified
+    var result = try db.execute("SELECT items.id, name, items.stock FROM items WHERE id = 1");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.rows.items.len);
+    try testing.expectEqual(@as(i64, 1), result.rows.items[0].items[0].int);
+    try testing.expect(std.mem.eql(u8, "Item1", result.rows.items[0].items[1].text));
+    try testing.expectEqual(@as(i64, 100), result.rows.items[0].items[2].int);
+}

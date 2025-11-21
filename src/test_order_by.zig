@@ -69,15 +69,26 @@ test "ORDER BY: Multiple columns" {
     defer result.deinit();
 
     try testing.expect(result.rows.items.len == 3);
-    // Should be sorted by age DESC, then name ASC
-    // Bob(25), then Alice(30), Charlie(30)
-    try testing.expect(result.rows.items[0].items[2].int == 30); // Alice or Charlie
-    try testing.expect(result.rows.items[1].items[2].int == 30); // Alice or Charlie
-    try testing.expect(result.rows.items[2].items[2].int == 25); // Bob
 
-    // Check that the 30-year-olds are sorted by name
+    // ORDER BY age DESC, name ASC means:
+    // 1. First sort by age descending: 30-year-olds come before 25-year-old
+    // 2. Within same age, sort by name ascending
+    // Expected order: Alice(30), Charlie(30), Bob(25)
+
+    // Row 0: Alice, age 30 (first 30-year-old alphabetically)
+    try testing.expectEqual(@as(i64, 2), result.rows.items[0].items[0].int); // id
     try testing.expect(std.mem.eql(u8, result.rows.items[0].items[1].text, "Alice"));
+    try testing.expectEqual(@as(i64, 30), result.rows.items[0].items[2].int);
+
+    // Row 1: Charlie, age 30 (second 30-year-old alphabetically)
+    try testing.expectEqual(@as(i64, 1), result.rows.items[1].items[0].int); // id
     try testing.expect(std.mem.eql(u8, result.rows.items[1].items[1].text, "Charlie"));
+    try testing.expectEqual(@as(i64, 30), result.rows.items[1].items[2].int);
+
+    // Row 2: Bob, age 25 (youngest, so comes last with DESC)
+    try testing.expectEqual(@as(i64, 3), result.rows.items[2].items[0].int); // id
+    try testing.expect(std.mem.eql(u8, result.rows.items[2].items[1].text, "Bob"));
+    try testing.expectEqual(@as(i64, 25), result.rows.items[2].items[2].int);
 }
 
 test "ORDER BY: With LIMIT" {
