@@ -14,6 +14,7 @@ const aggregate_executor = @import("aggregate_executor.zig");
 const sort_executor = @import("sort_executor.zig");
 const expr_evaluator = @import("expr_evaluator.zig");
 const query_optimizer = @import("query_optimizer.zig");
+const column_matching = @import("../column_matching.zig");
 
 /// Main SELECT execution function
 /// Routes to specialized executors based on query type:
@@ -254,7 +255,7 @@ pub fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
             }
 
             for (table.columns.items) |col| {
-                if (row.get(col.name)) |val| {
+                if (column_matching.resolveColumnValue(col.name, row.values)) |val| {
                     try result_row.append(try val.clone(db.allocator));
                 } else {
                     try result_row.append(ColumnValue.null_value);
@@ -264,7 +265,7 @@ pub fn executeSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
             for (cmd.columns.items) |col| {
                 switch (col) {
                     .regular => |col_name| {
-                        if (row.get(col_name)) |val| {
+                        if (column_matching.resolveColumnValue(col_name, row.values)) |val| {
                             try result_row.append(try val.clone(db.allocator));
                         } else {
                             try result_row.append(ColumnValue.null_value);

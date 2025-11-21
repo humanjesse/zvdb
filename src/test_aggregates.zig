@@ -438,7 +438,7 @@ test "aggregate: result column names" {
 }
 
 // Moved from test_pagination.zig - these tests aggregate functionality, not pagination
-test "aggregate: COUNT(*) with WHERE clause" {
+test "aggregate: COUNT(*) with WHERE range clause" {
     var db = Database.init(std.testing.allocator);
     defer db.deinit();
 

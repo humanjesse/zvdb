@@ -5,6 +5,7 @@ const StringHashMap = std.StringHashMap;
 const Table = @import("table.zig").Table;
 const ColumnValue = @import("table.zig").ColumnValue;
 pub const ColumnType = @import("table.zig").ColumnType;
+const column_matching = @import("database/column_matching.zig");
 
 /// SQL parsing errors
 pub const SqlError = error{
@@ -1814,18 +1815,15 @@ pub fn evaluateExpr(expr: Expr, row_values: anytype, db: ?*anyopaque) bool {
         },
         .column => {
             // A column reference is truthy if it exists and is truthy
-            var it = row_values.iterator();
-            while (it.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, expr.column)) {
-                    return switch (entry.value_ptr.*) {
-                        .null_value => false,
-                        .bool => |b| b,
-                        .int => |i| i != 0,
-                        .float => |f| f != 0.0,
-                        .text => |t| t.len > 0,
-                        .embedding => true,
-                    };
-                }
+            if (column_matching.resolveColumnValue(expr.column, row_values)) |val| {
+                return switch (val) {
+                    .null_value => false,
+                    .bool => |b| b,
+                    .int => |i| i != 0,
+                    .float => |f| f != 0.0,
+                    .text => |t| t.len > 0,
+                    .embedding => true,
+                };
             }
             return false; // Column not found
         },
@@ -1898,11 +1896,8 @@ fn getExprValue(expr: Expr, row_values: anytype, db: ?*anyopaque) ColumnValue {
     switch (expr) {
         .literal => |val| return val,
         .column => |col| {
-            var it = row_values.iterator();
-            while (it.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, col)) {
-                    return entry.value_ptr.*;
-                }
+            if (column_matching.resolveColumnValue(col, row_values)) |val| {
+                return val;
             }
             return ColumnValue.null_value;
         },
