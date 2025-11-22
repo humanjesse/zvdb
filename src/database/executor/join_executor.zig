@@ -657,12 +657,16 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
         // then filter, then project to the selected columns
         const join_with_all_columns = has_where and !select_all;
 
+        // Use aliases if available, otherwise use table names
+        const base_table_ref = cmd.table_alias orelse cmd.table_name;
+        const join_table_ref = join.table_alias orelse join.table_name;
+
         var join_result = try hash_join.executeHashJoin(
             db.allocator,
             base_table,
             join_table,
-            cmd.table_name,
-            join.table_name,
+            base_table_ref,
+            join_table_ref,
             join.join_type,
             left_parts.column,
             right_parts.column,
@@ -699,20 +703,23 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
 
     if (include_all_columns) {
         // Include all columns from both tables with qualified names
+        // Use alias if available, otherwise use table name
         for (base_table.columns.items) |col| {
+            const table_ref = cmd.table_alias orelse cmd.table_name;
             const qualified = try std.fmt.allocPrint(
                 db.allocator,
                 "{s}.{s}",
-                .{ cmd.table_name, col.name },
+                .{ table_ref, col.name },
             );
             defer db.allocator.free(qualified);
             try result.addColumn(qualified);
         }
         for (join_table.columns.items) |col| {
+            const table_ref = join.table_alias orelse join.table_name;
             const qualified = try std.fmt.allocPrint(
                 db.allocator,
                 "{s}.{s}",
-                .{ join.table_name, col.name },
+                .{ table_ref, col.name },
             );
             defer db.allocator.free(qualified);
             try result.addColumn(qualified);
@@ -735,6 +742,10 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
     const join_row_ids = try join_table.getAllRows(db.allocator, snapshot, clog);
     defer db.allocator.free(join_row_ids);
 
+    // Use aliases if available for column resolution
+    const base_table_ref_for_emit = cmd.table_alias orelse cmd.table_name;
+    const join_table_ref_for_emit = join.table_alias orelse join.table_name;
+
     // Perform nested loop join
     switch (join.join_type) {
         .inner => {
@@ -755,8 +766,8 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
                             db.allocator,
                             base_table,
                             join_table,
-                            cmd.table_name,
-                            join.table_name,
+                            base_table_ref_for_emit,
+                            join_table_ref_for_emit,
                             base_row,
                             join_row,
                             include_all_columns,
@@ -777,8 +788,8 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
                         db.allocator,
                         base_table,
                         join_table,
-                        cmd.table_name,
-                        join.table_name,
+                        base_table_ref_for_emit,
+                        join_table_ref_for_emit,
                         base_row,
                         null, // No join row (emit NULLs)
                         include_all_columns,
@@ -801,8 +812,8 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
                             db.allocator,
                             base_table,
                             join_table,
-                            cmd.table_name,
-                            join.table_name,
+                            base_table_ref_for_emit,
+                            join_table_ref_for_emit,
                             base_row,
                             join_row,
                             include_all_columns,
@@ -818,8 +829,8 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
                         db.allocator,
                         base_table,
                         join_table,
-                        cmd.table_name,
-                        join.table_name,
+                        base_table_ref_for_emit,
+                        join_table_ref_for_emit,
                         base_row,
                         null, // No join row (emit NULLs)
                         include_all_columns,
@@ -840,8 +851,8 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
                         db.allocator,
                         base_table,
                         join_table,
-                        cmd.table_name,
-                        join.table_name,
+                        base_table_ref_for_emit,
+                        join_table_ref_for_emit,
                         null, // No base row (emit NULLs)
                         join_row,
                         include_all_columns,
@@ -864,8 +875,8 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
                             db.allocator,
                             base_table,
                             join_table,
-                            cmd.table_name,
-                            join.table_name,
+                            base_table_ref_for_emit,
+                            join_table_ref_for_emit,
                             base_row,
                             join_row,
                             include_all_columns,
@@ -881,8 +892,8 @@ fn executeTwoTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) !Q
                         db.allocator,
                         base_table,
                         join_table,
-                        cmd.table_name,
-                        join.table_name,
+                        base_table_ref_for_emit,
+                        join_table_ref_for_emit,
                         null, // No base row (emit NULLs)
                         join_row,
                         include_all_columns,
@@ -926,9 +937,10 @@ fn executeMultiTableJoin(db: *Database, cmd: sql.SelectCmd, base_table: *Table) 
     var current_intermediate = IntermediateResult.init(db.allocator);
     errdefer current_intermediate.deinit();
 
-    // Build schema from base table
+    // Build schema from base table (use alias if available)
+    const base_table_ref = cmd.table_alias orelse cmd.table_name;
     for (base_table.columns.items) |col| {
-        try current_intermediate.addColumn(cmd.table_name, col.name);
+        try current_intermediate.addColumn(base_table_ref, col.name);
     }
 
     // Get all rows from base table and add to intermediate
@@ -998,8 +1010,10 @@ fn executeJoinStage(
     for (left_intermediate.schema.items) |col_info| {
         try result.addColumn(col_info.table_name, col_info.column_name);
     }
+    // Use alias if available, otherwise use table name
+    const right_table_ref = join_clause.table_alias orelse join_clause.table_name;
     for (right_table.columns.items) |col| {
-        try result.addColumn(join_clause.table_name, col.name);
+        try result.addColumn(right_table_ref, col.name);
     }
 
     // Parse right join column name (remove table prefix if present)
