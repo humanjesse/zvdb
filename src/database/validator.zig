@@ -453,10 +453,20 @@ pub fn validateSelectColumns(
     var resolver = try ColumnResolver.init(allocator, base_table);
     defer resolver.deinit();
 
-    // Add joined tables if present
+    // Register base table alias if present
+    if (cmd.table_alias) |alias| {
+        try resolver.registerAlias(alias, base_table.name);
+    }
+
+    // Add joined tables and register their aliases
     if (joined_tables) |tables| {
-        for (tables) |table| {
+        for (tables, 0..) |table, i| {
             try resolver.addJoinedTable(table);
+
+            // Register join table alias if present
+            if (cmd.joins.items[i].table_alias) |alias| {
+                try resolver.registerAlias(alias, table.name);
+            }
         }
     }
 

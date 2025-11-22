@@ -237,6 +237,7 @@ pub const InsertCmd = struct {
 /// SELECT command with semantic search support
 pub const SelectCmd = struct {
     table_name: []const u8,
+    table_alias: ?[]const u8, // Optional alias for base table (e.g., "u" in "FROM users u")
     columns: ArrayList(SelectColumn), // Changed to support aggregates
     joins: ArrayList(JoinClause), // JOIN clauses
     where_column: ?[]const u8,
@@ -254,6 +255,7 @@ pub const SelectCmd = struct {
 
     pub fn deinit(self: *SelectCmd, allocator: Allocator) void {
         allocator.free(self.table_name);
+        if (self.table_alias) |alias| allocator.free(alias);
         for (self.columns.items) |*col| {
             col.deinit(allocator);
         }
@@ -479,11 +481,13 @@ pub const JoinType = enum {
 pub const JoinClause = struct {
     join_type: JoinType,
     table_name: []const u8,
+    table_alias: ?[]const u8, // Optional alias for joined table (e.g., "o" in "JOIN orders o")
     left_column: []const u8, // e.g., "users.id" or "id"
     right_column: []const u8, // e.g., "orders.user_id" or "user_id"
 
     pub fn deinit(self: *JoinClause, allocator: Allocator) void {
         allocator.free(self.table_name);
+        if (self.table_alias) |alias| allocator.free(alias);
         allocator.free(self.left_column);
         allocator.free(self.right_column);
     }
@@ -1093,11 +1097,14 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
     errdefer allocator.free(table_name);
     i += 1;
 
-    // Skip table alias if present (e.g., "FROM users u" - skip the "u")
+    // Capture table alias if present (e.g., "FROM users u" - capture the "u")
     // An alias is any token that's not a SQL keyword
+    var table_alias: ?[]const u8 = null;
     if (i < tokens.len and !isSelectKeyword(tokens[i].text)) {
-        i += 1; // Skip alias
+        table_alias = try allocator.dupe(u8, tokens[i].text);
+        i += 1;
     }
+    errdefer if (table_alias) |alias| allocator.free(alias);
 
     var joins = ArrayList(JoinClause).init(allocator);
     errdefer {
@@ -1177,13 +1184,16 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
         const join_table = try allocator.dupe(u8, tokens[i].text);
         i += 1;
 
-        // Skip table alias if present (e.g., "JOIN orders o" - skip the "o")
+        // Capture table alias if present (e.g., "JOIN orders o" - capture the "o")
+        var join_alias: ?[]const u8 = null;
         if (i < tokens.len and !eqlIgnoreCase(tokens[i].text, "ON")) {
-            i += 1; // Skip alias
+            join_alias = try allocator.dupe(u8, tokens[i].text);
+            i += 1;
         }
 
         if (i >= tokens.len or !eqlIgnoreCase(tokens[i].text, "ON")) {
             allocator.free(join_table);
+            if (join_alias) |alias| allocator.free(alias);
             return SqlError.InvalidSyntax;
         }
         i += 1;
@@ -1191,6 +1201,7 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
         // Parse: left_column = right_column
         if (i >= tokens.len) {
             allocator.free(join_table);
+            if (join_alias) |alias| allocator.free(alias);
             return SqlError.InvalidSyntax;
         }
         const left_col = try allocator.dupe(u8, tokens[i].text);
@@ -1198,6 +1209,7 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
 
         if (i >= tokens.len or !std.mem.eql(u8, tokens[i].text, "=")) {
             allocator.free(join_table);
+            if (join_alias) |alias| allocator.free(alias);
             allocator.free(left_col);
             return SqlError.InvalidSyntax;
         }
@@ -1205,6 +1217,7 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
 
         if (i >= tokens.len) {
             allocator.free(join_table);
+            if (join_alias) |alias| allocator.free(alias);
             allocator.free(left_col);
             return SqlError.InvalidSyntax;
         }
@@ -1214,6 +1227,7 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
         try joins.append(JoinClause{
             .join_type = join_type.?,
             .table_name = join_table,
+            .table_alias = join_alias,
             .left_column = left_col,
             .right_column = right_col,
         });
@@ -1340,6 +1354,7 @@ fn parseSelect(allocator: Allocator, tokens: []const Token) !SelectCmd {
 
     const cmd = SelectCmd{
         .table_name = table_name,
+        .table_alias = table_alias,
         .columns = columns,
         .joins = joins,
         .where_column = where_column,

@@ -1703,14 +1703,20 @@ test "WalReader: rejects symlink" {
 
 test "isSymlink: returns false for regular file" {
     const test_dir = "test_isSymlink_regular";
+
+    // Clean up any previous test artifacts
+    std.fs.cwd().deleteTree(test_dir) catch {};
     defer std.fs.cwd().deleteTree(test_dir) catch {};
 
     // Create test directory
     try std.fs.cwd().makePath(test_dir);
 
-    // Create a regular file
+    // Create a regular file - open dir first, then create file relative to it
     {
-        const file = try std.fs.cwd().createFile(test_dir ++ "/regular.txt", .{});
+        var dir = try std.fs.cwd().openDir(test_dir, .{});
+        defer dir.close();
+
+        const file = try dir.createFile("regular.txt", .{});
         defer file.close();
         try file.writeAll("regular file content");
     }
@@ -1722,10 +1728,20 @@ test "isSymlink: returns false for regular file" {
 
 test "isSymlink: returns false for directory" {
     const test_dir = "test_isSymlink_directory";
+
+    // Clean up any previous test artifacts
+    std.fs.cwd().deleteTree(test_dir) catch {};
     defer std.fs.cwd().deleteTree(test_dir) catch {};
 
-    // Create test directory with a subdirectory
-    try std.fs.cwd().makePath(test_dir ++ "/subdir");
+    // Create test directory
+    try std.fs.cwd().makePath(test_dir);
+
+    // Create a subdirectory inside
+    {
+        var dir = try std.fs.cwd().openDir(test_dir, .{});
+        defer dir.close();
+        try dir.makeDir("subdir");
+    }
 
     // isSymlink should return false for directory
     const result = try isSymlink(test_dir, "subdir");
@@ -1734,6 +1750,9 @@ test "isSymlink: returns false for directory" {
 
 test "isSymlink: returns false for non-existent file" {
     const test_dir = "test_isSymlink_nonexistent";
+
+    // Clean up any previous test artifacts
+    std.fs.cwd().deleteTree(test_dir) catch {};
     defer std.fs.cwd().deleteTree(test_dir) catch {};
 
     // Create test directory only (no file)

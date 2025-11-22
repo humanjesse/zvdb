@@ -30,6 +30,9 @@ const evaluateExprWithSubqueries = executor.evaluateExprWithSubqueries;
 const sort_executor = @import("sort_executor.zig");
 const applyOrderBy = sort_executor.applyOrderBy;
 
+// Import validator for column validation
+const validator = @import("../validator.zig");
+
 // ============================================================================
 // JOIN Support
 // ============================================================================
@@ -531,6 +534,20 @@ pub fn executeJoinSelect(db: *Database, cmd: sql.SelectCmd) !QueryResult {
 
     // Validate we have at least one join
     if (cmd.joins.items.len == 0) return error.NoJoins;
+
+    // Validate column references before execution
+    // Build array of joined table pointers for validator
+    var joined_tables_array = try db.allocator.alloc(*Table, cmd.joins.items.len);
+    defer db.allocator.free(joined_tables_array);
+
+    // Populate array and validate each table exists
+    for (cmd.joins.items, 0..) |join_clause, i| {
+        const join_table = db.tables.get(join_clause.table_name) orelse return sql.SqlError.TableNotFound;
+        joined_tables_array[i] = join_table;
+    }
+
+    // Validate SELECT columns with all tables in scope
+    try validator.validateSelectColumns(db.allocator, &cmd, base_table, joined_tables_array);
 
     // For single join, use the optimized 2-table path
     var result = if (cmd.joins.items.len == 1)

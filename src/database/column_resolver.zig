@@ -139,6 +139,9 @@ pub const ColumnResolver = struct {
     /// Map from table name to table index for quick lookup
     table_name_index: StringHashMap(usize),
 
+    /// Map from table alias to table index for alias resolution
+    alias_to_table_index: StringHashMap(usize),
+
     allocator: Allocator,
 
     /// Initialize resolver with base table schema
@@ -146,6 +149,7 @@ pub const ColumnResolver = struct {
         var resolver = ColumnResolver{
             .table_schemas = ArrayList(TableSchema).init(allocator),
             .table_name_index = StringHashMap(usize).init(allocator),
+            .alias_to_table_index = StringHashMap(usize).init(allocator),
             .allocator = allocator,
         };
         errdefer resolver.deinit();
@@ -165,6 +169,9 @@ pub const ColumnResolver = struct {
 
         // Free table name index (keys are owned by TableSchema)
         self.table_name_index.deinit();
+
+        // Free alias index (keys are owned by SelectCmd/JoinClause)
+        self.alias_to_table_index.deinit();
     }
 
     /// Add a joined table's schema to the resolver
@@ -172,6 +179,19 @@ pub const ColumnResolver = struct {
     pub fn addJoinedTable(self: *ColumnResolver, table: *Table) !void {
         const table_index = self.table_schemas.items.len;
         try self.addTableInternal(table, table_index);
+    }
+
+    /// Register an alias for a table that's already been added
+    /// This allows the resolver to find tables by either their real name or alias
+    /// Example: registerAlias("u", "users") allows resolving "u.id" as "users.id"
+    pub fn registerAlias(self: *ColumnResolver, alias: []const u8, table_name: []const u8) !void {
+        // Look up the table by its real name
+        const table_index = self.table_name_index.get(table_name) orelse {
+            return error.TableNotFound;
+        };
+
+        // Register the alias pointing to the same table index
+        try self.alias_to_table_index.put(alias, table_index);
     }
 
     /// Internal helper to add a table at a specific index
@@ -227,8 +247,9 @@ pub const ColumnResolver = struct {
             return ColumnResolverError.InvalidQualifiedName;
         }
 
-        // Look up the table
-        const table_index = self.table_name_index.get(table_name) orelse {
+        // Look up the table by name OR alias (aliases take precedence)
+        const table_index = self.alias_to_table_index.get(table_name) orelse
+            self.table_name_index.get(table_name) orelse {
             return ColumnResolverError.ColumnNotFound;
         };
 
