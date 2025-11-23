@@ -338,18 +338,17 @@ Save and restore with WAL.
 
 ```zig
 pub fn initPersistent(allocator: std.mem.Allocator, data_dir: []const u8) !zvdb.Database {
-    var db = zvdb.Database.init(allocator);
+    // Try to load existing database
+    var db = zvdb.Database.loadAll(allocator, data_dir) catch |err| blk: {
+        if (err != error.FileNotFound) return err;
+        // First run - create new database
+        break :blk zvdb.Database.init(allocator);
+    };
 
     // Enable WAL
     const wal_path = try std.fmt.allocPrint(allocator, "{s}/zvdb.wal", .{data_dir});
     defer allocator.free(wal_path);
     try db.enableWal(wal_path);
-
-    // Try to load existing data
-    db.loadAll(data_dir) catch |err| {
-        if (err != error.FileNotFound) return err;
-        // First run - no data to load
-    };
 
     // Configure auto-save
     db.data_dir = try allocator.dupe(u8, data_dir);

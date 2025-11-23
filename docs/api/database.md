@@ -61,13 +61,17 @@ Save all tables and indexes to directory.
 - Creates `{data_dir}/hnsw_{dimension}_{column}.idx` for vector indexes
 - Preserves full MVCC version chains
 
-### `loadAll(self, data_dir) !void`
+### `loadAll(allocator, data_dir) !Database`
 
-Load database from directory. Reconstructs tables and indexes.
+Load database from directory. Returns new Database instance with reconstructed tables and indexes.
 
-### `rebuildHnswFromTables(self) !void`
+Static function - call as `Database.loadAll(allocator, "/path/to/data")`.
 
-Rebuild all HNSW indexes from table data. Use after bulk operations or corruption.
+### `rebuildHnswFromTables(self) !usize`
+
+Rebuild all HNSW indexes from table data. Returns number of vectors indexed.
+
+Use after bulk operations or corruption recovery.
 
 ## Transaction Management
 
@@ -147,7 +151,7 @@ ORDER BY SIMILARITY TO 'search query'
 LIMIT 5
 ```
 
-Automatically generates embedding for query text and searches HNSW index.
+Searches HNSW index by text similarity. Uses hash-based placeholder for text-to-embedding (demo/testing). For production use, generate embeddings externally with your model and insert as array literals.
 
 ## Error Handling
 

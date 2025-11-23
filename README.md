@@ -34,7 +34,7 @@ A hybrid vector-relational database written in pure Zig. Combines SQL operations
 const zvdb = @import("zvdb");
 
 // Initialize database
-var db = try zvdb.Database.init(allocator);
+var db = zvdb.Database.init(allocator);
 defer db.deinit();
 
 // Create table with embedding column
@@ -43,7 +43,7 @@ try db.execute("CREATE TABLE docs (id int, content text, embedding embedding(384
 // Insert with vector
 try db.execute("INSERT INTO docs VALUES (1, 'hello', [0.1, 0.2, ...])");
 
-// Semantic search
+// Semantic search (uses hash-based embedding for demo - integrate real model for production)
 const result = try db.execute("SELECT * FROM docs ORDER BY SIMILARITY TO 'search query' LIMIT 5");
 defer result.deinit();
 ```

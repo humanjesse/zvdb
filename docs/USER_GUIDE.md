@@ -127,7 +127,7 @@ SELECT * FROM docs WHERE EXISTS (SELECT 1 FROM refs WHERE refs.doc_id = docs.id)
 ORDER BY SIMILARITY TO 'query text'
 ```
 
-Generates embedding for text and searches HNSW index. Requires embedding column in table.
+Searches HNSW index by text similarity. Built-in text-to-embedding uses hash-based placeholder (demo/testing only). For production, integrate real embedding model and insert pre-computed vectors.
 
 **Random Ordering**
 
@@ -171,7 +171,7 @@ Index key: `(dimension, column_name)` - allows multiple same-dimension embedding
 INSERT INTO docs VALUES (1, 'text', [0.1, 0.2, 0.3, ...])
 ```
 
-Dimension must match column definition.
+Dimension must match column definition. Generate embeddings using your embedding model (e.g., sentence-transformers, OpenAI, etc.) before insertion.
 
 ### Searching
 
@@ -189,10 +189,9 @@ CREATE TABLE docs (
     title_vec embedding(384),
     content_vec embedding(768)
 )
-
--- Search specific column
-SELECT * FROM docs ORDER BY title_vec SIMILARITY TO 'query' LIMIT 5
 ```
+
+Note: SIMILARITY TO searches use the first embedding column found in the table. For multi-embedding scenarios, use direct HNSW API to search specific columns.
 
 ### HNSW Parameters
 
@@ -303,11 +302,11 @@ Creates:
 ### Loading Data
 
 ```zig
-var db = zvdb.Database.init(allocator);
-try db.loadAll("/data/directory");
+var db = try zvdb.Database.loadAll(allocator, "/data/directory");
+defer db.deinit();
 ```
 
-Reconstructs tables and indexes from disk.
+Returns new Database instance with tables and indexes reconstructed from disk.
 
 ### Auto-Save
 

@@ -11,7 +11,7 @@ Guide for contributing code, tests, and documentation.
 **Clone and build:**
 
 ```bash
-git clone https://github.com/yourrepo/zvdb
+git clone https://github.com/humanjesse/zvdb
 cd zvdb
 zig build
 zig build test

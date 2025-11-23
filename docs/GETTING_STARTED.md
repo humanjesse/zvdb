@@ -12,7 +12,7 @@ Quick guide to building and using ZVDB.
 Clone and build:
 
 ```bash
-git clone https://github.com/yourrepo/zvdb
+git clone https://github.com/humanjesse/zvdb
 cd zvdb
 zig build
 ```
@@ -104,9 +104,9 @@ try db.enableWal("/tmp/zvdb.wal");
 // Save all tables
 try db.saveAll("/tmp/zvdb_data");
 
-// Load from disk
-var db2 = zvdb.Database.init(allocator);
-try db2.loadAll("/tmp/zvdb_data");
+// Load from disk (returns new Database instance)
+var db2 = try zvdb.Database.loadAll(allocator, "/tmp/zvdb_data");
+defer db2.deinit();
 ```
 
 ## GraphRAG
